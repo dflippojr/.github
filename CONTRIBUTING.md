@@ -25,5 +25,5 @@ Keep it simple and suit the project. A short prefix plus the issue number and a 
 
 - Link the issue with `Closes #N` so merging closes it.
 - Say what changed, how it was verified, and anything the owner has to do after merging.
-- The owner reviews and merges every pull request. Agents push branches and may open PRs, but never merge or close issues themselves.
+- The owner reviews and merges every pull request. Agents push branches and open PRs only with the owner's go-ahead; they never merge or close issues themselves.
 - Never commit secrets, tokens, device identifiers or private paths, even in private repos.
