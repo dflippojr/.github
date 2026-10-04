@@ -13,9 +13,13 @@ Feature work and fixes go through GitHub issues and pull requests, so plans and 
 | `in-progress` | Work started on a branch; no pull request yet |
 | `awaiting-review` | Pull request open; waiting for the owner's review or merge |
 | `verification` | Confirm something already built works for real |
+| `reserved` | Held for a specific person or run; agents and orchestrators skip it |
+| `parked` | Deliberately deferred; not planned for now |
 | `P0` / `P1` / `P2` | Priority: do first / bugs and fixes ahead of features / normal |
 
-An issue moves from `needs-refinement` to `ready` once its outcome, scope, decisions and acceptance criteria are written down. Only `ready` issues get picked up.
+An issue moves from `needs-refinement` to `ready` once its outcome, scope, decisions and acceptance criteria are written down. Only `ready` issues without `reserved`, `parked`, `blocked` or `user-present` get picked up.
+
+The labels themselves are defined in `labels.json`. `python scripts/sync_labels.py` shows what differs in each active repository, and `--apply` brings them in line.
 
 ## Branches
 

@@ -1,0 +1,35 @@
+{
+  "labels": [
+    {"name": "bug", "color": "d73a4a", "description": "Something isn't working"},
+    {"name": "documentation", "color": "0075ca", "description": "Improvements or additions to documentation"},
+    {"name": "duplicate", "color": "cfd3d7", "description": "This issue or pull request already exists"},
+    {"name": "enhancement", "color": "a2eeef", "description": "New feature or request"},
+    {"name": "good first issue", "color": "7057ff", "description": "Good for newcomers"},
+    {"name": "help wanted", "color": "008672", "description": "Extra attention is needed"},
+    {"name": "invalid", "color": "e4e669", "description": "This doesn't seem right"},
+    {"name": "question", "color": "d876e3", "description": "Further information is requested"},
+    {"name": "wontfix", "color": "ffffff", "description": "This will not be worked on"},
+    {"name": "accessibility", "color": "f143ab", "description": "Barrier affecting people with disabilities"},
+
+    {"name": "needs-refinement", "color": "fbca04", "description": "Needs product or design decisions before work can start"},
+    {"name": "ready", "color": "2ea44f", "description": "Specified enough to implement or verify without further decisions"},
+    {"name": "blocked", "color": "5319e7", "description": "Specified, but waiting on a dependency"},
+    {"name": "user-present", "color": "f9d0c4", "description": "The owner or a physical device is needed for the next step"},
+    {"name": "in-progress", "color": "1d76db", "description": "Work started on a branch; no pull request yet"},
+    {"name": "awaiting-review", "color": "d4c5f9", "description": "Pull request open; waiting for the owner's review or merge"},
+    {"name": "verification", "color": "006b75", "description": "Confirm something already built works for real"},
+    {"name": "reserved", "color": "bfdadc", "description": "Held for a specific person or run; agents and orchestrators skip it"},
+    {"name": "parked", "color": "bfbfbf", "description": "Deliberately deferred; not planned for now"},
+
+    {"name": "P0", "color": "b60205", "description": "Priority: do first; others depend on it"},
+    {"name": "P1", "color": "d93f0b", "description": "Priority: bugs and fixes ahead of features"},
+    {"name": "P2", "color": "fef2c0", "description": "Priority: normal; not yet ordered"}
+  ],
+  "renames": {
+    "agent-ready": "ready",
+    "user-action": "user-present"
+  },
+  "remove": {
+    "agent-harness": ["phase-8"]
+  }
+}
