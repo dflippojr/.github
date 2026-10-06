@@ -19,7 +19,7 @@ Feature work and fixes go through GitHub issues and pull requests, so plans and 
 
 An issue moves from `needs-refinement` to `ready` once its outcome, scope, decisions and acceptance criteria are written down. Only `ready` issues without `reserved`, `parked`, `blocked` or `user-present` get picked up.
 
-The labels themselves are defined in `labels.json`. `python scripts/sync_labels.py` shows what differs in each active repository, and `--apply` brings them in line.
+The labels themselves are defined in `labels.json`. `python scripts/sync_labels.py` shows what differs in each active repository (not archived, not a fork, pushed within the last 365 days; `--since YYYY-MM-DD` overrides the cutoff), and `--apply` brings them in line. Naming a repository that doesn't exist is an error (exit 2) before anything is changed.
 
 ## Branches
 
