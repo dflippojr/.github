@@ -17,6 +17,21 @@ Feature work and fixes go through GitHub issues and pull requests, so plans and 
 | `parked` | Deliberately deferred; not planned for now |
 | `P0` / `P1` / `P2` | Priority: do first / bugs and fixes ahead of features / normal |
 
+The remaining labels are GitHub's defaults plus one for accessibility:
+
+| Label | Meaning |
+| --- | --- |
+| `bug` | Something isn't working |
+| `documentation` | Improvements or additions to documentation |
+| `duplicate` | This issue or pull request already exists |
+| `enhancement` | New feature or request |
+| `good first issue` | Good for newcomers |
+| `help wanted` | Extra attention is needed |
+| `invalid` | This doesn't seem right |
+| `question` | Further information is requested |
+| `wontfix` | This will not be worked on |
+| `accessibility` | Barrier affecting people with disabilities |
+
 An issue moves from `needs-refinement` to `ready` once its outcome, scope, decisions and acceptance criteria are written down. Only `ready` issues without `reserved`, `parked`, `blocked` or `user-present` get picked up.
 
 The labels themselves are defined in `labels.json`. `python scripts/sync_labels.py` shows what differs in each active repository (not archived, not a fork, pushed within the last 365 days; `--since YYYY-MM-DD` overrides the cutoff), and `--apply` brings them in line. Naming a repository that doesn't exist is an error (exit 2) before anything is changed.
