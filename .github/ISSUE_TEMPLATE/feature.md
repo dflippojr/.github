@@ -15,7 +15,10 @@ labels: [enhancement, needs-refinement]
 - Out:
 
 ## Decisions
-<!-- Product or design calls already made. List anything still open as a question. -->
+<!-- Calls already made, each written as a recommended default the owner can override. Questions only the owner can answer go under Open questions. -->
+
+## Open questions
+<!-- Questions only the owner can answer, each with a recommended answer. Delete this section if none. -->
 
 ## Dependencies
 <!-- Issues or PRs that must land first, or "None". -->

@@ -21,6 +21,21 @@ An issue moves from `needs-refinement` to `ready` once its outcome, scope, decis
 
 The labels themselves are defined in `labels.json`. `python scripts/sync_labels.py` shows what differs in each active repository (not archived, not a fork, pushed within the last 365 days; `--since YYYY-MM-DD` overrides the cutoff), and `--apply` brings them in line. Naming a repository that doesn't exist is an error (exit 2) before anything is changed.
 
+## Writing an issue
+
+Start from the feature template. A ready issue has these sections:
+
+- **Outcome**: what is true once the work is done, in a sentence or two.
+- **Background**: why it matters and where it touches the code.
+- **Scope**: what is in and what is out.
+- **Decisions**: calls already made, each written as a recommended default the owner can override ("Do X. Override if you want Y."), not as an open question.
+- **Dependencies**: issues or PRs that must land first, or "None".
+- **Acceptance criteria**: a checklist someone else can verify.
+
+Questions only the owner can answer go under an `Open questions` heading, each with a recommended answer, instead of being guessed. The issue stays `needs-refinement` until they are answered. If the owner approves the issue without answering, the recommended answers stand.
+
+Add a priority when refining, not when filing: `P0` for anything that must be done first, `P1` for bugs and fixes ahead of features, `P2` for everything else. Templates do not set one.
+
 ## Branches
 
 Keep it simple and suit the project. A short prefix plus the issue number and a slug is a good default, for example `feat/12-retry-alerts`, `fix/30-null-title` or `docs/8-backlog-sync`. Branch from the default branch, keep one issue per branch, and delete the branch after merge.
