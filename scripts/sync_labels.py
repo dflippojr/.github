@@ -1,12 +1,15 @@
 """Sync the labels in labels.json to the owner's active repositories.
 
-Active means not archived, not a fork, and pushed to this year. Prints the
-planned changes by default; pass --apply to make them. Labels a repository
+Active means not archived, not a fork, and pushed within the last 365 days
+(or since the --since date). Repository names given on the command line are
+checked against the owner's repositories before anything is planned; an
+unknown name exits with status 2. Prints the planned changes by default; pass --apply to make them. Labels a repository
 has that labels.json does not list are kept unless labels.json names them
 under "remove".
 
     python scripts/sync_labels.py                 # dry run, all active repos
     python scripts/sync_labels.py --apply
+    python scripts/sync_labels.py --since 2026-01-01
     python scripts/sync_labels.py --apply plex-webhook agent-loop
 """
 import argparse
@@ -25,11 +28,26 @@ def gh(*args):
     return out.stdout
 
 
-def active_repos():
-    year = str(datetime.date.today().year)
-    repos = json.loads(gh("repo", "list", OWNER, "--limit", "500", "--json", "name,isArchived,isFork,pushedAt"))
+def list_repos():
+    return json.loads(gh("repo", "list", OWNER, "--limit", "500", "--json", "name,isArchived,isFork,pushedAt"))
+
+
+def active_repos(repos, today=None, since=None):
+    """Names of repos that are not archived, not forks and pushed on or after since.
+
+    since defaults to 365 days before today. pushedAt is an ISO timestamp, so its
+    date part compares as a string.
+    """
+    if since is None:
+        since = (today or datetime.date.today()) - datetime.timedelta(days=365)
+    cutoff = since.isoformat()
     return sorted(r["name"] for r in repos
-                  if not r["isArchived"] and not r["isFork"] and r["pushedAt"].startswith(year))
+                  if not r["isArchived"] and not r["isFork"] and r["pushedAt"][:10] >= cutoff)
+
+
+def unknown_repos(names, repos):
+    known = {r["name"].lower() for r in repos}
+    return [n for n in names if n.lower() not in known]
 
 
 def current_labels(repo):
@@ -79,11 +97,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("repos", nargs="*", help="repository names (default: all active repos)")
     parser.add_argument("--apply", action="store_true", help="make the changes instead of printing them")
+    parser.add_argument("--since", type=datetime.date.fromisoformat, metavar="YYYY-MM-DD",
+                        help="count repos pushed on or after this date as active (default: 365 days ago)")
     opts = parser.parse_args()
     config = json.loads(CONFIG.read_text(encoding="utf-8"))
 
+    repos = list_repos()
+    missing = unknown_repos(opts.repos, repos)
+    if missing:
+        print(f"error: unknown repository name(s) for {OWNER}: {', '.join(missing)}", file=sys.stderr)
+        return 2
+
     total = 0
-    for repo in opts.repos or active_repos():
+    for repo in opts.repos or active_repos(repos, since=opts.since):
         steps = plan(repo, config)
         total += len(steps)
         print(f"{repo}: {len(steps)} change(s)")
