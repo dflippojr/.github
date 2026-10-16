@@ -13,7 +13,7 @@ Default community health files for repositories owned by dflippojr. GitHub appli
 - `labels.json`: the shared label set.
 - `scripts/sync_labels.py`: shows or applies label differences across repositories. See `CONTRIBUTING.md`.
 - `.github/workflows/gate-guard.yml` and `scripts/gate_guard.py`: the reusable gate guard. See below.
-- `.github/workflows/gate-guard-target.yml`, `templates/gate-guard-target-caller.yml` and `.github/workflows/gate-guard-base.yml`: the gate guard on the base branch, its caller template, and this repository's own caller. See "Gate guard on the base branch".
+- `.github/workflows/gate-guard-target.yml`, `templates/gate-guard-target-caller.yml` and `.github/workflows/gate-guard-base.yml`: the gate guard on the default branch, its caller template, and this repository's own caller. See "Gate guard on the default branch".
 - `tests/`: tests for the label configuration and the scripts. `tests/fixtures/gate_guard/` holds the gate guard's fixture diffs and `tests/fixtures/gate_guard_target/` its owner-label scenarios.
 
 ## Gate guard
@@ -81,14 +81,16 @@ gh pr diff 80 -R dflippojr/disc-golf-league > pr.diff && python3 scripts/gate_gu
 verdict on each pull request here: `flag-*.diff` fixtures must fail and
 `pass-*.diff` fixtures must pass.
 
-## Gate guard on the base branch
+## Gate guard on the default branch
 
 `gate-guard.yml` runs on `pull_request`, which takes its workflow files from
 the pull request's head. A pull request can edit its own caller to drop the
 owner-label rule or the guard, and the check still goes green.
 `gate-guard-target.yml` closes that hole: it runs on `pull_request_target`,
-which always takes the workflow from the base branch, and applies the same
-rules. Keep `gate-guard.yml` working until every caller has moved over.
+which always takes the workflow from the repository's default branch, whatever
+the pull request's base (GitHub's rule since 2025-12-08). It applies the same
+rules. A caller therefore takes effect only once it is on the default branch.
+Keep `gate-guard.yml` working until every caller has moved over.
 
 What it does on each `opened`, `synchronize`, `reopened`, `labeled` and
 `unlabeled` event:
@@ -114,7 +116,7 @@ What it does on each `opened`, `synchronize`, `reopened`, `labeled` and
    didn't apply to this head. A job that can't read the diff or the labels
    posts a failure.
 
-The workflow job's own check (`judge / judge`) lands on the base branch's
+The workflow job's own check (`judge / judge`) lands on the default branch's
 commit, as every `pull_request_target` check does, so a ruleset can't use it.
 Require `gate-guard` instead. The job also exposes `conclusion`,
 `gate-change-approved` and `findings-accepted` as outputs.
@@ -123,8 +125,8 @@ Copy `templates/gate-guard-target-caller.yml` to
 `.github/workflows/gate-guard-target.yml` in each repository and put the same
 full SHA of this repository's `main` in both places it asks for one. This
 repository calls the local copy through `gate-guard-base.yml`, with
-`guard-ref: ${{ github.sha }}`, which under `pull_request_target` is the base
-branch's commit.
+`guard-ref: ${{ github.sha }}`, which under `pull_request_target` is the
+default branch's newest commit.
 
 | Input | Default | Meaning |
 | --- | --- | --- |
@@ -147,9 +149,10 @@ anything from the pull request:
   tree, so no hook, build file, `.gitattributes` driver, submodule or LFS
   object from the pull request takes effect. The only checkout is this
   repository's script, at a pinned SHA.
-- **The judge comes from the base.** The caller, the reusable workflow (local,
-  or pinned by SHA) and the script (pinned by SHA) are all fixed by the base
-  branch. Every action is pinned by full SHA.
+- **The judge comes from the default branch.** The caller, the reusable
+  workflow (local, or pinned by SHA) and the script (pinned by SHA) are all
+  fixed by the default branch, even for a pull request into another branch.
+  Every action is pinned by full SHA.
 - **No secrets.** Only the default `GITHUB_TOKEN`, with `contents: read`,
   `issues: read`, `pull-requests: read` and `checks: write`. `checks: write` is
   there only to post the verdict on the head commit. The token reaches git
@@ -176,7 +179,7 @@ anything from the pull request:
 - **What a diff can't show.** A test made vacuous (`assert True`), a slower
   test, or a weaker assertion is not a hit. The guard looks for removals,
   skips, retries and config edits, not for meaning.
-- **Direct pushes to the base branch.** They never trigger this workflow. The
+- **Direct pushes to the default branch.** They never trigger this workflow. The
   default-branch ruleset (agent-ops `config/rulesets.yaml`) blocks them.
 - **`gate-guard.yml` callers.** Repositories still on the `pull_request`
   version keep the old hole until they move.

@@ -4,12 +4,12 @@
 #
 #   git ls-remote https://github.com/dflippojr/.github refs/heads/main
 #
-# pull_request_target runs this file as it is on the base branch, so a pull
+# pull_request_target runs this file as it is on the default branch, so a pull
 # request that edits it cannot change its own verdict. The verdict lands as the
 # gate-guard check on the pull request's head commit; require gate-guard in the
 # repository's ruleset next to gate. See README.md in dflippojr/.github, "Gate
-# guard on the base branch".
-name: Gate guard (base branch)
+# guard on the default branch".
+name: Gate guard (default branch)
 
 on:
   pull_request_target:

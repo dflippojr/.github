@@ -929,7 +929,7 @@ def render_target_summary(hits, error, verdicts, findings_blocked, sha, guard_sh
         counts, why = verdicts[label]
         out.append(f"| `{label}` | {'yes' if counts else 'no'} | {_cell(why)} |")
     guard = f" with `gate_guard.py` at `{guard_sha[:12]}`" if guard_sha else ""
-    out += ["", f"Judged head `{sha[:12]}` with the base branch's workflow{guard}. The pull request's "
+    out += ["", f"Judged head `{sha[:12]}` with the default branch's workflow{guard}. The pull request's "
                 "files are read only as a diff; none of them run."]
     return "\n".join(out) + "\n"
 

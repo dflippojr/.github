@@ -7,7 +7,7 @@ index 5d1c0a2..9e4b7f1 100644
 --- a/.github/workflows/gate-guard-target.yml
 +++ b/.github/workflows/gate-guard-target.yml
 @@ -1,21 +1,15 @@
- name: Gate guard (base branch)
+ name: Gate guard (default branch)
 
  on:
    pull_request_target:

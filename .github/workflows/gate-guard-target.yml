@@ -1,8 +1,8 @@
-name: Gate guard (base branch)
+name: Gate guard (default branch)
 
 # Reusable gate guard for pull_request_target callers. That event runs the
-# workflow as defined on the base branch, so a pull request cannot rewrite the
-# check that judges it. The job never checks out or runs pull request code: the
+# workflow as defined on the repository's default branch, whatever the pull
+# request's base, so a pull request cannot rewrite the check that judges it. The job never checks out or runs pull request code: the
 # script fetches the merge base and head commits as git objects and reads
 # their diff. It uses no secrets, only the caller's GITHUB_TOKEN.
 #
@@ -10,8 +10,8 @@ name: Gate guard (base branch)
 # the newest labeled/unlabeled event for the label is the owner's, applied after
 # the head commit was pushed. The verdict is posted as a check run named
 # gate-guard on the head commit, which is what a ruleset can require. This job's
-# own check lands on the base commit. See README.md, "Gate guard on the base
-# branch".
+# own check lands on the default branch's commit. See README.md, "Gate guard on
+# the default branch".
 on:
   workflow_call:
     inputs:

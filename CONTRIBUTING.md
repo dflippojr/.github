@@ -19,7 +19,7 @@ Feature work and fixes go through GitHub issues and pull requests, so plans and 
 | `findings-accepted` | The owner accepted this pull request's open review findings |
 | `P0` / `P1` / `P2` | Priority: do first / bugs and fixes ahead of features / normal |
 
-`gate-change-approved` and `findings-accepted` are owner-only. The base-branch gate guard counts one only when the owner applied it after the newest push. A label a worker applies, or re-applies, doesn't count, and a push voids the owner's label until the owner applies it again.
+`gate-change-approved` and `findings-accepted` are owner-only. The default-branch gate guard counts one only when the owner applied it after the newest push. A label a worker applies, or re-applies, doesn't count, and a push voids the owner's label until the owner applies it again.
 
 The remaining labels are GitHub's defaults plus one for accessibility:
 

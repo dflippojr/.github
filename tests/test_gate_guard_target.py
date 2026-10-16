@@ -123,7 +123,7 @@ class Scenarios(unittest.TestCase):
                 self.assertIn(f"conclusion={expect['conclusion']}", outputs)
 
     def test_head_edits_caller_is_judged_by_the_base(self):
-        """The head's caller would post a passing check; the base branch's guard posts a failing one."""
+        """The head's caller would post a passing check; the default branch's guard posts a failing one."""
         scenario = json.loads((SCENARIOS / "head-edits-caller.json").read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory() as tmp:
             code, _, fake, _, _ = run_scenario(scenario, tmp)
@@ -328,7 +328,7 @@ class WorkflowSafety(unittest.TestCase):
     def test_reusable_workflow_edit_is_a_gate_change(self):
         diff = ("diff --git a/.github/workflows/gate-guard-target.yml b/.github/workflows/gate-guard-target.yml\n"
                 "--- a/.github/workflows/gate-guard-target.yml\n+++ b/.github/workflows/gate-guard-target.yml\n"
-                "@@ -1 +1 @@\n-name: Gate guard (base branch)\n+name: Gate guard\n")
+                "@@ -1 +1 @@\n-name: Gate guard (default branch)\n+name: Gate guard\n")
         [hit] = gate_guard.analyze(gate_guard.parse_diff(diff))
         self.assertEqual((hit.rule, hit.detail), ("gate-config", "workflow modified"))
 
