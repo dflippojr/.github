@@ -1,0 +1,35 @@
+# Copy to .github/workflows/gate-guard-target.yml in each repository, then
+# replace both <full-sha> placeholders with the same full commit SHA of
+# dflippojr/.github main:
+#
+#   git ls-remote https://github.com/dflippojr/.github refs/heads/main
+#
+# pull_request_target runs this file as it is on the base branch, so a pull
+# request that edits it cannot change its own verdict. The verdict lands as the
+# gate-guard check on the pull request's head commit; require gate-guard in the
+# repository's ruleset next to gate. See README.md in dflippojr/.github, "Gate
+# guard on the base branch".
+name: Gate guard (base branch)
+
+on:
+  pull_request_target:
+    # labeled/unlabeled re-judge the pull request when an owner label changes.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+  checks: write
+
+concurrency:
+  group: gate-guard-target-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  judge:
+    uses: dflippojr/.github/.github/workflows/gate-guard-target.yml@<full-sha>
+    with:
+      guard-ref: <full-sha>
+      # Private repositories run on the tower:
+      # runs-on: '["self-hosted", "Linux", "X64", "tower-linux"]'
