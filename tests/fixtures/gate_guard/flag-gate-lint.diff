@@ -1,0 +1,52 @@
+# gate-guard fixture: an ESLint rule turned off, a ruff ignore and a removed ruff select entry, a flake8 ignore
+# expect: gate-config
+# hits: 4
+
+diff --git a/.eslintrc.json b/.eslintrc.json
+index 167fa26..709f2b1 100644
+--- a/.eslintrc.json
++++ b/.eslintrc.json
+@@ -1,6 +1,6 @@
+ {
+   "rules": {
+-    "no-console": "error",
++    "no-console": "off",
+     "eqeqeq": "error"
+   }
+ }
+diff --git a/.flake8 b/.flake8
+index 316b085..1aa882a 100644
+--- a/.flake8
++++ b/.flake8
+@@ -1,4 +1,5 @@
+ [flake8]
+ max-line-length = 100
+ extend-ignore =
+     E203,
++    W503,
+diff --git a/pyproject.toml b/pyproject.toml
+index fd91cda..f3df0bc 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,20 +1,20 @@
+ [project]
+ name = "calc"
+ version = "1.0"
+ 
+ [tool.coverage.run]
+ branch = true
+ 
+ [tool.coverage.report]
+ fail_under = 90
+ show_missing = true
+ 
+ [tool.ruff.lint]
+ select = [
+     "E",
+     "F",
+-    "B",
+ ]
+ ignore = [
+     "E741",
++    "E501",
+ ]

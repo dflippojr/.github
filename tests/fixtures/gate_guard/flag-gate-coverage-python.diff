@@ -1,0 +1,53 @@
+# gate-guard fixture: .coveragerc, [tool.coverage] and [coverage:report] edits
+# expect: gate-config
+# hits: 3
+
+diff --git a/.coveragerc b/.coveragerc
+index 472f9c3..5b47240 100644
+--- a/.coveragerc
++++ b/.coveragerc
+@@ -1,5 +1,5 @@
+ [run]
+ source = calc
+ 
+ [report]
+-fail_under = 85
++fail_under = 60
+diff --git a/pyproject.toml b/pyproject.toml
+index fd91cda..badce82 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,20 +1,21 @@
+ [project]
+ name = "calc"
+ version = "1.0"
+ 
+ [tool.coverage.run]
+ branch = true
+ 
+ [tool.coverage.report]
+ fail_under = 90
+ show_missing = true
++omit = ["calc/slow.py"]
+ 
+ [tool.ruff.lint]
+ select = [
+     "E",
+     "F",
+     "B",
+ ]
+ ignore = [
+     "E741",
+ ]
+diff --git a/setup.cfg b/setup.cfg
+index dc60656..e8b21b5 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -1,6 +1,7 @@
+ [metadata]
+ name = calc
+ 
+ [coverage:report]
+ exclude_lines =
+     pragma: no cover
++    if TYPE_CHECKING:

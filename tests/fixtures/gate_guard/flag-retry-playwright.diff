@@ -1,0 +1,40 @@
+# gate-guard fixture: Playwright retries raised in the config and set in a spec
+# expect: retry
+# hits: 2
+
+diff --git a/playwright.config.ts b/playwright.config.ts
+index 0b93f97..ac1fb1e 100644
+--- a/playwright.config.ts
++++ b/playwright.config.ts
+@@ -1,7 +1,7 @@
+ import { defineConfig } from '@playwright/test';
+ 
+ export default defineConfig({
+   testDir: './tests',
+-  retries: 1,
++  retries: process.env.CI ? 3 : 0,
+   use: { trace: 'on-first-retry' },
+ });
+diff --git a/tests/cart.spec.ts b/tests/cart.spec.ts
+index 795c13d..e9255e1 100644
+--- a/tests/cart.spec.ts
++++ b/tests/cart.spec.ts
+@@ -1,17 +1,18 @@
+ import { test, expect } from '@playwright/test';
+ 
+ test('adds an item', async ({ page }) => {
+   await page.goto('/cart');
+   await expect(page.getByRole('row')).toHaveCount(1);
+ });
+ 
+ test('removes an item', async ({ page }) => {
+   await page.goto('/cart');
+   await expect(page.getByRole('row')).toHaveCount(0);
+ });
+ 
+ test.describe('checkout', () => {
++  test.describe.configure({ retries: 2 });
+   it('charges the card', async () => {
+     expect(1).toBe(1);
+   });
+ });

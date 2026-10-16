@@ -1,0 +1,69 @@
+# gate-guard fixture: an ordinary feature: code, new tests with an environment guard, and look-alikes outside test config
+# expect: 
+# hits: 0
+
+diff --git a/README.md b/README.md
+index e2bd155..57e5ed9 100644
+--- a/README.md
++++ b/README.md
+@@ -1 +1,3 @@
+ # app
++
++Coverage must stay above fail_under = 90; never add pytest.mark.skip.
+diff --git a/config/app.yml b/config/app.yml
+index 9050578..bc75d17 100644
+--- a/config/app.yml
++++ b/config/app.yml
+@@ -1,2 +1,2 @@
+-budget: 500
+-limit: 10
++budget: 900
++limit: 20
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 766b3e6..0b77dc8 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -1,6 +1,6 @@
+ services:
+   db:
+     image: postgres:17
+     healthcheck:
+       test: pg_isready
+-      retries: 3
++      retries: 5
+diff --git a/src/http.py b/src/http.py
+index 8a3518a..b74b06a 100644
+--- a/src/http.py
++++ b/src/http.py
+@@ -1,2 +1,2 @@
+-def get(url):
+-    return fetch(url)
++def get(url, retries=3):
++    return fetch(url, retries=retries)
+diff --git a/src/reader.js b/src/reader.js
+index 83ec013..0eb0a13 100644
+--- a/src/reader.js
++++ b/src/reader.js
+@@ -1 +1 @@
+-export const read = (s) => s;
++export const read = (s) => s.skip(2).only(1);
+diff --git a/tests/test_http.py b/tests/test_http.py
+index f93fa98..21b0fcd 100644
+--- a/tests/test_http.py
++++ b/tests/test_http.py
+@@ -1,5 +1,15 @@
++import shutil
++
++import pytest
++
+ from src.http import get
+ 
+ 
+ def test_get():
+     assert get
++
++
++def test_get_retries():
++    if shutil.which("curl") is None:
++        pytest.skip("curl isn't installed")
++    assert get

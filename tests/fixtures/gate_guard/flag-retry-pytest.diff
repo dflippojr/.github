@@ -1,0 +1,42 @@
+# gate-guard fixture: --reruns, pytest-rerunfailures and @pytest.mark.flaky
+# expect: retry
+# hits: 3
+
+diff --git a/pytest.ini b/pytest.ini
+index 154db6e..9ab5ecc 100644
+--- a/pytest.ini
++++ b/pytest.ini
+@@ -1,3 +1,3 @@
+ [pytest]
+-addopts = -q
++addopts = -q --reruns 2
+ testpaths = tests
+diff --git a/requirements-dev.txt b/requirements-dev.txt
+index 7345f25..6c05586 100644
+--- a/requirements-dev.txt
++++ b/requirements-dev.txt
+@@ -1 +1,2 @@
+ pytest==9.1.1
++pytest-rerunfailures==16.1
+diff --git a/tests/test_calc.py b/tests/test_calc.py
+index 3ba026a..92a1d5d 100644
+--- a/tests/test_calc.py
++++ b/tests/test_calc.py
+@@ -1,16 +1,17 @@
+ import pytest
+ 
+ from calc import add, sub
+ 
+ 
++@pytest.mark.flaky(reruns=3)
+ def test_add():
+     assert add(1, 2) == 3
+ 
+ 
+ def test_sub():
+     assert sub(3, 2) == 1
+ 
+ 
+ class TestEdge:
+     def test_zero(self):
+         assert add(0, 0) == 0

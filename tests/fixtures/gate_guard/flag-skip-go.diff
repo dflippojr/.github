@@ -1,0 +1,28 @@
+# gate-guard fixture: an unconditional t.Skip; the testing.Short guard is not a hit
+# expect: skip-marker
+# hits: 1
+
+diff --git a/calc/calc_test.go b/calc/calc_test.go
+index de42a24..f490bbf 100644
+--- a/calc/calc_test.go
++++ b/calc/calc_test.go
+@@ -1,15 +1,19 @@
+ package calc
+ 
+ import "testing"
+ 
+ func TestAdd(t *testing.T) {
++	if testing.Short() {
++		t.Skip("short")
++	}
+ 	if Add(1, 2) != 3 {
+ 		t.Fatal("add")
+ 	}
+ }
+ 
+ func TestSub(t *testing.T) {
++	t.Skip("flaky")
+ 	if Sub(3, 2) != 1 {
+ 		t.Fatal("sub")
+ 	}
+ }

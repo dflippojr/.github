@@ -1,0 +1,2 @@
+# Fixture diffs are data: keep their bytes, including LF line endings.
+tests/fixtures/** -text

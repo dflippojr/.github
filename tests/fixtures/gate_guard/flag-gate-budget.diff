@@ -1,0 +1,54 @@
+# gate-guard fixture: size-limit, Angular and Lighthouse budgets raised
+# expect: gate-config
+# hits: 3
+
+diff --git a/.size-limit.json b/.size-limit.json
+index a0a3a76..4df466c 100644
+--- a/.size-limit.json
++++ b/.size-limit.json
+@@ -1,6 +1,6 @@
+ [
+   {
+     "path": "dist/app.js",
+-    "limit": "10 kB"
++    "limit": "12 kB"
+   }
+ ]
+diff --git a/angular.json b/angular.json
+index 45c476b..7a599ae 100644
+--- a/angular.json
++++ b/angular.json
+@@ -1,17 +1,17 @@
+ {
+   "projects": {
+     "app": {
+       "architect": {
+         "build": {
+           "configurations": {
+             "production": {
+               "budgets": [
+-                { "type": "initial", "maximumWarning": "500kb", "maximumError": "1mb" }
++                { "type": "initial", "maximumWarning": "2mb", "maximumError": "1mb" }
+               ]
+             }
+           }
+         }
+       }
+     }
+   }
+ }
+diff --git a/lighthouserc.json b/lighthouserc.json
+index a09e9a7..9e57491 100644
+--- a/lighthouserc.json
++++ b/lighthouserc.json
+@@ -1,9 +1,9 @@
+ {
+   "ci": {
+     "assert": {
+       "assertions": {
+-        "interactive": ["error", {"maxNumericValue": 2000}]
++        "interactive": ["error", {"maxNumericValue": 3000}]
+       }
+     }
+   }
+ }

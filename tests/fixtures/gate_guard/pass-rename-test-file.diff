@@ -1,0 +1,35 @@
+# gate-guard fixture: a test file renamed as-is and one renamed with a small edit
+# expect: 
+# hits: 0
+
+diff --git a/tests/cart.spec.ts b/tests/e2e/cart.spec.ts
+similarity index 85%
+rename from tests/cart.spec.ts
+rename to tests/e2e/cart.spec.ts
+index 795c13d..713cd78 100644
+--- a/tests/cart.spec.ts
++++ b/tests/e2e/cart.spec.ts
+@@ -1,17 +1,17 @@
+ import { test, expect } from '@playwright/test';
+ 
+ test('adds an item', async ({ page }) => {
+-  await page.goto('/cart');
++  await page.goto('/basket');
+   await expect(page.getByRole('row')).toHaveCount(1);
+ });
+ 
+ test('removes an item', async ({ page }) => {
+-  await page.goto('/cart');
++  await page.goto('/basket');
+   await expect(page.getByRole('row')).toHaveCount(0);
+ });
+ 
+ test.describe('checkout', () => {
+   it('charges the card', async () => {
+     expect(1).toBe(1);
+   });
+ });
+diff --git a/tests/test_calc.py b/tests/unit/test_calc.py
+similarity index 100%
+rename from tests/test_calc.py
+rename to tests/unit/test_calc.py

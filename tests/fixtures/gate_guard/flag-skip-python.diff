@@ -1,0 +1,44 @@
+# gate-guard fixture: pytest and unittest markers, an unconditional and a CI-only skip; the environment guard is not a hit
+# expect: skip-marker
+# hits: 6
+
+diff --git a/tests/test_calc.py b/tests/test_calc.py
+index 3ba026a..6cc5ec4 100644
+--- a/tests/test_calc.py
++++ b/tests/test_calc.py
+@@ -1,16 +1,35 @@
+ import pytest
+ 
+ from calc import add, sub
+ 
+ 
++@pytest.mark.skip(reason="broken")
+ def test_add():
+     assert add(1, 2) == 3
+ 
+ 
++@pytest.mark.skipif(sys.platform == "win32", reason="posix")
++@pytest.mark.xfail
+ def test_sub():
+     assert sub(3, 2) == 1
+ 
+ 
++@unittest.skip("later")
+ class TestEdge:
+     def test_zero(self):
+         assert add(0, 0) == 0
++def test_mul():
++    pytest.skip("flaky")
++    assert mul(2, 2) == 4
++
++
++def test_node():
++    if shutil.which("node") is None:
++        pytest.skip("node isn't installed")
++    assert True
++
++
++def test_div():
++    if os.environ.get("CI"):
++        pytest.skip("slow on CI")
++    assert div(4, 2) == 2

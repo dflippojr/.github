@@ -1,0 +1,28 @@
+# gate-guard fixture: a #[test] function is removed
+# expect: removed-tests
+# hits: 1
+
+diff --git a/src/lib.rs b/src/lib.rs
+index e0f2559..c5de69c 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,19 +1,13 @@
+ pub fn add(a: i32, b: i32) -> i32 {
+     a + b
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
+     #[test]
+     fn adds() {
+         assert_eq!(add(1, 2), 3);
+     }
+-
+-    #[test]
+-    #[should_panic]
+-    fn overflows() {
+-        add(i32::MAX, 1);
+-    }
+ }

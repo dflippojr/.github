@@ -1,0 +1,30 @@
+# gate-guard fixture: a JUnit @Test method is removed
+# expect: removed-tests
+# hits: 1
+
+diff --git a/src/test/java/shop/CartTest.java b/src/test/java/shop/CartTest.java
+index 044bc09..3625225 100644
+--- a/src/test/java/shop/CartTest.java
++++ b/src/test/java/shop/CartTest.java
+@@ -1,21 +1,15 @@
+ package shop;
+ 
+ import org.junit.jupiter.api.Test;
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ 
+ class CartTest {
+     @Test
+     void addsItem() {
+         assertEquals(1, new Cart().add("a").size());
+     }
+ 
+-    @Test
+-    @DisplayName("removes an item")
+-    void removesItem() {
+-        assertEquals(0, new Cart().add("a").remove("a").size());
+-    }
+-
+     @Test void emptyByDefault() {
+         assertEquals(0, new Cart().size());
+     }
+ }

@@ -1,0 +1,24 @@
+# gate-guard fixture: a Go Test function is removed
+# expect: removed-tests
+# hits: 1
+
+diff --git a/calc/calc_test.go b/calc/calc_test.go
+index de42a24..2284039 100644
+--- a/calc/calc_test.go
++++ b/calc/calc_test.go
+@@ -1,15 +1,9 @@
+ package calc
+ 
+ import "testing"
+ 
+ func TestAdd(t *testing.T) {
+ 	if Add(1, 2) != 3 {
+ 		t.Fatal("add")
+ 	}
+ }
+-
+-func TestSub(t *testing.T) {
+-	if Sub(3, 2) != 1 {
+-		t.Fatal("sub")
+-	}
+-}
