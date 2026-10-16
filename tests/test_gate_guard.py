@@ -294,7 +294,6 @@ def _trees(diff_text):
     return before, after
 
 
-@unittest.skipIf(shutil.which("git") is None, "git is not installed")
 class GitEndToEnd(unittest.TestCase):
     """The CLI diffs two real commits the way the workflow does and reaches the same verdict."""
 
