@@ -116,10 +116,10 @@ What it does on each `opened`, `synchronize`, `reopened`, `labeled` and
    didn't apply to this head. A job that can't read the diff or the labels
    posts a failure.
 
-The workflow job's own check (`judge / judge`) lands on the default branch's
-commit, as every `pull_request_target` check does, so a ruleset can't use it.
-Require `gate-guard` instead. The job also exposes `conclusion`,
-`gate-change-approved` and `findings-accepted` as outputs.
+Require `gate-guard` in the ruleset. The workflow job's own check also shows
+on the pull request, but its name (`judge / judge` with the template) comes
+from the caller's job names, and it carries no report. The job also exposes
+`conclusion`, `gate-change-approved` and `findings-accepted` as outputs.
 
 Copy `templates/gate-guard-target-caller.yml` to
 `.github/workflows/gate-guard-target.yml` in each repository and put the same
@@ -155,7 +155,7 @@ anything from the pull request:
   Every action is pinned by full SHA.
 - **No secrets.** Only the default `GITHUB_TOKEN`, with `contents: read`,
   `issues: read`, `pull-requests: read` and `checks: write`. `checks: write` is
-  there only to post the verdict on the head commit. The token reaches git
+  there only to post the `gate-guard` check run on the head commit. The token reaches git
   through the environment, never a command line or `.git/config`.
 - **No untrusted input in shell.** No `run:` step interpolates pull request
   fields such as the branch name or title. The script reads the event payload
