@@ -92,16 +92,26 @@ the pull request's base (GitHub's rule since 2025-12-08). It applies the same
 rules. A caller therefore takes effect only once it is on the default branch.
 Keep `gate-guard.yml` working until every caller has moved over.
 
-What it does on each `opened`, `synchronize`, `reopened`, `labeled` and
-`unlabeled` event:
+What it does on each `opened`, `synchronize`, `reopened`, `edited`, `labeled`
+and `unlabeled` event. `edited` covers a pull request moved to another base:
+the same head against a new base can bring hits the old base hid.
 
 1. Loads `scripts/gate_guard.py` from this repository at the full commit SHA in
    `guard-ref`. Anything other than 40 hex characters fails the job.
-2. Asks the compare API for the merge base, then fetches the merge base and the
-   head commit as git objects into an empty repository (`git fetch --depth=1`,
-   no checkout) and reads their diff, with no external diff or textconv driver.
-3. Checks the owner-only labels, `gate-change-approved` and
-   `findings-accepted`. One counts only when both are true:
+2. Lists every open pull request whose head is the event's head commit, with
+   each one's current base, and judges each of them as in steps 3 and 4. A
+   check run belongs to a commit, not to a pull request, so the guard makes one
+   decision per commit: two pull requests that share a head but not a base can't
+   let the passing one's result replace the failing one's. The caller's
+   concurrency group is keyed by the head SHA, so the newest decision for a
+   commit is the one that lands. Closing the pull request that fails doesn't
+   re-judge the others; a push, an edit or a label change on one of them does.
+3. Asks the compare API for each pull request's merge base, then fetches the
+   merge base and the head commit as git objects into an empty repository
+   (`git fetch --depth=1`, no checkout) and reads their diff, with no external
+   diff or textconv driver.
+4. Checks the owner-only labels, `gate-change-approved` and
+   `findings-accepted`. One counts only when all of these are true:
    - the newest labeled/unlabeled event for it is `labeled` by the owner (the
      same rule as `ao owner-label`), so a label a worker applies or re-applies
      doesn't count;
@@ -109,17 +119,22 @@ What it does on each `opened`, `synchronize`, `reopened`, `labeled` and
      GitHub's repository activity record, not from commit dates, which whoever
      makes the commit sets. A push makes the owner's label stale. If GitHub has
      no record of the push, the label doesn't count.
-4. Posts the verdict as a check run named **`gate-guard`** on the head commit,
-   with the hit table and the label verdicts. It fails on unapproved hits, as
-   `gate-guard.yml` does. It also fails while `findings-accepted` is on the
-   pull request but doesn't count, so nothing can lean on a label the owner
-   didn't apply to this head. A job that can't read the diff or the labels
-   posts a failure.
+   - the whole label history was read. A list longer than 30 pages of 100
+     fails the job rather than judge from its oldest part.
+5. Posts the verdict as a check run named **`gate-guard`** on the head commit,
+   with the hit table and the label verdicts of each pull request. It fails
+   when any of them has unapproved hits, as `gate-guard.yml` does. It also
+   fails while `findings-accepted` is on a pull request but doesn't count, so
+   nothing can lean on a label the owner didn't apply to this head. A job that
+   can't read a diff, the labels or the list of open pull requests posts a
+   failure.
 
 Require `gate-guard` in the ruleset. The workflow job's own check also shows
 on the pull request, but its name (`judge / judge` with the template) comes
 from the caller's job names, and it carries no report. The job also exposes
-`conclusion`, `gate-change-approved` and `findings-accepted` as outputs.
+`conclusion`, `gate-change-approved` and `findings-accepted` as outputs; a
+label output is `true` only when the label counts on every open pull request
+with the head.
 
 Copy `templates/gate-guard-target-caller.yml` to
 `.github/workflows/gate-guard-target.yml` in each repository and put the same

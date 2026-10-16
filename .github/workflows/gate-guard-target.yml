@@ -9,9 +9,11 @@ name: Gate guard (default branch)
 #
 # Owner-only labels (gate-change-approved, findings-accepted) count only when
 # the newest labeled/unlabeled event for the label is the owner's, applied after
-# the head commit was pushed. The verdict is posted as a check run named
-# gate-guard on the head commit, with the full report; a ruleset requires that
-# name. See README.md, "Gate guard on the default branch".
+# the head commit was pushed. A check run belongs to a commit, so the script
+# judges every open pull request with the event's head, each against its
+# current base, and posts one verdict as a check run named gate-guard on that
+# commit, with the full report; a ruleset requires that name. See README.md,
+# "Gate guard on the default branch".
 on:
   workflow_call:
     inputs:
@@ -37,10 +39,10 @@ on:
         description: success or failure, as posted on the gate-guard check run.
         value: ${{ jobs.judge.outputs.conclusion }}
       gate-change-approved:
-        description: "'true' when the owner's gate-change-approved label counts for the head commit."
+        description: "'true' when the owner's gate-change-approved label counts on every open pull request with the head."
         value: ${{ jobs.judge.outputs.gate-change-approved }}
       findings-accepted:
-        description: "'true' when the owner's findings-accepted label counts for the head commit."
+        description: "'true' when the owner's findings-accepted label counts on every open pull request with the head."
         value: ${{ jobs.judge.outputs.findings-accepted }}
 
 permissions:

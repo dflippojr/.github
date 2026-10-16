@@ -7,6 +7,7 @@ import re
 import subprocess
 import tempfile
 import unittest
+import urllib.parse
 from unittest import mock
 
 from test_gate_guard import FIXTURES, _trees, clean_env, gate_guard
@@ -15,32 +16,53 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 SCENARIOS = pathlib.Path(__file__).resolve().parent / "fixtures" / "gate_guard_target"
 WORKFLOWS = ROOT / ".github" / "workflows"
 OWNER, REPO, NUMBER, HEAD_REF = "dflippojr", "dflippojr/demo", 7, "feature"
+HEAD_GROUP = "group: gate-guard-target-${{ github.event.pull_request.head.sha }}"
 
 
 class FakeGitHub:
-    """Answers the API calls of run_target from a scenario and records the check runs it posts."""
+    """Answers the API calls of run_target and records the check runs it posts.
 
-    def __init__(self, merge_base, head, scenario):
-        self.merge_base, self.head, self.scenario = merge_base, head, scenario
+    prs maps each open pull request with head `head` to its base, head branch,
+    labels, label events and push time; merge_bases maps each base to its merge
+    base with the head.
+    """
+
+    def __init__(self, head, merge_bases, prs):
+        self.head, self.merge_bases, self.prs = head, merge_bases, prs
         self.posted = []
 
+    @classmethod
+    def single(cls, merge_base, head, scenario, base="main"):
+        return cls(head, {base: merge_base}, {NUMBER: dict(scenario, base=base, head_ref=HEAD_REF)})
+
     def get(self, path):
-        assert path == f"/repos/{REPO}/compare/main...{self.head}?per_page=1", path
-        return {"merge_base_commit": {"sha": self.merge_base}}
+        for base, merge_base in self.merge_bases.items():
+            if path == f"/repos/{REPO}/compare/{base}...{self.head}?per_page=1":
+                return {"merge_base_commit": {"sha": merge_base}}
+        raise AssertionError(f"unexpected API path {path}")
 
     def pages(self, path):
-        s = self.scenario
-        if path == f"/repos/{REPO}/issues/{NUMBER}/labels":
-            return [{"name": n} for n in s["labels"]]
-        if path == f"/repos/{REPO}/issues/{NUMBER}/events":
-            return [{"id": i, "event": e["event"], "label": {"name": e["label"]}, "actor": {"login": e["actor"]},
-                     "created_at": e["created_at"]} for i, e in enumerate(s["events"])]
-        if path == f"/repos/{REPO}/activity?ref=refs/heads/{HEAD_REF}":
-            # Newest first, as GitHub returns it; pushes of other commits and refs are noise.
-            noise = [{"after": "f" * 40, "ref": f"refs/heads/{HEAD_REF}", "timestamp": "2026-10-16T23:00:00Z"},
-                     {"after": self.head, "ref": "refs/heads/other", "timestamp": "2026-10-16T23:00:00Z"}]
-            push = [{"after": self.head, "ref": f"refs/heads/{HEAD_REF}", "timestamp": s["pushed_at"]}]
-            return noise + (push if s["pushed_at"] else [])
+        if path == f"/repos/{REPO}/pulls?state=open":
+            # An open pull request with another head is noise.
+            other = {"number": 99, "head": {"sha": "f" * 40, "ref": "other", "repo": {"full_name": REPO}},
+                     "base": {"ref": "main"}}
+            return [other] + [{"number": n, "head": {"sha": self.head, "ref": p["head_ref"],
+                                                     "repo": {"full_name": REPO}}, "base": {"ref": p["base"]}}
+                              for n, p in self.prs.items()]
+        for number, s in self.prs.items():
+            if path == f"/repos/{REPO}/issues/{number}/labels":
+                return [{"name": n} for n in s["labels"]]
+            if path == f"/repos/{REPO}/issues/{number}/events":
+                return [{"id": i, "event": e["event"], "label": {"name": e["label"]},
+                         "actor": {"login": e["actor"]}, "created_at": e["created_at"]}
+                        for i, e in enumerate(s["events"])]
+            ref = f"refs/heads/{s['head_ref']}"
+            if path == f"/repos/{REPO}/activity?ref={ref}":
+                # Newest first, as GitHub returns it; pushes of other commits and refs are noise.
+                noise = [{"after": "f" * 40, "ref": ref, "timestamp": "2026-10-16T23:00:00Z"},
+                         {"after": self.head, "ref": "refs/heads/other", "timestamp": "2026-10-16T23:00:00Z"}]
+                push = [{"after": self.head, "ref": ref, "timestamp": s["pushed_at"]}]
+                return noise + (push if s["pushed_at"] else [])
         raise AssertionError(f"unexpected API path {path}")
 
     def post(self, path, body):
@@ -69,34 +91,43 @@ def commit_tree(root, files, message):
     return git(root, "rev-parse", "HEAD")
 
 
-def make_remote(tmp, diff_name):
-    """A repository at <tmp>/server/<REPO>.git holding the fixture's base and head commits."""
+def make_remote(tmp, *trees):
+    """(server URL, commit shas): a repository at <tmp>/server/<REPO>.git with one commit per tree, in a line."""
     remote = pathlib.Path(tmp, "server", f"{REPO}.git")
     remote.mkdir(parents=True)
     git(remote, "init", "-q")
     git(remote, "config", "uploadpack.allowAnySHA1InWant", "true")
-    before, after = _trees((FIXTURES / f"{diff_name}.diff").read_text(encoding="utf-8"))
-    base = commit_tree(remote, before, "base")
-    head = commit_tree(remote, after, "head")
-    return pathlib.Path(tmp, "server").as_uri(), base, head
+    shas = [commit_tree(remote, files, f"commit {i}") for i, files in enumerate(trees)]
+    return pathlib.Path(tmp, "server").as_uri(), shas
 
 
-def run_scenario(scenario, tmp):
-    """(exit code, stdout, fake API, head sha, outputs) of the CLI on a scenario."""
-    server, base, head = make_remote(tmp, scenario["diff"])
-    event = pathlib.Path(tmp, "event.json")
-    event.write_text(json.dumps({"pull_request": {
-        "number": NUMBER, "head": {"sha": head, "ref": HEAD_REF, "repo": {"full_name": REPO}},
-        "base": {"ref": "main", "sha": base}}}), encoding="utf-8")
+def event_pr(number, head, base, head_ref=HEAD_REF):
+    return {"number": number, "head": {"sha": head, "ref": head_ref, "repo": {"full_name": REPO}},
+            "base": {"ref": base}}
+
+
+def run_cli(tmp, server, event, fake):
+    """(exit code, stdout, outputs) of the CLI on a pull_request_target event, against a fake API."""
+    path = pathlib.Path(tmp, "event.json")
+    path.write_text(json.dumps(event), encoding="utf-8")
     outputs = pathlib.Path(tmp, "outputs.txt")
-    env = clean_env({"GITHUB_EVENT_PATH": str(event), "GITHUB_REPOSITORY": REPO, "GITHUB_REPOSITORY_OWNER": OWNER,
+    outputs.write_text("", encoding="utf-8")
+    env = clean_env({"GITHUB_EVENT_PATH": str(path), "GITHUB_REPOSITORY": REPO, "GITHUB_REPOSITORY_OWNER": OWNER,
                      "GITHUB_SERVER_URL": server, "GITHUB_OUTPUT": str(outputs), "GITHUB_RUN_ID": "99"})
-    fake = FakeGitHub(base, head, scenario)
     out = io.StringIO()
     with mock.patch.dict(os.environ, env, clear=True), mock.patch("sys.stdout", out), \
             mock.patch.object(gate_guard, "GitHub", return_value=fake):
         code = gate_guard.main(["--pull-request-target", "--guard-sha", "a" * 40])
-    return code, out.getvalue(), fake, head, outputs.read_text(encoding="utf-8")
+    return code, out.getvalue(), outputs.read_text(encoding="utf-8")
+
+
+def run_scenario(scenario, tmp):
+    """(exit code, stdout, fake API, head sha, outputs) of the CLI on a scenario."""
+    diff = (FIXTURES / f"{scenario['diff']}.diff").read_text(encoding="utf-8")
+    server, (base, head) = make_remote(tmp, *_trees(diff))
+    fake = FakeGitHub.single(base, head, scenario)
+    code, out, outputs = run_cli(tmp, server, {"pull_request": event_pr(NUMBER, head, "main")}, fake)
+    return code, out, fake, head, outputs
 
 
 class Scenarios(unittest.TestCase):
@@ -132,6 +163,80 @@ class Scenarios(unittest.TestCase):
         self.assertIn("| gate-config | `.github/workflows/gate-guard-target.yml` | workflow modified |", summary)
         self.assertIn("removed-tests | `tests/test_billing.py`", summary)
         self.assertIn("none of them run", summary)
+
+
+class SharedHead(unittest.TestCase):
+    """C1 deletes a test and C2 changes code on top of it. C2 is the head of every pull request here.
+
+    Into main (merge base C0) the deletion shows; into the stacked branch at C1
+    (merge base C1) it doesn't.
+    """
+    BILLING = "def charge(amount):\n    return amount\n"
+    TEST = "from src.billing import charge\n\n\ndef test_charge():\n    assert charge(1) == 1\n"
+    NO_LABELS = {"labels": [], "events": [], "pushed_at": "2026-10-16T12:00:00Z"}
+    APPROVED = {"labels": [gate_guard.APPROVAL_LABEL], "events": [
+        {"event": "labeled", "label": gate_guard.APPROVAL_LABEL, "actor": OWNER, "created_at": "2026-10-16T13:00:00Z"}]}
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        self.server, (c0, c1, self.head) = make_remote(
+            self.tmp, {"src/billing.py": self.BILLING, "tests/test_billing.py": self.TEST},
+            {"src/billing.py": self.BILLING}, {"src/billing.py": "def charge(amount):\n    return round(amount, 2)\n"})
+        self.merge_bases = {"main": c0, "stacked": c1}
+
+    def pr(self, base, head_ref=HEAD_REF, **labels):
+        return dict(self.NO_LABELS, base=base, head_ref=head_ref, **labels)
+
+    def judge(self, prs, action, number, base):
+        """(exit code, check run, outputs) for an event on pull request `number` whose payload names `base`."""
+        fake = FakeGitHub(self.head, self.merge_bases, prs)
+        event = {"action": action, "pull_request": event_pr(number, self.head, base, prs[number]["head_ref"])}
+        code, _, outputs = run_cli(self.tmp, self.server, event, fake)
+        [check] = fake.posted
+        self.assertEqual(check["head_sha"], self.head)
+        return code, check, outputs
+
+    def test_stacked_pull_request_passes(self):
+        code, check, _ = self.judge({NUMBER: self.pr("stacked")}, "opened", NUMBER, "stacked")
+        self.assertEqual((code, check["conclusion"]), (0, "success"))
+
+    def test_retarget_to_main_is_judged_against_main(self):
+        """Retargeting fires `edited`, which the callers subscribe to; the deleted test now shows."""
+        code, check, _ = self.judge({NUMBER: self.pr("main")}, "edited", NUMBER, "main")
+        self.assertEqual((code, check["conclusion"]), (1, "failure"))
+        self.assertIn(f"### Gate guard: #{NUMBER} into `main`", check["output"]["summary"])
+        self.assertIn("removed-tests | `tests/test_billing.py`", check["output"]["summary"])
+
+    def test_current_base_wins_over_the_payload(self):
+        """A queued event's payload can predate a retarget; the guard judges the base the API reports now."""
+        code, check, _ = self.judge({NUMBER: self.pr("main")}, "labeled", NUMBER, "stacked")
+        self.assertEqual((code, check["conclusion"]), (1, "failure"))
+        self.assertIn("removed-tests | `tests/test_billing.py`", check["output"]["summary"])
+
+    def test_passing_pull_request_cannot_replace_a_failing_one(self):
+        """A second pull request with this head, into the stacked branch, passes alone; the commit's check fails."""
+        prs = {NUMBER: self.pr("main"), 8: self.pr("stacked", head_ref="stacked-copy")}
+        for number, base in ((8, "stacked"), (NUMBER, "main")):
+            with self.subTest(event=number):
+                code, check, outputs = self.judge(prs, "opened", number, base)
+                self.assertEqual((code, check["conclusion"]), (1, "failure"))
+                self.assertEqual(check["output"]["title"], f"#{NUMBER} into main: 1 hit, not approved")
+                summary = check["output"]["summary"]
+                self.assertIn(f"2 open pull requests have head `{self.head[:12]}`", summary)
+                self.assertIn(f"Failing: #{NUMBER}.", summary)
+                self.assertIn("### Gate guard: #8 into `stacked`", summary)
+                self.assertIn("conclusion=failure", outputs)
+
+    def test_shared_head_passes_once_every_pull_request_does(self):
+        prs = {NUMBER: self.pr("main", **self.APPROVED), 8: self.pr("stacked", head_ref="stacked-copy")}
+        code, check, outputs = self.judge(prs, "opened", 8, "stacked")
+        self.assertEqual((code, check["conclusion"]), (0, "success"))
+        self.assertEqual(check["output"]["title"], "All 2 pull requests with this head pass")
+        self.assertIn("Failing: none.", check["output"]["summary"])
+        # The outputs say whether a label counts on every pull request with this head.
+        self.assertIn("gate-change-approved=false", outputs)
 
 
 class OwnerLabel(unittest.TestCase):
@@ -184,7 +289,8 @@ class HeadPushedAt(unittest.TestCase):
 
 
 class TargetFailures(unittest.TestCase):
-    def run_target(self, fake, event):
+    @staticmethod
+    def run_target(fake, event):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp, "event.json")
             path.write_text(json.dumps(event), encoding="utf-8")
@@ -257,11 +363,93 @@ class TargetFailures(unittest.TestCase):
         self.assertEqual(code, 0)
         fake.post.assert_not_called()
 
+    def test_unlisted_open_pull_requests_fail_closed(self):
+        """Without the whole list of pull requests with this head, one that fails could go unseen."""
+        fake = mock.Mock()
+        fake.get.return_value = {"merge_base_commit": {"sha": "e" * 40}}
+
+        def pages(path):
+            if path == f"/repos/{REPO}/pulls?state=open":
+                raise gate_guard.IncompleteList("too many pages")
+            return []
+
+        fake.pages.side_effect = pages
+        with mock.patch.object(gate_guard, "fetch_diff", return_value=""):
+            code, _ = self.run_target(fake, self.EVENT)
+        self.assertEqual(code, 2)
+        body = fake.post.call_args[0][1]
+        self.assertEqual(body["conclusion"], "failure")
+        self.assertIn("could not list the open pull requests with this head (too many pages)",
+                      body["output"]["summary"])
+
     def test_annotations_only_for_lines(self):
         hits = [gate_guard.Hit("retry", "a.ts", 3, "raised"), gate_guard.Hit("removed-tests", "b.py", None, "gone")]
         self.assertEqual(gate_guard.check_annotations(hits, approved=False), [
             {"path": "a.ts", "start_line": 3, "end_line": 3, "annotation_level": "failure",
              "title": "gate-guard retry", "message": "raised"}])
+
+
+class CutOffLabelHistory(unittest.TestCase):
+    """The owner applied the label after the push, within the first pages of label events. A worker then churned
+    other labels past the page limit and removed and re-applied the owner's label there."""
+
+    def run_with_pages(self, label, max_pages):
+        head = "d" * 40
+        owner = {"event": "labeled", "label": {"name": label}, "actor": {"login": OWNER},
+                 "created_at": "2026-10-16T13:00:00Z"}
+        churn = {"event": "labeled", "label": {"name": "ready"}, "actor": {"login": "worker[bot]"},
+                 "created_at": "2026-10-16T14:00:00Z"}
+        worker = [{"event": e, "label": {"name": label}, "actor": {"login": "worker[bot]"},
+                   "created_at": "2026-10-16T15:00:00Z"} for e in ("unlabeled", "labeled")]
+        last = gate_guard.MAX_API_PAGES + 1
+        requested = []
+
+        def request(url, _token, method="GET", _body=None):
+            parts = urllib.parse.urlsplit(url)
+            if method == "POST":
+                return {"id": 1}, None
+            if "/compare/" in parts.path:
+                return {"merge_base_commit": {"sha": "e" * 40}}, None
+            if parts.path.endswith("/labels"):
+                return [{"name": label}], None
+            if parts.path.endswith("/activity"):
+                return [{"after": head, "ref": f"refs/heads/{HEAD_REF}", "timestamp": "2026-10-16T12:00:00Z"}], None
+            if parts.path.endswith("/events"):
+                page = int(urllib.parse.parse_qs(parts.query).get("page", ["1"])[0])
+                requested.append(page)
+                events = [owner] if page == 1 else worker if page == last else [churn] * 100
+                link = f'<https://api.test{parts.path}?page={page + 1}>; rel="next"' if page < last else None
+                return [dict(e, id=page * 1000 + i) for i, e in enumerate(events)], link
+            return [], None  # the open pull requests
+
+        github = gate_guard.GitHub("https://api.test", "tok")
+        event = {"pull_request": event_pr(NUMBER, head, "main")}
+        with mock.patch.object(gate_guard, "api_request", side_effect=request), \
+                mock.patch.object(gate_guard, "MAX_API_PAGES", max_pages), \
+                mock.patch.object(gate_guard, "fetch_diff", return_value=""):
+            code, _ = TargetFailures.run_target(github, event)
+        return code, github, requested
+
+    def test_cut_off_history_fails_closed(self):
+        for label in gate_guard.OWNER_LABELS:
+            with self.subTest(label=label), mock.patch.object(gate_guard.GitHub, "post") as post:
+                code, _, requested = self.run_with_pages(label, gate_guard.MAX_API_PAGES)
+                self.assertEqual(code, 2)
+                self.assertEqual(max(requested), gate_guard.MAX_API_PAGES)
+                body = post.call_args[0][1]
+                self.assertEqual(body["conclusion"], "failure")
+                self.assertIn("could not read the pull request's labels", body["output"]["summary"])
+                self.assertIn(f"has more than {gate_guard.MAX_API_PAGES} pages", body["output"]["summary"])
+
+    def test_whole_history_finds_the_worker_reapplication(self):
+        """The control: read to the end, the newest event is the worker's, so the label doesn't count."""
+        for label in gate_guard.OWNER_LABELS:
+            with self.subTest(label=label), mock.patch.object(gate_guard.GitHub, "post") as post:
+                code, _, _ = self.run_with_pages(label, gate_guard.MAX_API_PAGES + 1)
+                # The diff is empty, so only a findings-accepted label that doesn't count fails the check.
+                self.assertEqual(code, 1 if label == gate_guard.FINDINGS_LABEL else 0)
+                self.assertIn(f"`{label}` was applied by @worker[bot], not the owner",
+                              post.call_args[0][1]["output"]["summary"])
 
 
 class FetchDiff(unittest.TestCase):
@@ -315,10 +503,19 @@ class WorkflowSafety(unittest.TestCase):
                 self.assertNotRegex(text, r"(?m)^  (pull_request|push|workflow_run):")
                 self.assertNotIn("actions/checkout", text)
                 self.assertNotIn("secrets", text)
-                self.assertNotRegex(text, r"head\.(sha|ref)")
+                # The head SHA only names the concurrency group: one decision at a time per commit.
+                self.assertEqual(text.count(HEAD_GROUP), 1)
+                self.assertNotRegex(text.replace(HEAD_GROUP, ""), r"head\.(sha|ref)")
                 block = re.search(r"(?m)^permissions:\n((?:  .*\n)+)", text).group(1)
                 self.assertEqual(block.split(), ["contents:", "read", "issues:", "read", "pull-requests:", "read",
                                                  "checks:", "write"])
+
+    def test_callers_rejudge_every_change_to_base_head_or_labels(self):
+        """edited covers a retarget: the same head against a new base can expose new hits."""
+        for path in (WORKFLOWS / "gate-guard-base.yml", ROOT / "templates" / "gate-guard-target-caller.yml"):
+            with self.subTest(caller=path.name):
+                types = re.search(r"(?m)^    types: \[(.*)\]$", self.text(path)).group(1).split(", ")
+                self.assertEqual(types, ["opened", "synchronize", "reopened", "edited", "labeled", "unlabeled"])
 
     def test_template_pins_one_sha_in_both_places(self):
         text = self.text(ROOT / "templates" / "gate-guard-target-caller.yml")

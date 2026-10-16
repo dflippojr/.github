@@ -13,8 +13,10 @@ name: Gate guard (default branch)
 
 on:
   pull_request_target:
-    # labeled/unlabeled re-judge the pull request when an owner label changes.
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    # edited re-judges a pull request moved to another base, where the same
+    # head can bring new hits; labeled/unlabeled re-judge it when an owner
+    # label changes.
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
 
 permissions:
   contents: read
@@ -22,8 +24,11 @@ permissions:
   pull-requests: read
   checks: write
 
+# The check run lands on the head commit, which several pull requests can
+# share, so each run judges every open pull request with that head and runs
+# alone for it: the newest decision for a commit is the one that lands.
 concurrency:
-  group: gate-guard-target-${{ github.event.pull_request.number }}
+  group: gate-guard-target-${{ github.event.pull_request.head.sha }}
   cancel-in-progress: true
 
 jobs:

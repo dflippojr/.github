@@ -16,12 +16,13 @@ there are unapproved hits, and 2 when the diff cannot be read. Only the
 standard library is used, and only the GitHub API is contacted, to read the
 label when there are hits.
 
-With --pull-request-target the script judges the pull request named in a
-pull_request_target event instead. It fetches the merge base and head commits
-as data, never checking out or running them, and accepts an owner-only label
-(gate-change-approved, findings-accepted) only when the owner applied it after
-the head commit was pushed. It posts the verdict as a check run named
-gate-guard on the head commit.
+With --pull-request-target the script judges every open pull request whose
+head is the head of a pull_request_target event, each against its current
+base. It fetches the merge base and head commits as data, never checking out
+or running them, and accepts an owner-only label (gate-change-approved,
+findings-accepted) only when the owner applied it after the head commit was
+pushed. It posts one verdict, failing if any of those pull requests fails, as a
+check run named gate-guard on the head commit.
 
     python3 gate_guard.py --repo-dir . --base HEAD^1 --head HEAD
     python3 gate_guard.py --diff-file pr.diff
@@ -692,8 +693,8 @@ def _cell(text):
     return text.replace("|", "\\|").replace("\n", " ")
 
 
-def render_summary(hits, approved, note):
-    out = ["### Gate guard", ""]
+def render_summary(hits, approved, note, title="Gate guard"):
+    out = [f"### {title}", ""]
     if not hits:
         out.append("No removed tests, skip markers, retries or gate-config edits.")
         return "\n".join(out) + "\n"
@@ -753,8 +754,16 @@ def api_request(url, token, method="GET", body=None):
         return json.loads(resp.read().decode("utf-8") or "null"), resp.headers.get("Link")
 
 
+class IncompleteList(ValueError):
+    """A paginated list still had pages left when api_pages stopped reading."""
+
+
 def api_pages(api, path, token):
-    """Every item of a paginated GitHub API list."""
+    """Every item of a paginated GitHub API list.
+
+    Raises IncompleteList rather than return part of a list: label events come
+    oldest first, so a cut-off history would date a label by a stale event.
+    """
     url = f"{api}{path}{'&' if '?' in path else '?'}per_page=100"
     items = []
     for _ in range(MAX_API_PAGES):
@@ -762,8 +771,8 @@ def api_pages(api, path, token):
         items.extend(page)
         url = _next_link(link)
         if not url:
-            break
-    return items
+            return items
+    raise IncompleteList(f"{path} has more than {MAX_API_PAGES} pages; the guard reads no partial list")
 
 
 def label_approval(repo, pr, owner, require_actor, fetch):
@@ -915,34 +924,65 @@ def fetch_diff(url, token, base, head):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def render_target_summary(hits, error, verdicts, findings_blocked, sha, guard_sha):
-    approved, note = verdicts[APPROVAL_LABEL]
-    if error:
-        out = ["### Gate guard", "", f"**Failing:** {error}.", ""]
+class Judgment(collections.namedtuple("Judgment", "number base hits error labels verdicts approved findings_blocked")):
+    """The verdict on one pull request: its hits against its base, and its owner-only labels."""
+    __slots__ = ()
+
+    @property
+    def passed(self):
+        return not self.error and self.approved and not self.findings_blocked
+
+
+def render_judgment(j):
+    """The report for one pull request: its hits and its owner-only labels."""
+    approved, note = j.verdicts[APPROVAL_LABEL]
+    title = f"Gate guard: #{j.number} into `{j.base}`"
+    if j.error:
+        out = [f"### {title}", "", f"**Failing:** {j.error}.", ""]
     else:
-        out = [render_summary(hits, approved, note)]
-    if findings_blocked:
-        out += [f"**Failing:** {verdicts[FINDINGS_LABEL][1]}. Only the owner's `{FINDINGS_LABEL}` label, "
+        out = [render_summary(j.hits, approved, note, title)]
+    if j.findings_blocked:
+        out += [f"**Failing:** {j.verdicts[FINDINGS_LABEL][1]}. Only the owner's `{FINDINGS_LABEL}` label, "
                 "applied after the newest push, accepts review findings; the owner re-applies or removes it.", ""]
     out += ["#### Owner-only labels", "", "| Label | Counts | Why |", "| --- | --- | --- |"]
     for label in OWNER_LABELS:
-        counts, why = verdicts[label]
+        counts, why = j.verdicts[label]
         out.append(f"| `{label}` | {'yes' if counts else 'no'} | {_cell(why)} |")
-    guard = f" with `gate_guard.py` at `{guard_sha[:12]}`" if guard_sha else ""
-    out += ["", f"Judged head `{sha[:12]}` with the default branch's workflow{guard}. The pull request's "
-                "files are read only as a diff; none of them run."]
     return "\n".join(out) + "\n"
 
 
-def check_title(hits, error, approved, findings_blocked):
-    if error:
+def render_target_summary(judgments, sha, guard_sha):
+    out = []
+    if len(judgments) > 1:
+        failing = ", ".join(f"#{j.number}" for j in judgments if not j.passed) or "none"
+        out += [f"{len(judgments)} open pull requests have head `{sha[:12]}`. A check run belongs to the commit, "
+                f"not to one pull request, so `{CHECK_NAME}` passes only when every one of them passes. "
+                f"Failing: {failing}.", ""]
+    out += [render_judgment(j) for j in judgments]
+    guard = f" with `gate_guard.py` at `{guard_sha[:12]}`" if guard_sha else ""
+    out += [f"Judged head `{sha[:12]}` against each pull request's current base with the default branch's "
+            f"workflow{guard}. The pull requests' files are read only as a diff; none of them run."]
+    return "\n".join(out) + "\n"
+
+
+def _judgment_title(j):
+    if j.error:
         return "Could not judge this pull request"
-    if findings_blocked:
+    if j.findings_blocked:
         return f"{FINDINGS_LABEL} does not count"
-    if not hits:
+    if not j.hits:
         return "No removed tests, skips, retries or gate-config edits"
-    count = f"{len(hits)} hit{'s' if len(hits) != 1 else ''}"
-    return f"{count}, approved by the owner" if approved else f"{count}, not approved"
+    count = f"{len(j.hits)} hit{'s' if len(j.hits) != 1 else ''}"
+    return f"{count}, approved by the owner" if j.approved else f"{count}, not approved"
+
+
+def check_title(judgments):
+    if len(judgments) == 1:
+        return _judgment_title(judgments[0])
+    failing = [j for j in judgments if not j.passed]
+    if not failing:
+        return f"All {len(judgments)} pull requests with this head pass"
+    return f"#{failing[0].number} into {failing[0].base}: {_judgment_title(failing[0])}"
 
 
 def check_annotations(hits, approved):
@@ -987,8 +1027,40 @@ def _target_labels(github, repo, number, head, sha, owner):
     return labels, {label: owner_label(label, labels, events, owner, sha, pushed_at) for label in OWNER_LABELS}
 
 
+def judge_pull_request(github, repo, pr, sha, owner, server, token):
+    """The Judgment of one pull request whose head is sha, against the base pr names."""
+    base, head = pr["base"]["ref"], pr.get("head") or {}
+    hits, error = _target_hits(github, repo, base, sha, server, token)
+    try:
+        labels, verdicts = _target_labels(github, repo, pr["number"], head, sha, owner)
+    except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as e:
+        error = error or f"could not read the pull request's labels ({e})"
+        labels, verdicts = set(), {label: (False, f"could not read the labels ({e})") for label in OWNER_LABELS}
+    approved = not hits or verdicts[APPROVAL_LABEL][0]
+    findings_blocked = FINDINGS_LABEL in labels and not verdicts[FINDINGS_LABEL][0]
+    return Judgment(pr["number"], base, hits, error, labels, verdicts, approved, findings_blocked)
+
+
+def pull_requests_with_head(github, repo, sha, event_pr):
+    """(pull requests, error): every open pull request whose head is sha, as the API has it now.
+
+    A check run lands on a commit, which any number of pull requests can share,
+    each with its own base and labels. The listing gives each one's current
+    base, which a queued event's payload may predate. The event's own pull
+    request is judged from the payload if the listing doesn't show it.
+    """
+    try:
+        prs = {p["number"]: p for p in github.pages(f"/repos/{repo}/pulls?state=open")
+               if (p.get("head") or {}).get("sha") == sha}
+        error = None
+    except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as e:
+        prs, error = {}, f"could not list the open pull requests with this head ({e})"
+    prs.setdefault(event_pr["number"], event_pr)
+    return [prs[n] for n in sorted(prs)], error
+
+
 def run_target(args, github=None):
-    """Judge the pull request of a pull_request_target event and post the gate-guard check run on its head."""
+    """Judge every open pull request with the event's head and post one gate-guard check run on that head."""
     pr = load_event(os.environ.get("GITHUB_EVENT_PATH")).get("pull_request") or {}
     head, base = pr.get("head") or {}, pr.get("base") or {}
     repo = args.repo or os.environ.get("GITHUB_REPOSITORY")
@@ -1002,30 +1074,30 @@ def run_target(args, github=None):
     server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
     github = github or GitHub(os.environ.get("GITHUB_API_URL", "https://api.github.com"), token)
 
-    hits, error = _target_hits(github, repo, base["ref"], sha, server, token)
-    try:
-        labels, verdicts = _target_labels(github, repo, pr["number"], head, sha, owner)
-    except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as e:
-        error = error or f"could not read the pull request's labels ({e})"
-        labels, verdicts = set(), {label: (False, f"could not read the labels ({e})") for label in OWNER_LABELS}
-
-    approved = not hits or verdicts[APPROVAL_LABEL][0]
-    findings_blocked = FINDINGS_LABEL in labels and not verdicts[FINDINGS_LABEL][0]
-    passed = not error and approved and not findings_blocked
+    prs, list_error = pull_requests_with_head(github, repo, sha, pr)
+    judgments = [judge_pull_request(github, repo, p, sha, owner, server, token) for p in prs]
+    if list_error:
+        # Without the whole list, another pull request's failure could go unseen.
+        judgments = [j._replace(error=j.error or list_error) for j in judgments]
+    error = next((j.error for j in judgments if j.error), None)
+    passed = all(j.passed for j in judgments)
     conclusion = "success" if passed else "failure"
-    summary = render_target_summary(hits, error, verdicts, findings_blocked, sha, args.guard_sha)
+    summary = render_target_summary(judgments, sha, args.guard_sha)
     print(summary)
     if args.summary:
         with open(args.summary, "a", encoding="utf-8") as f:
             f.write(summary)
-    _write_outputs({"conclusion": conclusion, APPROVAL_LABEL: str(verdicts[APPROVAL_LABEL][0]).lower(),
-                    FINDINGS_LABEL: str(verdicts[FINDINGS_LABEL][0]).lower()})
+    _write_outputs({"conclusion": conclusion,
+                    **{label: str(all(j.verdicts[label][0] for j in judgments)).lower() for label in OWNER_LABELS}})
 
     if len(summary) > MAX_CHECK_SUMMARY:
         summary = summary[:MAX_CHECK_SUMMARY] + "\n\n… (truncated; the job summary has the rest)\n"
+    annotations = []
+    for j in judgments:
+        annotations += [a for a in check_annotations(j.hits, j.approved) if a not in annotations]
     body = {"name": CHECK_NAME, "head_sha": sha, "status": "completed", "conclusion": conclusion,
-            "output": {"title": check_title(hits, error, approved, findings_blocked), "summary": summary,
-                       "annotations": check_annotations(hits, approved)}}
+            "output": {"title": check_title(judgments), "summary": summary,
+                       "annotations": annotations[:MAX_ANNOTATIONS]}}
     run_id = os.environ.get("GITHUB_RUN_ID")
     if run_id:
         body["details_url"] = f"{server}/{repo}/actions/runs/{run_id}"
