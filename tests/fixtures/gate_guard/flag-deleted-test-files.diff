@@ -1,0 +1,33 @@
+# gate-guard fixture: a test module and an empty test module are deleted
+# expect: removed-tests
+# hits: 2
+
+diff --git a/tests/test_calc.py b/tests/test_calc.py
+deleted file mode 100644
+index 3ba026a..0000000
+--- a/tests/test_calc.py
++++ /dev/null
+@@ -1,16 +0,0 @@
+-import pytest
+-
+-from calc import add, sub
+-
+-
+-def test_add():
+-    assert add(1, 2) == 3
+-
+-
+-def test_sub():
+-    assert sub(3, 2) == 1
+-
+-
+-class TestEdge:
+-    def test_zero(self):
+-        assert add(0, 0) == 0
+diff --git a/tests/test_placeholder.py b/tests/test_placeholder.py
+deleted file mode 100644
+index cd6840d..0000000
+--- a/tests/test_placeholder.py
++++ /dev/null
+@@ -1 +0,0 @@
+-import calc  # imported for coverage

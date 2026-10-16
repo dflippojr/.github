@@ -1,0 +1,46 @@
+name: Gate guard self-test
+
+# Exercises scripts/gate_guard.py, the script behind the reusable
+# gate-guard.yml, on the fixture diffs in tests/fixtures/gate_guard: one per
+# rule plus false-positive guards. It uses the runner's own python3 with no
+# installs, as the reusable workflow does. flag-*.diff fixtures must exit 1
+# and pass-*.diff fixtures must exit 0; each report lands in the job summary.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  fixtures:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rule tests
+        run: python3 -m unittest discover -s tests -p test_gate_guard.py -v
+
+      - name: Fixture verdicts
+        run: |
+          status=0
+          for f in tests/fixtures/gate_guard/*.diff; do
+            name=$(basename "$f" .diff)
+            case "$name" in flag-*) want=1 ;; *) want=0 ;; esac
+            echo "#### $name" >> "$GITHUB_STEP_SUMMARY"
+            # No event or Actions variables: fixtures have no PR labels to read
+            # and their paths must not become annotations on this repository.
+            set +e
+            env -u GITHUB_EVENT_PATH -u GITHUB_ACTIONS python3 scripts/gate_guard.py --diff-file "$f" > /dev/null
+            got=$?
+            set -e
+            if [ "$got" -ne "$want" ]; then
+              echo "::error::$name exited $got, expected $want"
+              status=1
+            fi
+          done
+          exit $status

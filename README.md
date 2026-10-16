@@ -12,7 +12,73 @@ Default community health files for repositories owned by dflippojr. GitHub appli
 - `CONTRIBUTING.md`: how issues, labels, branches and pull requests work, including how to write an issue.
 - `labels.json`: the shared label set.
 - `scripts/sync_labels.py`: shows or applies label differences across repositories. See `CONTRIBUTING.md`.
-- `tests/`: tests for the label configuration and script.
+- `.github/workflows/gate-guard.yml` and `scripts/gate_guard.py`: the reusable gate guard. See below.
+- `tests/`: tests for the label configuration and the scripts. `tests/fixtures/gate_guard/` holds the gate guard's fixture diffs.
+
+## Gate guard
+
+A reusable workflow that makes "don't weaken the gate" a check. It reads what
+merging the pull request would change and reports each hit in the job summary:
+
+| Rule | Hits |
+| --- | --- |
+| `removed-tests` | A deleted test file, or fewer test functions in a file (`def test_`, `test(`/`it(`, `@Test`, `#[test]`, `func Test`). |
+| `skip-marker` | A new `pytest.mark.skip`/`skipif`/`xfail`, `unittest.skip`, `.skip(`/`.only(`/`test.fixme`/`xit(`/`xdescribe(`, `@Disabled`, `#[ignore]`, or pytest `--deselect`/`-k "not …"` in config. `pytest.skip()` and Go `t.Skip()` count when unconditional or when the condition checks `CI`. |
+| `retry` | New or raised Playwright `retries`, `--reruns`, `pytest-rerunfailures`, `flaky`, `jest.retryTimes`, Surefire `rerunFailingTestsCount`. |
+| `gate-config` | Any edit to `.github/workflows/**`, `sonar-project.properties`, `CODEOWNERS` or coverage config (`.coveragerc`, `[tool.coverage]`, `fail_under`, JaCoCo rules, c8/nyc/Jest thresholds); a lint rule disabled; a size or performance budget raised. |
+
+A test renamed in place or moved to another file, a renamed test file, and a
+skip marker that moves with its test are not hits. The job fails on any hit
+unless the pull request carries the `gate-change-approved` label; with the label
+it passes and still lists every hit. Only the owner applies that label: it
+records that the owner reviewed the removals or gate changes on this PR.
+
+The workflow needs no secrets. It reads labels with the caller's `GITHUB_TOKEN`,
+runs the script with the runner's `python3` (3.7 or later, standard library
+only), and uses no action except `actions/checkout`, pinned by SHA.
+
+Call it from a workflow in each repository:
+
+```yaml
+name: Gate guard
+
+on:
+  pull_request:
+    # labeled/unlabeled re-run the check when the approval label changes.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  gate-guard:
+    uses: dflippojr/.github/.github/workflows/gate-guard.yml@main
+    # Private repositories run on the tower:
+    # with:
+    #   runs-on: '["self-hosted", "Linux", "X64", "tower-linux"]'
+```
+
+| Input | Default | Meaning |
+| --- | --- | --- |
+| `runs-on` | `'"ubuntu-latest"'` | Runner as JSON: a label string or a list of labels. |
+| `require-owner-label-actor` | `false` | Accept the label only when the repository owner applied it, checked through the issue-events API. Turn it on once workers act under their own identity (dflippojr/agent-ops#44). |
+| `guard-ref` | `main` | Ref of this repository to load `scripts/gate_guard.py` from. If you pin `uses:` to a SHA or tag, set `guard-ref` to the same value. |
+
+The check appears as `gate-guard / gate-guard`; make it a required status check
+to enforce it. On events other than `pull_request` the job only prints a notice.
+
+Run it locally against a branch or a saved diff:
+
+```sh
+python3 scripts/gate_guard.py --repo-dir ../some-repo --base origin/main --head HEAD
+gh pr diff 80 -R dflippojr/disc-golf-league > pr.diff && python3 scripts/gate_guard.py --diff-file pr.diff
+```
+
+`gate-guard-self-test.yml` runs the rule tests and checks every fixture's
+verdict on each pull request here: `flag-*.diff` fixtures must fail and
+`pass-*.diff` fixtures must pass.
 
 ## CI and analysis
 

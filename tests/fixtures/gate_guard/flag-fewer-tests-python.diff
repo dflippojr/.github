@@ -1,0 +1,26 @@
+# gate-guard fixture: one test removed, one renamed in place
+# expect: removed-tests
+# hits: 1
+
+diff --git a/tests/test_calc.py b/tests/test_calc.py
+index 3ba026a..202840c 100644
+--- a/tests/test_calc.py
++++ b/tests/test_calc.py
+@@ -1,16 +1,12 @@
+ import pytest
+ 
+ from calc import add, sub
+ 
+ 
+ def test_add():
+     assert add(1, 2) == 3
+ 
+ 
+-def test_sub():
+-    assert sub(3, 2) == 1
+-
+-
+ class TestEdge:
+-    def test_zero(self):
++    def test_zero_plus_zero(self):
+         assert add(0, 0) == 0

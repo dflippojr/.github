@@ -1,0 +1,32 @@
+# gate-guard fixture: skip, only, fixme, xit and xdescribe in a spec file
+# expect: skip-marker
+# hits: 5
+
+diff --git a/tests/cart.spec.ts b/tests/cart.spec.ts
+index 795c13d..a1e4fbf 100644
+--- a/tests/cart.spec.ts
++++ b/tests/cart.spec.ts
+@@ -1,17 +1,19 @@
+ import { test, expect } from '@playwright/test';
+ 
+-test('adds an item', async ({ page }) => {
++test.skip('adds an item', async ({ page }) => {
+   await page.goto('/cart');
+   await expect(page.getByRole('row')).toHaveCount(1);
+ });
+ 
+-test('removes an item', async ({ page }) => {
++test.only('removes an item', async ({ page }) => {
+   await page.goto('/cart');
+   await expect(page.getByRole('row')).toHaveCount(0);
+ });
+ 
+-test.describe('checkout', () => {
+-  it('charges the card', async () => {
++xdescribe('checkout', () => {
++  xit('charges the card', async () => {
+     expect(1).toBe(1);
+   });
+ });
++
++test.fixme('refunds', async () => {});

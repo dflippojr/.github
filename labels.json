@@ -20,6 +20,7 @@
     {"name": "verification", "color": "006b75", "description": "Confirm something already built works for real"},
     {"name": "reserved", "color": "bfdadc", "description": "Held for a specific person or run; agents and orchestrators skip it"},
     {"name": "parked", "color": "bfbfbf", "description": "Deliberately deferred; not planned for now"},
+    {"name": "gate-change-approved", "color": "0e8a16", "description": "Owner approved this PR's test removals, skips, retries or gate-config edits"},
 
     {"name": "P0", "color": "b60205", "description": "Priority: do first; others depend on it"},
     {"name": "P1", "color": "d93f0b", "description": "Priority: bugs and fixes ahead of features"},

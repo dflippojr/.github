@@ -1,0 +1,26 @@
+# gate-guard fixture: a Playwright test is removed from a spec file
+# expect: removed-tests
+# hits: 1
+
+diff --git a/tests/cart.spec.ts b/tests/cart.spec.ts
+index 795c13d..b24efae 100644
+--- a/tests/cart.spec.ts
++++ b/tests/cart.spec.ts
+@@ -1,17 +1,12 @@
+ import { test, expect } from '@playwright/test';
+ 
+ test('adds an item', async ({ page }) => {
+   await page.goto('/cart');
+   await expect(page.getByRole('row')).toHaveCount(1);
+ });
+ 
+-test('removes an item', async ({ page }) => {
+-  await page.goto('/cart');
+-  await expect(page.getByRole('row')).toHaveCount(0);
+-});
+-
+ test.describe('checkout', () => {
+   it('charges the card', async () => {
+     expect(1).toBe(1);
+   });
+ });

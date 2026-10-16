@@ -1,0 +1,63 @@
+# gate-guard fixture: retries lowered, a budget lowered, a lint rule made stricter and a test renamed in place
+# expect: 
+# hits: 0
+
+diff --git a/.eslintrc.json b/.eslintrc.json
+index 2d95edd..167fa26 100644
+--- a/.eslintrc.json
++++ b/.eslintrc.json
+@@ -1,6 +1,6 @@
+ {
+   "rules": {
+     "no-console": "error",
+-    "eqeqeq": "warn"
++    "eqeqeq": "error"
+   }
+ }
+diff --git a/.size-limit.json b/.size-limit.json
+index a0a3a76..fb3635f 100644
+--- a/.size-limit.json
++++ b/.size-limit.json
+@@ -1,6 +1,6 @@
+ [
+   {
+     "path": "dist/app.js",
+-    "limit": "10 kB"
++    "limit": "8 kB"
+   }
+ ]
+diff --git a/playwright.config.ts b/playwright.config.ts
+index 586b9d9..0b93f97 100644
+--- a/playwright.config.ts
++++ b/playwright.config.ts
+@@ -1,7 +1,7 @@
+ import { defineConfig } from '@playwright/test';
+ 
+ export default defineConfig({
+   testDir: './tests',
+-  retries: 3,
++  retries: 1,
+   use: { trace: 'on-first-retry' },
+ });
+diff --git a/tests/test_calc.py b/tests/test_calc.py
+index 3ba026a..d379149 100644
+--- a/tests/test_calc.py
++++ b/tests/test_calc.py
+@@ -1,16 +1,16 @@
+ import pytest
+ 
+ from calc import add, sub
+ 
+ 
+ def test_add():
+     assert add(1, 2) == 3
+ 
+ 
+-def test_sub():
++def test_subtracts():
+     assert sub(3, 2) == 1
+ 
+ 
+ class TestEdge:
+     def test_zero(self):
+         assert add(0, 0) == 0

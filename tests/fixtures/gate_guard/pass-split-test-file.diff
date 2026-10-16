@@ -1,0 +1,40 @@
+# gate-guard fixture: a test module is deleted and its tests are split across two new modules
+# expect: 
+# hits: 0
+
+diff --git a/tests/test_calc.py b/tests/test_add.py
+similarity index 57%
+rename from tests/test_calc.py
+rename to tests/test_add.py
+index 3ba026a..284f2e6 100644
+--- a/tests/test_calc.py
++++ b/tests/test_add.py
+@@ -1,16 +1,10 @@
+-import pytest
+-
+-from calc import add, sub
++from calc import add
+ 
+ 
+ def test_add():
+     assert add(1, 2) == 3
+ 
+ 
+-def test_sub():
+-    assert sub(3, 2) == 1
+-
+-
+ class TestEdge:
+     def test_zero(self):
+         assert add(0, 0) == 0
+diff --git a/tests/test_sub.py b/tests/test_sub.py
+new file mode 100644
+index 0000000..998430b
+--- /dev/null
++++ b/tests/test_sub.py
+@@ -0,0 +1,5 @@
++from calc import sub
++
++
++def test_sub():
++    assert sub(3, 2) == 1

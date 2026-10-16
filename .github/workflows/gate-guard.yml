@@ -1,0 +1,72 @@
+name: Gate guard
+
+# Reusable check that fails a pull request which deletes tests, adds skip or
+# focus markers, adds or raises retries, or edits gate config (workflows,
+# Sonar, coverage, lint rules, size or performance budgets), unless the PR
+# carries the gate-change-approved label. Every hit is listed in the job
+# summary either way. Needs no secrets: it reads the PR's labels with the
+# caller's GITHUB_TOKEN. See README.md, "Gate guard", for the call syntax.
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: >-
+          Runner for the job, as JSON: a label string or a list of labels.
+          Private repos pass '["self-hosted", "Linux", "X64", "tower-linux"]'.
+        type: string
+        default: '"ubuntu-latest"'
+      require-owner-label-actor:
+        description: >-
+          Accept gate-change-approved only when the repository owner applied
+          it, checked through the issue-events API.
+        type: boolean
+        default: false
+      guard-ref:
+        description: >-
+          Ref of dflippojr/.github to load the guard script from. Keep it equal
+          to the ref in the caller's uses: line when that is pinned.
+        type: string
+        default: main
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  gate-guard:
+    name: gate-guard
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 5
+    steps:
+      - name: Not a pull request
+        if: github.event_name != 'pull_request'
+        run: echo "::notice::gate-guard checks pull_request events only; nothing to check for ${{ github.event_name }}."
+
+      # The default ref of a pull_request event is the merge commit, so
+      # HEAD^1..HEAD is exactly what merging the PR would change.
+      - name: Check out the pull request merge commit
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: target
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Check out the guard script
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dflippojr/.github
+          ref: ${{ inputs.guard-ref }}
+          path: gate-guard
+          persist-credentials: false
+          sparse-checkout: scripts/gate_guard.py
+          sparse-checkout-cone-mode: false
+
+      - name: Inspect the diff
+        if: github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          OWNER_FLAG: ${{ inputs.require-owner-label-actor && '--require-owner-label-actor' || '' }}
+        run: python3 gate-guard/scripts/gate_guard.py --repo-dir target --base HEAD^1 --head HEAD $OWNER_FLAG
