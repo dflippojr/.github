@@ -15,6 +15,7 @@ Feature work and fixes go through GitHub issues and pull requests, so plans and 
 | `verification` | Confirm something already built works for real |
 | `reserved` | Held for a specific person or run; agents and orchestrators skip it |
 | `parked` | Deliberately deferred; not planned for now |
+| `gate-change-approved` | The owner approved this pull request's test removals, skips, retries or gate-config edits; the gate guard then passes |
 | `P0` / `P1` / `P2` | Priority: do first / bugs and fixes ahead of features / normal |
 
 The remaining labels are GitHub's defaults plus one for accessibility:
