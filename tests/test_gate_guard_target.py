@@ -19,16 +19,21 @@ OWNER, REPO, NUMBER, HEAD_REF = "dflippojr", "dflippojr/demo", 7, "feature"
 HEAD_GROUP = "group: gate-guard-target-${{ github.event.pull_request.head.sha }}"
 
 
+def reject(status, body):
+    return gate_guard.urllib.error.HTTPError("https://api.test", status, json.dumps(body), {}, None)
+
+
 class FakeGitHub:
-    """Answers the API calls of run_target and records the check runs it posts.
+    """Answers the API calls of run_target and keeps the check runs it creates and updates.
 
     prs maps each open pull request with head `head` to its base, head branch,
     labels, label events and push time; merge_bases maps each base to its merge
-    base with the head.
+    base with the head. Like the Checks API, it rejects an output over 65,535
+    UTF-8 bytes, and any update that `refuse` returns true for.
     """
 
-    def __init__(self, head, merge_bases, prs):
-        self.head, self.merge_bases, self.prs = head, merge_bases, prs
+    def __init__(self, head, merge_bases, prs, refuse=lambda _: False):
+        self.head, self.merge_bases, self.prs, self.refuse = head, merge_bases, prs, refuse
         self.posted = []
 
     @classmethod
@@ -65,10 +70,29 @@ class FakeGitHub:
                 return noise + (push if s["pushed_at"] else [])
         raise AssertionError(f"unexpected API path {path}")
 
+    @staticmethod
+    def check_size(body):
+        for field in ("summary", "text"):
+            if len(body.get("output", {}).get(field, "").encode("utf-8")) > 65535:
+                raise reject(422, {"message": f"output.{field} is too long (maximum is 65535 bytes)"})
+
     def post(self, path, body):
         assert path == f"/repos/{REPO}/check-runs", path
-        self.posted.append(body)
-        return {"id": 1}
+        self.check_size(body)
+        self.posted.append(dict(body))
+        return {"id": len(self.posted)}
+
+    def patch(self, path, body):
+        prefix = f"/repos/{REPO}/check-runs/"
+        assert path.startswith(prefix), path
+        self.check_size(body)
+        if self.refuse(body):
+            raise reject(422, {"message": "Invalid request"})
+        self.posted[int(path[len(prefix):]) - 1].update(body)
+
+    def current(self):
+        """The commit's gate-guard result: the newest check run of that name, as rulesets read it."""
+        return self.posted[-1]
 
 
 def git(root, *args):
@@ -239,6 +263,72 @@ class SharedHead(unittest.TestCase):
         self.assertIn("gate-change-approved=false", outputs)
 
 
+class OversizedReport(unittest.TestCase):
+    """The review's scenario: C1 deletes a test and adds 300 skipped test modules with long non-ASCII names; C2
+    changes code on top. Into the stacked branch at C1 the head passes. Retargeted to main, the failure report runs
+    to about 50,000 characters but twice that in UTF-8 bytes, over the Checks API's 65,535-byte limit."""
+    BILLING = SharedHead.BILLING
+    SKIPPED = "import pytest\n\n\n@pytest.mark.skip\ndef test_later():\n    pass\n"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        skipped = {f"tests/test_{i}_{'界' * 70}.py": self.SKIPPED for i in range(300)}
+        self.server, (c0, c1, self.head) = make_remote(
+            self.tmp, {"src/billing.py": self.BILLING, "tests/test_billing.py": SharedHead.TEST},
+            dict(skipped, **{"src/billing.py": self.BILLING}),
+            dict(skipped, **{"src/billing.py": "def charge(amount):\n    return round(amount, 2)\n"}))
+        self.merge_bases = {"main": c0, "stacked": c1}
+
+    def retarget(self, refuse=lambda _: False):
+        """(exit code of the retarget's job, fake API) after a pass into the stacked branch, then a retarget."""
+        fake = FakeGitHub(self.head, self.merge_bases, {NUMBER: dict(SharedHead.NO_LABELS, base="stacked",
+                                                                     head_ref=HEAD_REF)})
+        code, _, _ = run_cli(self.tmp, self.server, {"action": "opened",
+                                                     "pull_request": event_pr(NUMBER, self.head, "stacked")}, fake)
+        self.assertEqual((code, fake.current()["conclusion"]), (0, "success"))
+        fake.prs[NUMBER]["base"], fake.refuse = "main", refuse
+        code, _, _ = run_cli(self.tmp, self.server, {"action": "edited",
+                                                     "pull_request": event_pr(NUMBER, self.head, "main")}, fake)
+        self.assertEqual(len(fake.posted), 2)
+        return code, fake
+
+    def test_report_is_cut_to_fit_in_bytes(self):
+        code, fake = self.retarget()
+        check = fake.current()
+        summary = check["output"]["summary"]
+        self.assertEqual((code, check["status"], check["conclusion"]), (1, "completed", "failure"))
+        self.assertEqual(check["output"]["title"], "301 hits, not approved")
+        # Rows sort by path, so the deleted test's row is past the cut; the title still counts it.
+        self.assertIn(f"| skip-marker | `tests/test_0_{'界' * 70}.py:4` |", summary)
+        self.assertTrue(summary.endswith(gate_guard.TRUNCATED))
+        self.assertLessEqual(len(summary.encode("utf-8")), gate_guard.MAX_CHECK_BYTES)
+
+    def test_rejected_report_falls_back_to_a_bare_failure(self):
+        code, fake = self.retarget(refuse=lambda body: "annotations" in body["output"])
+        check = fake.current()
+        self.assertEqual((code, check["status"], check["conclusion"]), (2, "completed", "failure"))
+        self.assertEqual(check["output"]["title"], "Could not post the report")
+
+    def test_no_update_lands_and_the_check_stays_in_progress(self):
+        """Even when GitHub takes no update at all, the earlier success is no longer the commit's result."""
+        code, fake = self.retarget(refuse=lambda _: True)
+        check = fake.current()
+        self.assertEqual((code, check["status"]), (2, "in_progress"))
+        self.assertNotIn("conclusion", check)
+
+
+class FitBytes(unittest.TestCase):
+    def test_cut_counts_bytes_and_keeps_whole_characters(self):
+        text = gate_guard.fit_bytes("界" * 100, limit=50, suffix="…")
+        self.assertLessEqual(len(text.encode("utf-8")), 50)
+        self.assertEqual(text, "界" * 15 + "…")
+
+    def test_short_text_is_unchanged(self):
+        self.assertEqual(gate_guard.fit_bytes("界" * 10, limit=30), "界" * 10)
+
+
 class OwnerLabel(unittest.TestCase):
     PUSHED = gate_guard.parse_time("2026-10-16T12:00:00Z")
 
@@ -290,6 +380,13 @@ class HeadPushedAt(unittest.TestCase):
 
 class TargetFailures(unittest.TestCase):
     @staticmethod
+    def github():
+        """A mock API whose check-run create answers with an id; the verdict arrives as an update."""
+        fake = mock.Mock()
+        fake.post.return_value = {"id": 5}
+        return fake
+
+    @staticmethod
     def run_target(fake, event):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp, "event.json")
@@ -309,26 +406,26 @@ class TargetFailures(unittest.TestCase):
         self.assertIn("needs a pull_request_target event", err)
 
     def test_unreadable_diff_posts_a_failure(self):
-        fake = mock.Mock()
+        fake = self.github()
         fake.get.side_effect = gate_guard.urllib.error.URLError("offline")
         fake.pages.return_value = []
         code, _ = self.run_target(fake, self.EVENT)
         self.assertEqual(code, 2)
-        body = fake.post.call_args[0][1]
+        body = fake.patch.call_args[0][1]
         self.assertEqual((body["conclusion"], body["output"]["title"]), ("failure", "Could not judge this pull request"))
         self.assertIn("could not read the pull request's diff", body["output"]["summary"])
 
     def test_unreadable_labels_post_a_failure(self):
-        fake = mock.Mock()
+        fake = self.github()
         fake.get.return_value = {"merge_base_commit": {"sha": "e" * 40}}
         fake.pages.side_effect = gate_guard.urllib.error.URLError("rate limited")
         with mock.patch.object(gate_guard, "fetch_diff", return_value=""):
             code, _ = self.run_target(fake, self.EVENT)
         self.assertEqual(code, 2)
-        self.assertIn("could not read the pull request's labels", fake.post.call_args[0][1]["output"]["summary"])
+        self.assertIn("could not read the pull request's labels", fake.patch.call_args[0][1]["output"]["summary"])
 
     def test_deleted_fork_cannot_date_the_label(self):
-        fake = mock.Mock()
+        fake = self.github()
         fake.get.return_value = {"merge_base_commit": {"sha": "e" * 40}}
         fake.pages.side_effect = lambda path: (
             [{"name": "findings-accepted"}] if path.endswith("/labels") else
@@ -337,10 +434,10 @@ class TargetFailures(unittest.TestCase):
         with mock.patch.object(gate_guard, "fetch_diff", return_value=""):
             code, _ = self.run_target(fake, self.EVENT)
         self.assertEqual(code, 1)
-        self.assertIn("GitHub has no record of when", fake.post.call_args[0][1]["output"]["summary"])
+        self.assertIn("GitHub has no record of when", fake.patch.call_args[0][1]["output"]["summary"])
 
     def test_check_run_post_failure_exits_2(self):
-        fake = mock.Mock()
+        fake = self.github()
         fake.get.return_value = {"merge_base_commit": {"sha": "e" * 40}}
         fake.pages.return_value = []
         fake.post.side_effect = gate_guard.urllib.error.URLError("forbidden")
@@ -350,7 +447,7 @@ class TargetFailures(unittest.TestCase):
         self.assertIn("could not post the gate-guard check run", err)
 
     def test_dry_run_posts_nothing(self):
-        fake = mock.Mock()
+        fake = self.github()
         fake.get.return_value = {"merge_base_commit": {"sha": "e" * 40}}
         fake.pages.return_value = []
         with tempfile.TemporaryDirectory() as tmp:
@@ -362,10 +459,11 @@ class TargetFailures(unittest.TestCase):
                 code = gate_guard.run_target(gate_guard.parse_args(["--pull-request-target", "--dry-run"]), fake)
         self.assertEqual(code, 0)
         fake.post.assert_not_called()
+        fake.patch.assert_not_called()
 
     def test_unlisted_open_pull_requests_fail_closed(self):
         """Without the whole list of pull requests with this head, one that fails could go unseen."""
-        fake = mock.Mock()
+        fake = self.github()
         fake.get.return_value = {"merge_base_commit": {"sha": "e" * 40}}
 
         def pages(path):
@@ -377,7 +475,7 @@ class TargetFailures(unittest.TestCase):
         with mock.patch.object(gate_guard, "fetch_diff", return_value=""):
             code, _ = self.run_target(fake, self.EVENT)
         self.assertEqual(code, 2)
-        body = fake.post.call_args[0][1]
+        body = fake.patch.call_args[0][1]
         self.assertEqual(body["conclusion"], "failure")
         self.assertIn("could not list the open pull requests with this head (too many pages)",
                       body["output"]["summary"])
@@ -432,11 +530,11 @@ class CutOffLabelHistory(unittest.TestCase):
 
     def test_cut_off_history_fails_closed(self):
         for label in gate_guard.OWNER_LABELS:
-            with self.subTest(label=label), mock.patch.object(gate_guard.GitHub, "post") as post:
+            with self.subTest(label=label), mock.patch.object(gate_guard.GitHub, "patch") as patch:
                 code, _, requested = self.run_with_pages(label, gate_guard.MAX_API_PAGES)
                 self.assertEqual(code, 2)
                 self.assertEqual(max(requested), gate_guard.MAX_API_PAGES)
-                body = post.call_args[0][1]
+                body = patch.call_args[0][1]
                 self.assertEqual(body["conclusion"], "failure")
                 self.assertIn("could not read the pull request's labels", body["output"]["summary"])
                 self.assertIn(f"has more than {gate_guard.MAX_API_PAGES} pages", body["output"]["summary"])
@@ -444,12 +542,12 @@ class CutOffLabelHistory(unittest.TestCase):
     def test_whole_history_finds_the_worker_reapplication(self):
         """The control: read to the end, the newest event is the worker's, so the label doesn't count."""
         for label in gate_guard.OWNER_LABELS:
-            with self.subTest(label=label), mock.patch.object(gate_guard.GitHub, "post") as post:
+            with self.subTest(label=label), mock.patch.object(gate_guard.GitHub, "patch") as patch:
                 code, _, _ = self.run_with_pages(label, gate_guard.MAX_API_PAGES + 1)
                 # The diff is empty, so only a findings-accepted label that doesn't count fails the check.
                 self.assertEqual(code, 1 if label == gate_guard.FINDINGS_LABEL else 0)
                 self.assertIn(f"`{label}` was applied by @worker[bot], not the owner",
-                              post.call_args[0][1]["output"]["summary"])
+                              patch.call_args[0][1]["output"]["summary"])
 
 
 class FetchDiff(unittest.TestCase):

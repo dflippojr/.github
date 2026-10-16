@@ -48,7 +48,10 @@ APPROVAL_LABEL = "gate-change-approved"
 FINDINGS_LABEL = "findings-accepted"
 OWNER_LABELS = (APPROVAL_LABEL, FINDINGS_LABEL)
 CHECK_NAME = "gate-guard"
-MAX_CHECK_SUMMARY = 65000
+# The Checks API rejects an output.summary or output.text over 65,535 UTF-8
+# bytes; the guard stays a margin under it.
+MAX_CHECK_BYTES = 65000
+TRUNCATED = "\n\n… (truncated; the job summary has the rest)\n"
 MAX_ANNOTATIONS = 50
 MAX_API_PAGES = 30
 
@@ -889,6 +892,9 @@ class GitHub:
     def post(self, path, body):
         return api_request(self.api + path, self.token, "POST", body)[0]
 
+    def patch(self, path, body):
+        return api_request(self.api + path, self.token, "PATCH", body)[0]
+
 
 def git_diff(repo_dir, base, head):
     # Full context lets ini/TOML edits be placed in their section. No external
@@ -993,6 +999,58 @@ def check_annotations(hits, approved):
             for h in hits if h.line][:MAX_ANNOTATIONS]
 
 
+def fit_bytes(text, limit=MAX_CHECK_BYTES, suffix=TRUNCATED):
+    """text, cut so that it and the suffix fit in limit UTF-8 bytes.
+
+    The Checks API counts bytes, not characters: a report of non-ASCII paths
+    can be far longer in bytes than in characters.
+    """
+    data = text.encode("utf-8")
+    if len(data) <= limit:
+        return text
+    return data[:limit - len(suffix.encode("utf-8"))].decode("utf-8", "ignore") + suffix
+
+
+def start_check(github, repo, sha, details_url):
+    """The id of a new in_progress gate-guard check run on sha, posted before any judging.
+
+    It supersedes whatever gate-guard result the commit had, so a job that
+    fails before it posts a verdict leaves a blocking check, not an earlier
+    success.
+    """
+    body = {"name": CHECK_NAME, "head_sha": sha, "status": "in_progress",
+            "output": {"title": "Judging the pull requests with this head",
+                       "summary": "The verdict replaces this when the job finishes. If the job fails first, "
+                                  "this check stays in progress and blocks the merge."}}
+    if details_url:
+        body["details_url"] = details_url
+    return github.post(f"/repos/{repo}/check-runs", body)["id"]
+
+
+def finish_check(github, repo, check_id, body):
+    """Complete the check run with body, or with a bare failure if GitHub rejects body.
+
+    False when body didn't land. If the bare failure doesn't land either, the
+    check run stays in_progress, which blocks the merge too.
+    """
+    path = f"/repos/{repo}/check-runs/{check_id}"
+    try:
+        github.patch(path, body)
+        return True
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(f"gate-guard: GitHub rejected the {CHECK_NAME} report: {e}", file=sys.stderr)
+    failure = {"status": "completed", "conclusion": "failure",
+               "output": {"title": "Could not post the report",
+                          "summary": "GitHub rejected the full report, so this check fails whatever the verdict "
+                                     "was. The job summary, linked from Details, has the report."}}
+    try:
+        github.patch(path, failure)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(f"gate-guard: could not complete the {CHECK_NAME} check run; it stays in progress: {e}",
+              file=sys.stderr)
+    return False
+
+
 def _write_outputs(values):
     path = os.environ.get("GITHUB_OUTPUT")
     if path:
@@ -1073,6 +1131,15 @@ def run_target(args, github=None):
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
     github = github or GitHub(os.environ.get("GITHUB_API_URL", "https://api.github.com"), token)
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    details_url = f"{server}/{repo}/actions/runs/{run_id}" if run_id else None
+    check_id = None
+    if not args.dry_run:
+        try:
+            check_id = start_check(github, repo, sha, details_url)
+        except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as e:
+            print(f"gate-guard: could not post the {CHECK_NAME} check run on {sha}: {e}", file=sys.stderr)
+            return 2
 
     prs, list_error = pull_requests_with_head(github, repo, sha, pr)
     judgments = [judge_pull_request(github, repo, p, sha, owner, server, token) for p in prs]
@@ -1090,25 +1157,16 @@ def run_target(args, github=None):
     _write_outputs({"conclusion": conclusion,
                     **{label: str(all(j.verdicts[label][0] for j in judgments)).lower() for label in OWNER_LABELS}})
 
-    if len(summary) > MAX_CHECK_SUMMARY:
-        summary = summary[:MAX_CHECK_SUMMARY] + "\n\n… (truncated; the job summary has the rest)\n"
     annotations = []
     for j in judgments:
         annotations += [a for a in check_annotations(j.hits, j.approved) if a not in annotations]
-    body = {"name": CHECK_NAME, "head_sha": sha, "status": "completed", "conclusion": conclusion,
-            "output": {"title": check_title(judgments), "summary": summary,
+    body = {"status": "completed", "conclusion": conclusion,
+            "output": {"title": check_title(judgments), "summary": fit_bytes(summary),
                        "annotations": annotations[:MAX_ANNOTATIONS]}}
-    run_id = os.environ.get("GITHUB_RUN_ID")
-    if run_id:
-        body["details_url"] = f"{server}/{repo}/actions/runs/{run_id}"
     if args.dry_run:
         print(f"gate-guard: dry run; a {conclusion} {CHECK_NAME} check run would be posted on {sha}")
-    else:
-        try:
-            github.post(f"/repos/{repo}/check-runs", body)
-        except (urllib.error.URLError, OSError, ValueError) as e:
-            print(f"gate-guard: could not post the {CHECK_NAME} check run on {sha}: {e}", file=sys.stderr)
-            return 2
+    elif not finish_check(github, repo, check_id, body):
+        return 2
     if error:
         return 2
     return 0 if passed else 1

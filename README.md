@@ -129,6 +129,13 @@ the same head against a new base can bring hits the old base hid.
    can't read a diff, the labels or the list of open pull requests posts a
    failure.
 
+   Before judging anything, the job creates the check run as `in_progress`,
+   which replaces any earlier `gate-guard` result on the commit, and fills in
+   the verdict at the end. A job that dies or is cancelled in between leaves a
+   blocking check, never an earlier success. The report is cut to fit the
+   Checks API's limit, which counts UTF-8 bytes; if GitHub still rejects it,
+   the check fails with a short note and the job summary keeps the report.
+
 Require `gate-guard` in the ruleset. The workflow job's own check also shows
 on the pull request, but its name (`judge / judge` with the template) comes
 from the caller's job names, and it carries no report. The job also exposes
