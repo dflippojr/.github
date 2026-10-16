@@ -1,27 +1,16 @@
 name: Gate guard (base branch)
 
-# This repository's own caller of gate-guard-target.yml. Under
-# pull_request_target both this file and the local reusable workflow come from
-# the base branch, and github.sha is the base branch's commit, so the guard
-# script is the base version too. Other repositories copy
-# templates/gate-guard-target-caller.yml instead.
+# Demo head for dflippojr/.github#17: this version drops the guard. Under
+# pull_request_target GitHub ignores it and runs the base branch's version.
 on:
   pull_request_target:
-    # labeled/unlabeled re-judge the pull request when an owner label changes.
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
   contents: read
-  issues: read
-  pull-requests: read
-  checks: write
-
-concurrency:
-  group: gate-guard-target-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
 
 jobs:
   judge:
-    uses: ./.github/workflows/gate-guard-target.yml
-    with:
-      guard-ref: ${{ github.sha }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "guard skipped"
