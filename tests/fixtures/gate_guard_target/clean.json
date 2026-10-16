@@ -1,0 +1,13 @@
+{
+  "description": "An ordinary feature with no owner labels passes.",
+  "diff": "pass-feature-with-tests",
+  "pushed_at": "2026-10-16T12:00:00Z",
+  "labels": [],
+  "events": [],
+  "expect": {
+    "conclusion": "success",
+    "exit": 0,
+    "title": "No removed tests, skips, retries or gate-config edits",
+    "reason": "No removed tests, skip markers, retries or gate-config edits."
+  }
+}

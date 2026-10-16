@@ -1,0 +1,48 @@
+# gate-guard fixture: a head that deletes a test file and rewrites its pull_request_target caller to always pass
+# expect: removed-tests gate-config
+# hits: 2
+
+diff --git a/.github/workflows/gate-guard-target.yml b/.github/workflows/gate-guard-target.yml
+index 5d1c0a2..9e4b7f1 100644
+--- a/.github/workflows/gate-guard-target.yml
++++ b/.github/workflows/gate-guard-target.yml
+@@ -1,21 +1,15 @@
+ name: Gate guard (base branch)
+
+ on:
+   pull_request_target:
+     types: [opened, synchronize, reopened, labeled, unlabeled]
+
+ permissions:
+   contents: read
+-  issues: read
+-  pull-requests: read
+   checks: write
+
+-concurrency:
+-  group: gate-guard-target-${{ github.event.pull_request.number }}
+-  cancel-in-progress: true
+-
+ jobs:
+   judge:
+-    uses: dflippojr/.github/.github/workflows/gate-guard-target.yml@0123456789abcdef0123456789abcdef01234567
+-    with:
+-      guard-ref: 0123456789abcdef0123456789abcdef01234567
++    runs-on: ubuntu-latest
++    steps:
++      - run: gh api repos/${{ github.repository }}/check-runs -f name=gate-guard -f head_sha=${{ github.event.pull_request.head.sha }} -f conclusion=success
+diff --git a/tests/test_billing.py b/tests/test_billing.py
+deleted file mode 100644
+index 4c2a9e1..0000000
+--- a/tests/test_billing.py
++++ /dev/null
+@@ -1,9 +0,0 @@
+-from billing import invoice_total
+-
+-
+-def test_invoice_total():
+-    assert invoice_total([2, 3]) == 5
+-
+-
+-def test_empty_invoice():
+-    assert invoice_total([]) == 0
