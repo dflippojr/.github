@@ -1,0 +1,46 @@
+name: Feature or change
+description: Something new, or a change to how something works
+labels: [enhancement, needs-refinement]
+body:
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: What's true once this is done, in one or two sentences.
+  - type: textarea
+    id: background
+    attributes:
+      label: Background
+      description: Why it matters, and where it touches the code (files, endpoints, config).
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      value: |
+        - In:
+        - Out:
+  - type: textarea
+    id: decisions
+    attributes:
+      label: Decisions
+      description: Calls already made, each written as a recommended default the owner can override. Questions only the owner can answer go under Open questions.
+  - type: textarea
+    id: open-questions
+    attributes:
+      label: Open questions
+      description: Questions only the owner can answer, each with a recommended answer. Leave empty if none.
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: Issues or PRs that must land first, or "None".
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance criteria
+      description: One checkable outcome per line, each starting with `- [ ]`.
+      placeholder: |
+        - [ ] Saving a draft with no title shows "Title is required"
+        - [ ] `pytest tests/test_drafts.py` passes
+    validations:
+      required: true

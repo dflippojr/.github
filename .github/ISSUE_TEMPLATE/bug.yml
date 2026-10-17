@@ -1,0 +1,53 @@
+name: Bug
+description: Something isn't working as intended
+labels: [bug, needs-refinement]
+body:
+  - type: textarea
+    id: what-happens
+    attributes:
+      label: What happens
+      description: Observed behavior, with exact error text if there is any.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      value: |
+        1.
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Logs, screenshots, commit or version. Leave out secrets, tokens, device IDs and private paths.
+  - type: input
+    id: introduced-by
+    attributes:
+      label: Introduced by
+      description: The PR or commit that introduced the bug, found with `git log -S`, blame or bisect. Write "unknown" if you couldn't find it.
+      placeholder: "#123, a1b2c3d or unknown"
+    validations:
+      required: true
+  - type: dropdown
+    id: gate
+    attributes:
+      label: Gate that should have caught it
+      options:
+        - tests
+        - review
+        - lint
+        - outside judge
+        - none existed
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance criteria
+      value: |
+        - [ ] The steps above no longer reproduce the problem
+        - [ ] A test or check that would have caught it
