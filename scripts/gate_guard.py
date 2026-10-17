@@ -16,21 +16,42 @@ there are unapproved hits, and 2 when the diff cannot be read. Only the
 standard library is used, and only the GitHub API is contacted, to read the
 label when there are hits.
 
+With --pull-request-target the script judges every open pull request whose
+head is the head of a pull_request_target event, each against its current
+base. It fetches the merge base and head commits as data, never checking out
+or running them, and accepts an owner-only label (gate-change-approved,
+findings-accepted) only when the owner applied it after the head commit was
+pushed. It posts one verdict, failing if any of those pull requests fails, as a
+check run named gate-guard on the head commit.
+
     python3 gate_guard.py --repo-dir . --base HEAD^1 --head HEAD
     python3 gate_guard.py --diff-file pr.diff
+    python3 gate_guard.py --pull-request-target --guard-sha "$GUARD_SHA"
 """
 import argparse
+import base64
 import collections
+import datetime
 import json
 import os
 import posixpath
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 
 APPROVAL_LABEL = "gate-change-approved"
+FINDINGS_LABEL = "findings-accepted"
+OWNER_LABELS = (APPROVAL_LABEL, FINDINGS_LABEL)
+CHECK_NAME = "gate-guard"
+# The Checks API rejects an output.summary or output.text over 65,535 UTF-8
+# bytes; the guard stays a margin under it.
+MAX_CHECK_BYTES = 65000
+TRUNCATED = "\n\n… (truncated; the job summary has the rest)\n"
 MAX_ANNOTATIONS = 50
 MAX_API_PAGES = 30
 
@@ -675,8 +696,8 @@ def _cell(text):
     return text.replace("|", "\\|").replace("\n", " ")
 
 
-def render_summary(hits, approved, note):
-    out = ["### Gate guard", ""]
+def render_summary(hits, approved, note, title="Gate guard"):
+    out = [f"### {title}", ""]
     if not hits:
         out.append("No removed tests, skip markers, retries or gate-config edits.")
         return "\n".join(out) + "\n"
@@ -721,21 +742,40 @@ def _next_link(header):
     return None
 
 
+def api_request(url, token, method="GET", body=None):
+    """(parsed JSON, Link header) of one GitHub API call."""
+    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28",
+               "User-Agent": "gate-guard"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(request, timeout=20) as resp:
+        return json.loads(resp.read().decode("utf-8") or "null"), resp.headers.get("Link")
+
+
+class IncompleteList(ValueError):
+    """A paginated list still had pages left when api_pages stopped reading."""
+
+
 def api_pages(api, path, token):
-    """Every item of a paginated GitHub API list."""
-    url = f"{api}{path}?per_page=100"
+    """Every item of a paginated GitHub API list.
+
+    Raises IncompleteList rather than return part of a list: label events come
+    oldest first, so a cut-off history would date a label by a stale event.
+    """
+    url = f"{api}{path}{'&' if '?' in path else '?'}per_page=100"
     items = []
     for _ in range(MAX_API_PAGES):
-        headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28",
-                   "User-Agent": "gate-guard"}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=20) as resp:
-            items.extend(json.loads(resp.read().decode("utf-8")))
-            url = _next_link(resp.headers.get("Link"))
+        page, link = api_request(url, token)
+        items.extend(page)
+        url = _next_link(link)
         if not url:
-            break
-    return items
+            return items
+    raise IncompleteList(f"{path} has more than {MAX_API_PAGES} pages; the guard reads no partial list")
 
 
 def label_approval(repo, pr, owner, require_actor, fetch):
@@ -755,12 +795,15 @@ def label_approval(repo, pr, owner, require_actor, fetch):
     return False, f"the `{APPROVAL_LABEL}` label was applied by @{actor or 'unknown'}, not the owner @{owner}"
 
 
-def pr_from_event(path):
+def load_event(path):
     if not path or not os.path.exists(path):
-        return None
+        return {}
     with open(path, encoding="utf-8") as f:
-        event = json.load(f)
-    return (event.get("pull_request") or {}).get("number")
+        return json.load(f)
+
+
+def pr_from_event(path):
+    return (load_event(path).get("pull_request") or {}).get("number")
 
 
 def approval(args):
@@ -778,19 +821,364 @@ def approval(args):
         return False, f"could not read the pull request's labels ({e})"
 
 
+# -------------------------------------------------------- pull_request_target
+
+def parse_time(text):
+    """An aware datetime from a GitHub ISO 8601 timestamp, or None."""
+    try:
+        return datetime.datetime.fromisoformat((text or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _stamp(when):
+    return when.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def head_pushed_at(activities, ref, sha):
+    """When sha last became the tip of ref, from the repository activity API, or None.
+
+    That is GitHub's own record of the push. A commit's author and committer
+    dates are whatever its maker wrote, so they cannot date a push.
+    """
+    times = [parse_time(a.get("timestamp")) for a in activities
+             if a.get("after") == sha and a.get("ref") == ref]
+    times = [t for t in times if t]
+    return max(times) if times else None
+
+
+def owner_label(label, labels, events, owner, sha, pushed_at):
+    """(counts, reason) for an owner-only label on a pull request whose head is sha.
+
+    The label counts only when the newest labeled/unlabeled event for it is
+    'labeled' by the owner, after sha was pushed. A label a worker re-applies
+    becomes the worker's, and a new push makes the owner's label stale.
+    """
+    if label not in labels:
+        return False, f"`{label}` is not on this pull request"
+    history = [e for e in events if e.get("event") in ("labeled", "unlabeled")
+               and ((e.get("label") or {}).get("name") or "").lower() == label]
+    if not history:
+        return False, f"no labeled event was found for `{label}`"
+    newest = max(history, key=lambda e: (e.get("created_at") or "", e.get("id") or 0))
+    actor = (newest.get("actor") or {}).get("login") or "unknown"
+    if newest.get("event") != "labeled":
+        return False, f"`{label}` was last removed, by @{actor}"
+    if actor.lower() != owner.lower():
+        return False, f"`{label}` was applied by @{actor}, not the owner @{owner}"
+    if pushed_at is None:
+        return False, (f"`{label}` was applied by the owner, but GitHub has no record of when {sha[:7]} "
+                       "was pushed, so the label cannot be dated against it")
+    applied = parse_time(newest.get("created_at"))
+    if applied is None or applied <= pushed_at:
+        return False, (f"`{label}` was applied by the owner at {newest.get('created_at')}, before {sha[:7]} "
+                       f"was pushed at {_stamp(pushed_at)}; the owner re-applies it after reviewing the new commits")
+    return True, (f"`{label}` was applied by the owner @{actor} at {_stamp(applied)}, after {sha[:7]} "
+                  f"was pushed at {_stamp(pushed_at)}")
+
+
+class GitHub:
+    """The GitHub API calls the pull_request_target mode makes."""
+
+    def __init__(self, api, token):
+        self.api, self.token = api, token
+
+    def get(self, path):
+        return api_request(self.api + path, self.token)[0]
+
+    def pages(self, path):
+        return api_pages(self.api, path, self.token)
+
+    def post(self, path, body):
+        return api_request(self.api + path, self.token, "POST", body)[0]
+
+    def patch(self, path, body):
+        return api_request(self.api + path, self.token, "PATCH", body)[0]
+
+
+def git_diff(repo_dir, base, head):
+    # Full context lets ini/TOML edits be placed in their section. No external
+    # diff or textconv driver runs, whatever the repository's attributes say.
+    out = subprocess.run(
+        ["git", "-C", repo_dir, "-c", "core.quotePath=false", "diff", "--no-color", "--no-ext-diff",
+         "--no-textconv", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", "--unified=1000000",
+         base, head],
+        check=True, capture_output=True)
+    return out.stdout.decode("utf-8", "replace")
+
+
+def fetch_diff(url, token, base, head):
+    """The diff from base to head, fetched as objects into an empty repository.
+
+    Nothing is checked out, so no file from the pull request reaches the disk,
+    let alone runs. The token reaches git through the environment, never the
+    command line or a config file.
+    """
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    if token:
+        n = int(env.get("GIT_CONFIG_COUNT") or 0)
+        basic = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
+        env.update({"GIT_CONFIG_COUNT": str(n + 1), f"GIT_CONFIG_KEY_{n}": "http.extraheader",
+                    f"GIT_CONFIG_VALUE_{n}": f"AUTHORIZATION: basic {basic}"})
+    tmp = tempfile.mkdtemp(prefix="gate-guard-", dir=os.environ.get("RUNNER_TEMP"))
+    try:
+        subprocess.run(["git", "init", "-q", tmp], check=True, capture_output=True, env=env)
+        subprocess.run(["git", "-C", tmp, "fetch", "-q", "--no-tags", "--no-recurse-submodules", "--depth=1",
+                        url, base, head], check=True, capture_output=True, env=env)
+        return git_diff(tmp, base, head)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class Judgment(collections.namedtuple("Judgment", "number base hits error labels verdicts approved findings_blocked")):
+    """The verdict on one pull request: its hits against its base, and its owner-only labels."""
+    __slots__ = ()
+
+    @property
+    def passed(self):
+        return not self.error and self.approved and not self.findings_blocked
+
+
+def render_judgment(j):
+    """The report for one pull request: its hits and its owner-only labels."""
+    approved, note = j.verdicts[APPROVAL_LABEL]
+    title = f"Gate guard: #{j.number} into `{j.base}`"
+    if j.error:
+        out = [f"### {title}", "", f"**Failing:** {j.error}.", ""]
+    else:
+        out = [render_summary(j.hits, approved, note, title)]
+    if j.findings_blocked:
+        out += [f"**Failing:** {j.verdicts[FINDINGS_LABEL][1]}. Only the owner's `{FINDINGS_LABEL}` label, "
+                "applied after the newest push, accepts review findings; the owner re-applies or removes it.", ""]
+    out += ["#### Owner-only labels", "", "| Label | Counts | Why |", "| --- | --- | --- |"]
+    for label in OWNER_LABELS:
+        counts, why = j.verdicts[label]
+        out.append(f"| `{label}` | {'yes' if counts else 'no'} | {_cell(why)} |")
+    return "\n".join(out) + "\n"
+
+
+def render_target_summary(judgments, sha, guard_sha):
+    out = []
+    if len(judgments) > 1:
+        failing = ", ".join(f"#{j.number}" for j in judgments if not j.passed) or "none"
+        out += [f"{len(judgments)} open pull requests have head `{sha[:12]}`. A check run belongs to the commit, "
+                f"not to one pull request, so `{CHECK_NAME}` passes only when every one of them passes. "
+                f"Failing: {failing}.", ""]
+    out += [render_judgment(j) for j in judgments]
+    guard = f" with `gate_guard.py` at `{guard_sha[:12]}`" if guard_sha else ""
+    out += [f"Judged head `{sha[:12]}` against each pull request's current base with the default branch's "
+            f"workflow{guard}. The pull requests' files are read only as a diff; none of them run."]
+    return "\n".join(out) + "\n"
+
+
+def _judgment_title(j):
+    if j.error:
+        return "Could not judge this pull request"
+    if j.findings_blocked:
+        return f"{FINDINGS_LABEL} does not count"
+    if not j.hits:
+        return "No removed tests, skips, retries or gate-config edits"
+    count = f"{len(j.hits)} hit{'s' if len(j.hits) != 1 else ''}"
+    return f"{count}, approved by the owner" if j.approved else f"{count}, not approved"
+
+
+def check_title(judgments):
+    if len(judgments) == 1:
+        return _judgment_title(judgments[0])
+    failing = [j for j in judgments if not j.passed]
+    if not failing:
+        return f"All {len(judgments)} pull requests with this head pass"
+    return f"#{failing[0].number} into {failing[0].base}: {_judgment_title(failing[0])}"
+
+
+def check_annotations(hits, approved):
+    """Line annotations for the check run; file-level hits stay in the summary table."""
+    level = "warning" if approved else "failure"
+    return [{"path": h.path, "start_line": h.line, "end_line": h.line, "annotation_level": level,
+             "title": f"gate-guard {h.rule}", "message": h.detail}
+            for h in hits if h.line][:MAX_ANNOTATIONS]
+
+
+def fit_bytes(text, limit=MAX_CHECK_BYTES, suffix=TRUNCATED):
+    """text, cut so that it and the suffix fit in limit UTF-8 bytes.
+
+    The Checks API counts bytes, not characters: a report of non-ASCII paths
+    can be far longer in bytes than in characters.
+    """
+    data = text.encode("utf-8")
+    if len(data) <= limit:
+        return text
+    return data[:limit - len(suffix.encode("utf-8"))].decode("utf-8", "ignore") + suffix
+
+
+def start_check(github, repo, sha, details_url):
+    """The id of a new in_progress gate-guard check run on sha, posted before any judging.
+
+    It supersedes whatever gate-guard result the commit had, so a job that
+    fails before it posts a verdict leaves a blocking check, not an earlier
+    success.
+    """
+    body = {"name": CHECK_NAME, "head_sha": sha, "status": "in_progress",
+            "output": {"title": "Judging the pull requests with this head",
+                       "summary": "The verdict replaces this when the job finishes. If the job fails first, "
+                                  "this check stays in progress and blocks the merge."}}
+    if details_url:
+        body["details_url"] = details_url
+    return github.post(f"/repos/{repo}/check-runs", body)["id"]
+
+
+def finish_check(github, repo, check_id, body):
+    """Complete the check run with body, or with a bare failure if GitHub rejects body.
+
+    False when body didn't land. If the bare failure doesn't land either, the
+    check run stays in_progress, which blocks the merge too.
+    """
+    path = f"/repos/{repo}/check-runs/{check_id}"
+    try:
+        github.patch(path, body)
+        return True
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(f"gate-guard: GitHub rejected the {CHECK_NAME} report: {e}", file=sys.stderr)
+    failure = {"status": "completed", "conclusion": "failure",
+               "output": {"title": "Could not post the report",
+                          "summary": "GitHub rejected the full report, so this check fails whatever the verdict "
+                                     "was. The job summary, linked from Details, has the report."}}
+    try:
+        github.patch(path, failure)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(f"gate-guard: could not complete the {CHECK_NAME} check run; it stays in progress: {e}",
+              file=sys.stderr)
+    return False
+
+
+def _write_outputs(values):
+    path = os.environ.get("GITHUB_OUTPUT")
+    if path:
+        with open(path, "a", encoding="utf-8") as f:
+            f.writelines(f"{k}={v}\n" for k, v in values.items())
+
+
+def _target_hits(github, repo, base_ref, sha, server, token):
+    """(hits, error) for what the pull request changes since its merge base."""
+    try:
+        compare = github.get(f"/repos/{repo}/compare/{urllib.parse.quote(base_ref, safe='/')}...{sha}?per_page=1")
+        merge_base = compare["merge_base_commit"]["sha"]
+        return analyze(parse_diff(fetch_diff(f"{server}/{repo}.git", token, merge_base, sha))), None
+    except subprocess.CalledProcessError as e:
+        detail = (e.stderr or b"").decode("utf-8", "replace").strip()
+        return [], f"could not fetch the pull request's commits ({detail or e})"
+    except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as e:
+        return [], f"could not read the pull request's diff ({e})"
+
+
+def _target_labels(github, repo, number, head, sha, owner):
+    """(labels on the PR, {label: (counts, reason)}) for the owner-only labels."""
+    labels = {l["name"].lower() for l in github.pages(f"/repos/{repo}/issues/{number}/labels")}
+    events, pushed_at = [], None
+    if labels & set(OWNER_LABELS):
+        events = github.pages(f"/repos/{repo}/issues/{number}/events")
+        head_repo = (head.get("repo") or {}).get("full_name")
+        ref = f"refs/heads/{head.get('ref')}"
+        if head_repo:
+            activity = github.pages(f"/repos/{head_repo}/activity?ref={urllib.parse.quote(ref, safe='/')}")
+            pushed_at = head_pushed_at(activity, ref, sha)
+    return labels, {label: owner_label(label, labels, events, owner, sha, pushed_at) for label in OWNER_LABELS}
+
+
+def judge_pull_request(github, repo, pr, sha, owner, server, token):
+    """The Judgment of one pull request whose head is sha, against the base pr names."""
+    base, head = pr["base"]["ref"], pr.get("head") or {}
+    hits, error = _target_hits(github, repo, base, sha, server, token)
+    try:
+        labels, verdicts = _target_labels(github, repo, pr["number"], head, sha, owner)
+    except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as e:
+        error = error or f"could not read the pull request's labels ({e})"
+        labels, verdicts = set(), {label: (False, f"could not read the labels ({e})") for label in OWNER_LABELS}
+    approved = not hits or verdicts[APPROVAL_LABEL][0]
+    findings_blocked = FINDINGS_LABEL in labels and not verdicts[FINDINGS_LABEL][0]
+    return Judgment(pr["number"], base, hits, error, labels, verdicts, approved, findings_blocked)
+
+
+def pull_requests_with_head(github, repo, sha, event_pr):
+    """(pull requests, error): every open pull request whose head is sha, as the API has it now.
+
+    A check run lands on a commit, which any number of pull requests can share,
+    each with its own base and labels. The listing gives each one's current
+    base, which a queued event's payload may predate. The event's own pull
+    request is judged from the payload if the listing doesn't show it.
+    """
+    try:
+        prs = {p["number"]: p for p in github.pages(f"/repos/{repo}/pulls?state=open")
+               if (p.get("head") or {}).get("sha") == sha}
+        error = None
+    except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as e:
+        prs, error = {}, f"could not list the open pull requests with this head ({e})"
+    prs.setdefault(event_pr["number"], event_pr)
+    return [prs[n] for n in sorted(prs)], error
+
+
+def run_target(args, github=None):
+    """Judge every open pull request with the event's head and post one gate-guard check run on that head."""
+    pr = load_event(os.environ.get("GITHUB_EVENT_PATH")).get("pull_request") or {}
+    head, base = pr.get("head") or {}, pr.get("base") or {}
+    repo = args.repo or os.environ.get("GITHUB_REPOSITORY")
+    sha = head.get("sha")
+    if not (repo and pr.get("number") and sha and base.get("ref")):
+        print("gate-guard: --pull-request-target needs a pull_request_target event in $GITHUB_EVENT_PATH",
+              file=sys.stderr)
+        return 2
+    owner = args.owner or os.environ.get("GITHUB_REPOSITORY_OWNER") or repo.split("/")[0]
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    github = github or GitHub(os.environ.get("GITHUB_API_URL", "https://api.github.com"), token)
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    details_url = f"{server}/{repo}/actions/runs/{run_id}" if run_id else None
+    check_id = None
+    if not args.dry_run:
+        try:
+            check_id = start_check(github, repo, sha, details_url)
+        except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as e:
+            print(f"gate-guard: could not post the {CHECK_NAME} check run on {sha}: {e}", file=sys.stderr)
+            return 2
+
+    prs, list_error = pull_requests_with_head(github, repo, sha, pr)
+    judgments = [judge_pull_request(github, repo, p, sha, owner, server, token) for p in prs]
+    if list_error:
+        # Without the whole list, another pull request's failure could go unseen.
+        judgments = [j._replace(error=j.error or list_error) for j in judgments]
+    error = next((j.error for j in judgments if j.error), None)
+    passed = all(j.passed for j in judgments)
+    conclusion = "success" if passed else "failure"
+    summary = render_target_summary(judgments, sha, args.guard_sha)
+    print(summary)
+    if args.summary:
+        with open(args.summary, "a", encoding="utf-8") as f:
+            f.write(summary)
+    _write_outputs({"conclusion": conclusion,
+                    **{label: str(all(j.verdicts[label][0] for j in judgments)).lower() for label in OWNER_LABELS}})
+
+    annotations = []
+    for j in judgments:
+        annotations += [a for a in check_annotations(j.hits, j.approved) if a not in annotations]
+    body = {"status": "completed", "conclusion": conclusion,
+            "output": {"title": check_title(judgments), "summary": fit_bytes(summary),
+                       "annotations": annotations[:MAX_ANNOTATIONS]}}
+    if args.dry_run:
+        print(f"gate-guard: dry run; a {conclusion} {CHECK_NAME} check run would be posted on {sha}")
+    elif not finish_check(github, repo, check_id, body):
+        return 2
+    if error:
+        return 2
+    return 0 if passed else 1
+
+
 # ----------------------------------------------------------------------- main
 
 def read_diff(args):
     if args.diff_file:
         with open(args.diff_file, encoding="utf-8", errors="replace") as f:
             return f.read()
-    # Full context lets ini/TOML edits be placed in their section.
-    out = subprocess.run(
-        ["git", "-C", args.repo_dir, "-c", "core.quotePath=false", "diff", "--no-color", "--no-ext-diff",
-         "--no-textconv", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", "--unified=1000000",
-         args.base, args.head],
-        check=True, capture_output=True)
-    return out.stdout.decode("utf-8", "replace")
+    return git_diff(args.repo_dir, args.base, args.head)
 
 
 def parse_args(argv):
@@ -806,6 +1194,11 @@ def parse_args(argv):
                    help=f"accept {APPROVAL_LABEL} only when the owner applied it")
     p.add_argument("--summary", default=os.environ.get("GITHUB_STEP_SUMMARY"),
                    help="append the Markdown report here (default: $GITHUB_STEP_SUMMARY)")
+    p.add_argument("--pull-request-target", action="store_true",
+                   help="judge the pull request of the pull_request_target event in $GITHUB_EVENT_PATH, "
+                        "date owner labels against the head push, and post a gate-guard check run")
+    p.add_argument("--guard-sha", help="commit of this script, named in the check run's summary")
+    p.add_argument("--dry-run", action="store_true", help="with --pull-request-target, do not post the check run")
     return p.parse_args(argv)
 
 
@@ -814,6 +1207,8 @@ def main(argv=None):
     if reconfigure:
         reconfigure(errors="replace")
     args = parse_args(argv)
+    if args.pull_request_target:
+        return run_target(args)
     try:
         diff = read_diff(args)
     except (OSError, subprocess.CalledProcessError) as e:

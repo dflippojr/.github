@@ -16,7 +16,10 @@ Feature work and fixes go through GitHub issues and pull requests, so plans and 
 | `reserved` | Held for a specific person or run; agents and orchestrators skip it |
 | `parked` | Deliberately deferred; not planned for now |
 | `gate-change-approved` | The owner approved this pull request's test removals, skips, retries or gate-config edits; the gate guard then passes |
+| `findings-accepted` | The owner accepted this pull request's open review findings |
 | `P0` / `P1` / `P2` | Priority: do first / bugs and fixes ahead of features / normal |
+
+`gate-change-approved` and `findings-accepted` are owner-only. The default-branch gate guard counts one only when the owner applied it after the newest push. A label a worker applies, or re-applies, doesn't count, and a push voids the owner's label until the owner applies it again.
 
 The remaining labels are GitHub's defaults plus one for accessibility:
 

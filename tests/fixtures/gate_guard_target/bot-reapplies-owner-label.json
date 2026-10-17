@@ -1,0 +1,34 @@
+{
+  "description": "The owner applied the label, then the bot removed and re-applied it: the newest event is the bot's, so it is rejected.",
+  "diff": "flag-skip-python",
+  "pushed_at": "2026-10-16T12:00:00Z",
+  "labels": [
+    "gate-change-approved"
+  ],
+  "events": [
+    {
+      "event": "labeled",
+      "label": "gate-change-approved",
+      "actor": "dflippojr",
+      "created_at": "2026-10-16T13:00:00Z"
+    },
+    {
+      "event": "unlabeled",
+      "label": "gate-change-approved",
+      "actor": "dflippojr-workers[bot]",
+      "created_at": "2026-10-16T13:05:00Z"
+    },
+    {
+      "event": "labeled",
+      "label": "gate-change-approved",
+      "actor": "dflippojr-workers[bot]",
+      "created_at": "2026-10-16T13:06:00Z"
+    }
+  ],
+  "expect": {
+    "conclusion": "failure",
+    "exit": 1,
+    "title": "6 hits, not approved",
+    "reason": "applied by @dflippojr-workers[bot], not the owner"
+  }
+}

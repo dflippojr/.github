@@ -1,0 +1,95 @@
+name: Gate guard (default branch)
+
+# Reusable gate guard for pull_request_target callers. That event runs the
+# workflow as defined on the repository's default branch, whatever the pull
+# request's base, so a pull request cannot rewrite the check that judges it.
+# The job never checks out or runs pull request code: the script fetches the
+# merge base and head commits as git objects and reads their diff. It uses no
+# secrets, only the caller's GITHUB_TOKEN.
+#
+# Owner-only labels (gate-change-approved, findings-accepted) count only when
+# the newest labeled/unlabeled event for the label is the owner's, applied after
+# the head commit was pushed. A check run belongs to a commit, so the script
+# judges every open pull request with the event's head, each against its
+# current base, and posts one verdict as a check run named gate-guard on that
+# commit, with the full report; a ruleset requires that name. See README.md,
+# "Gate guard on the default branch".
+on:
+  workflow_call:
+    inputs:
+      guard-ref:
+        description: >-
+          Full 40-character commit SHA of dflippojr/.github to load the guard
+          script from. Use the SHA in the caller's uses: line.
+        type: string
+        required: true
+      runs-on:
+        description: >-
+          Runner for the job, as JSON: a label string or a list of labels.
+          Private repos pass '["self-hosted", "Linux", "X64", "tower-linux"]'.
+        type: string
+        default: '"ubuntu-latest"'
+      owner:
+        description: >-
+          Login whose labels count. Defaults to the repository owner.
+        type: string
+        default: ''
+    outputs:
+      conclusion:
+        description: success or failure, as posted on the gate-guard check run.
+        value: ${{ jobs.judge.outputs.conclusion }}
+      gate-change-approved:
+        description: "'true' when the owner's gate-change-approved label counts on every open pull request with the head."
+        value: ${{ jobs.judge.outputs.gate-change-approved }}
+      findings-accepted:
+        description: "'true' when the owner's findings-accepted label counts on every open pull request with the head."
+        value: ${{ jobs.judge.outputs.findings-accepted }}
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+  checks: write
+
+jobs:
+  judge:
+    name: judge
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 10
+    outputs:
+      conclusion: ${{ steps.judge.outputs.conclusion }}
+      gate-change-approved: ${{ steps.judge.outputs.gate-change-approved }}
+      findings-accepted: ${{ steps.judge.outputs.findings-accepted }}
+    steps:
+      - name: Require pull_request_target
+        if: github.event_name != 'pull_request_target'
+        run: |
+          echo "::error::gate-guard-target.yml judges pull_request_target events only, not ${{ github.event_name }}. Under pull_request the pull request would supply its own judge."
+          exit 1
+
+      - name: Require a full commit SHA for the guard
+        env:
+          GUARD_REF: ${{ inputs.guard-ref }}
+        run: |
+          if ! printf '%s' "$GUARD_REF" | grep -Eqx '[0-9a-f]{40}'; then
+            echo "::error::guard-ref must be a full 40-character commit SHA of dflippojr/.github, not '$GUARD_REF'."
+            exit 1
+          fi
+
+      - name: Check out the guard script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dflippojr/.github
+          ref: ${{ inputs.guard-ref }}
+          path: gate-guard
+          persist-credentials: false
+          sparse-checkout: scripts/gate_guard.py
+          sparse-checkout-cone-mode: false
+
+      - name: Judge the pull request
+        id: judge
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GUARD_REF: ${{ inputs.guard-ref }}
+          OWNER: ${{ inputs.owner }}
+        run: python3 gate-guard/scripts/gate_guard.py --pull-request-target --guard-sha "$GUARD_REF" ${OWNER:+--owner "$OWNER"}

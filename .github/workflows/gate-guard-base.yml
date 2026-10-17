@@ -1,0 +1,32 @@
+name: Gate guard (default branch)
+
+# This repository's own caller of gate-guard-target.yml. Under
+# pull_request_target both this file and the local reusable workflow come from
+# the default branch, and github.sha is the default branch's newest commit, so
+# the guard script is the default branch's version too. Other repositories copy
+# templates/gate-guard-target-caller.yml instead.
+on:
+  pull_request_target:
+    # edited re-judges a pull request moved to another base, where the same
+    # head can bring new hits; labeled/unlabeled re-judge it when an owner
+    # label changes.
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+  checks: write
+
+# The check run lands on the head commit, which several pull requests can
+# share, so each run judges every open pull request with that head and runs
+# alone for it: the newest decision for a commit is the one that lands.
+concurrency:
+  group: gate-guard-target-${{ github.event.pull_request.head.sha }}
+  cancel-in-progress: true
+
+jobs:
+  judge:
+    uses: ./.github/workflows/gate-guard-target.yml
+    with:
+      guard-ref: ${{ github.sha }}

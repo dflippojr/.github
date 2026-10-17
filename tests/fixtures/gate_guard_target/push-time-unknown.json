@@ -1,0 +1,22 @@
+{
+  "description": "GitHub has no activity record for the head push, so the owner's label cannot be dated and does not count.",
+  "diff": "flag-skip-python",
+  "pushed_at": null,
+  "labels": [
+    "gate-change-approved"
+  ],
+  "events": [
+    {
+      "event": "labeled",
+      "label": "gate-change-approved",
+      "actor": "dflippojr",
+      "created_at": "2026-10-16T13:00:00Z"
+    }
+  ],
+  "expect": {
+    "conclusion": "failure",
+    "exit": 1,
+    "title": "6 hits, not approved",
+    "reason": "GitHub has no record of when {head} was pushed"
+  }
+}

@@ -1,0 +1,40 @@
+# Copy to .github/workflows/gate-guard-target.yml in each repository, then
+# replace both <full-sha> placeholders with the same full commit SHA of
+# dflippojr/.github main:
+#
+#   git ls-remote https://github.com/dflippojr/.github refs/heads/main
+#
+# pull_request_target runs this file as it is on the default branch, so a pull
+# request that edits it cannot change its own verdict. The verdict lands as the
+# gate-guard check on the pull request's head commit; require gate-guard in the
+# repository's ruleset next to gate. See README.md in dflippojr/.github, "Gate
+# guard on the default branch".
+name: Gate guard (default branch)
+
+on:
+  pull_request_target:
+    # edited re-judges a pull request moved to another base, where the same
+    # head can bring new hits; labeled/unlabeled re-judge it when an owner
+    # label changes.
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+  checks: write
+
+# The check run lands on the head commit, which several pull requests can
+# share, so each run judges every open pull request with that head and runs
+# alone for it: the newest decision for a commit is the one that lands.
+concurrency:
+  group: gate-guard-target-${{ github.event.pull_request.head.sha }}
+  cancel-in-progress: true
+
+jobs:
+  judge:
+    uses: dflippojr/.github/.github/workflows/gate-guard-target.yml@<full-sha>
+    with:
+      guard-ref: <full-sha>
+      # Private repositories run on the tower:
+      # runs-on: '["self-hosted", "Linux", "X64", "tower-linux"]'

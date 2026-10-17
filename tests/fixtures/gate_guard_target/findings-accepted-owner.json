@@ -1,0 +1,22 @@
+{
+  "description": "The owner accepted the review findings after the newest push: the label counts.",
+  "diff": "pass-feature-with-tests",
+  "pushed_at": "2026-10-16T12:00:00Z",
+  "labels": [
+    "findings-accepted"
+  ],
+  "events": [
+    {
+      "event": "labeled",
+      "label": "findings-accepted",
+      "actor": "dflippojr",
+      "created_at": "2026-10-16T12:00:01Z"
+    }
+  ],
+  "expect": {
+    "conclusion": "success",
+    "exit": 0,
+    "title": "No removed tests, skips, retries or gate-config edits",
+    "reason": "`findings-accepted` was applied by the owner @dflippojr"
+  }
+}

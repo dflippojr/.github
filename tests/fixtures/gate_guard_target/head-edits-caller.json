@@ -1,0 +1,13 @@
+{
+  "description": "The head rewrites its pull_request_target caller to post a passing gate-guard check and deletes a test file. The base branch's workflow still judges it, so the verdict fails.",
+  "diff": "flag-gate-target-caller",
+  "pushed_at": "2026-10-16T12:00:00Z",
+  "labels": [],
+  "events": [],
+  "expect": {
+    "conclusion": "failure",
+    "exit": 1,
+    "title": "2 hits, not approved",
+    "reason": "`gate-change-approved` is not on this pull request"
+  }
+}

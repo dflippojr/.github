@@ -239,6 +239,23 @@ class Approval(unittest.TestCase):
         self.assertEqual(first.get_header("Authorization"), "Bearer tok")
         self.assertEqual(second.full_url, "https://api.test/next?page=2")
 
+    def test_api_pages_fails_closed_on_a_cut_off_list(self):
+        """Label events come oldest first; the pages past the limit hold the newest ones."""
+        def request(url, _token):
+            return [{"event": "labeled"}], f'<{url}&more>; rel="next"'
+
+        with mock.patch.object(gate_guard, "api_request", side_effect=request) as api_request:
+            with self.assertRaisesRegex(gate_guard.IncompleteList, "more than 30 pages"):
+                gate_guard.api_pages("https://api.test", "/repos/o/r/issues/7/events", "tok")
+        self.assertEqual(api_request.call_count, gate_guard.MAX_API_PAGES)
+
+    def test_cut_off_label_history_fails_closed(self):
+        args = gate_guard.parse_args(["--repo", "o/r", "--pr", "7", "--require-owner-label-actor"])
+        cut_off = gate_guard.IncompleteList("too long")
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(gate_guard, "api_pages", side_effect=cut_off):
+            self.assertEqual(gate_guard.approval(args), (False, "could not read the pull request's labels (too long)"))
+
 
 class Main(unittest.TestCase):
     def test_approved_hits_pass_with_warnings_and_summary(self):

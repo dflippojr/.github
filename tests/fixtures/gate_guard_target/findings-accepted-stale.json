@@ -1,0 +1,22 @@
+{
+  "description": "A clean diff, but findings-accepted predates the newest push: the label no longer counts and the check fails.",
+  "diff": "pass-feature-with-tests",
+  "pushed_at": "2026-10-16T12:00:00Z",
+  "labels": [
+    "findings-accepted"
+  ],
+  "events": [
+    {
+      "event": "labeled",
+      "label": "findings-accepted",
+      "actor": "dflippojr",
+      "created_at": "2026-10-16T11:59:59Z"
+    }
+  ],
+  "expect": {
+    "conclusion": "failure",
+    "exit": 1,
+    "title": "findings-accepted does not count",
+    "reason": "`findings-accepted` was applied by the owner at 2026-10-16T11:59:59Z, before {head}"
+  }
+}
