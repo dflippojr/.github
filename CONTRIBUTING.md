@@ -42,7 +42,7 @@ The labels themselves are defined in `labels.json`. `python scripts/sync_labels.
 
 ## Writing an issue
 
-Start from the feature template. A ready issue has these sections:
+Start from the feature form. A ready issue has these sections:
 
 - **Outcome**: what is true once the work is done, in a sentence or two.
 - **Background**: why it matters and where it touches the code.
@@ -50,6 +50,8 @@ Start from the feature template. A ready issue has these sections:
 - **Decisions**: calls already made, each written as a recommended default the owner can override ("Do X. Override if you want Y."), not as an open question.
 - **Dependencies**: issues or PRs that must land first, or "None".
 - **Acceptance criteria**: a checklist someone else can verify.
+
+A bug starts from the bug form. It also asks which PR or commit introduced the bug (found with `git log -S`, blame or bisect, or "unknown") and which gate should have caught it, so the rate of defects that get past the checks can be measured.
 
 Questions only the owner can answer go under an `Open questions` heading, each with a recommended answer, instead of being guessed. The issue stays `needs-refinement` until they are answered. If the owner approves the issue without answering, the recommended answers stand.
 
@@ -62,6 +64,6 @@ Keep it simple and suit the project. A short prefix plus the issue number and a 
 ## Pull requests
 
 - Link the issue with `Closes #N` so merging closes it.
-- Say what changed, how it was verified, and anything the owner has to do after merging.
+- Say what changed and anything the owner has to do after merging. Under Proof, give each acceptance criterion a row with how you verified it and the evidence; list what you didn't verify, and any test removed or skipped or config loosened, with the reason.
 - The owner reviews and merges every pull request. Agents push branches and open PRs only with the owner's go-ahead; they never merge or close issues themselves.
 - Never commit secrets, tokens, device identifiers or private paths, even in private repos.

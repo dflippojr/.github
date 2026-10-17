@@ -4,17 +4,17 @@ Default community health files for repositories owned by dflippojr. GitHub appli
 
 ## Contents
 
-- `.github/ISSUE_TEMPLATE/feature.md`: template for features and changes (Outcome, Background, Scope, Decisions, Open questions, Dependencies, Acceptance criteria).
-- `.github/ISSUE_TEMPLATE/bug.md`: template for bug reports.
+- `.github/ISSUE_TEMPLATE/feature.yml`: issue form for features and changes (Outcome, Background, Scope, Decisions, Open questions, Dependencies, and a required Acceptance criteria checklist).
+- `.github/ISSUE_TEMPLATE/bug.yml`: issue form for bug reports, with required *Introduced by* (PR, commit or "unknown") and *Gate that should have caught it* fields.
 - `.github/ISSUE_TEMPLATE/verification.md`: template for confirming something already built works.
 - `.github/ISSUE_TEMPLATE/config.yml`: new-issue chooser settings.
-- `PULL_REQUEST_TEMPLATE.md`: default pull request description.
+- `PULL_REQUEST_TEMPLATE.md`: default pull request description, with a Proof table (acceptance criterion, how verified, evidence), Not verified and Gate changes.
 - `CONTRIBUTING.md`: how issues, labels, branches and pull requests work, including how to write an issue.
 - `labels.json`: the shared label set.
 - `scripts/sync_labels.py`: shows or applies label differences across repositories. See `CONTRIBUTING.md`.
 - `.github/workflows/gate-guard.yml` and `scripts/gate_guard.py`: the reusable gate guard. See below.
 - `.github/workflows/gate-guard-target.yml`, `templates/gate-guard-target-caller.yml` and `.github/workflows/gate-guard-base.yml`: the gate guard on the default branch, its caller template, and this repository's own caller. See "Gate guard on the default branch".
-- `tests/`: tests for the label configuration and the scripts. `tests/fixtures/gate_guard/` holds the gate guard's fixture diffs and `tests/fixtures/gate_guard_target/` its owner-label scenarios.
+- `tests/`: tests for the label configuration, the issue forms and PR template, and the scripts. `tests/fixtures/gate_guard/` holds the gate guard's fixture diffs and `tests/fixtures/gate_guard_target/` its owner-label scenarios.
 
 ## Gate guard
 
