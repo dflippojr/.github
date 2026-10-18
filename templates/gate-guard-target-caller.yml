@@ -15,8 +15,9 @@ on:
   pull_request_target:
     # edited re-judges a pull request moved to another base, where the same
     # head can bring new hits; labeled/unlabeled re-judge it when an owner
-    # label changes.
-    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+    # label changes; closed re-judges the pull requests still open with the
+    # head, so one that closes stops deciding their shared check.
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled, closed]
 
 permissions:
   contents: read

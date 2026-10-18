@@ -92,9 +92,10 @@ the pull request's base (GitHub's rule since 2025-12-08). It applies the same
 rules. A caller therefore takes effect only once it is on the default branch.
 Keep `gate-guard.yml` working until every caller has moved over.
 
-What it does on each `opened`, `synchronize`, `reopened`, `edited`, `labeled`
-and `unlabeled` event. `edited` covers a pull request moved to another base:
-the same head against a new base can bring hits the old base hid.
+What it does on each `opened`, `synchronize`, `reopened`, `edited`, `labeled`,
+`unlabeled` and `closed` event. `edited` covers a pull request moved to another
+base: the same head against a new base can bring hits the old base hid.
+`closed` re-judges the pull requests still open with the head.
 
 1. Loads `scripts/gate_guard.py` from this repository at the full commit SHA in
    `guard-ref`. Anything other than 40 hex characters fails the job.
@@ -104,8 +105,10 @@ the same head against a new base can bring hits the old base hid.
    decision per commit: two pull requests that share a head but not a base can't
    let the passing one's result replace the failing one's. The caller's
    concurrency group is keyed by the head SHA, so the newest decision for a
-   commit is the one that lands. Closing the pull request that fails doesn't
-   re-judge the others; a push, an edit or a label change on one of them does.
+   commit is the one that lands. On a `closed` event the closed pull request
+   is left out, so closing the one that fails lets the others pass. When none
+   is left open with the head, the check completes as `neutral` with no
+   verdict, and both label outputs are `false`.
 3. Asks the compare API for each pull request's merge base, then fetches the
    merge base and the head commit as git objects into an empty repository
    (`git fetch --depth=1`, no checkout) and reads their diff, with no external

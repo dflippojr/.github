@@ -957,9 +957,14 @@ def render_judgment(j):
     return "\n".join(out) + "\n"
 
 
-def render_target_summary(judgments, sha, guard_sha):
+def render_target_summary(judgments, sha, guard_sha, list_error=None):
     out = []
-    if len(judgments) > 1:
+    if not judgments:
+        out += [f"### Gate guard: head `{sha[:12]}`", "",
+                f"**Failing:** {list_error}." if list_error else
+                "No open pull request has this head, so there is nothing to judge. The pull request that closed "
+                "isn't judged; reopening it, or opening another with this head, judges the head again.", ""]
+    elif len(judgments) > 1:
         failing = ", ".join(f"#{j.number}" for j in judgments if not j.passed) or "none"
         out += [f"{len(judgments)} open pull requests have head `{sha[:12]}`. A check run belongs to the commit, "
                 f"not to one pull request, so `{CHECK_NAME}` passes only when every one of them passes. "
@@ -982,7 +987,11 @@ def _judgment_title(j):
     return f"{count}, approved by the owner" if j.approved else f"{count}, not approved"
 
 
-def check_title(judgments):
+def check_title(judgments, list_error=None):
+    if not judgments:
+        if list_error:
+            return "Could not list the open pull requests with this head"
+        return "No open pull request has this head"
     if len(judgments) == 1:
         return _judgment_title(judgments[0])
     failing = [j for j in judgments if not j.passed]
@@ -1105,7 +1114,9 @@ def pull_requests_with_head(github, repo, sha, event_pr):
     A check run lands on a commit, which any number of pull requests can share,
     each with its own base and labels. The listing gives each one's current
     base, which a queued event's payload may predate. The event's own pull
-    request is judged from the payload if the listing doesn't show it.
+    request is judged from the payload if the listing doesn't show it, unless
+    the event closed it: then it is left out even if the listing still shows
+    it, and the pull requests still open with the head decide.
     """
     try:
         prs = {p["number"]: p for p in github.pages(f"/repos/{repo}/pulls?state=open")
@@ -1113,7 +1124,10 @@ def pull_requests_with_head(github, repo, sha, event_pr):
         error = None
     except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as e:
         prs, error = {}, f"could not list the open pull requests with this head ({e})"
-    prs.setdefault(event_pr["number"], event_pr)
+    if event_pr.get("state", "open") == "open":
+        prs.setdefault(event_pr["number"], event_pr)
+    else:
+        prs.pop(event_pr["number"], None)
     return [prs[n] for n in sorted(prs)], error
 
 
@@ -1146,22 +1160,24 @@ def run_target(args, github=None):
     if list_error:
         # Without the whole list, another pull request's failure could go unseen.
         judgments = [j._replace(error=j.error or list_error) for j in judgments]
-    error = next((j.error for j in judgments if j.error), None)
-    passed = all(j.passed for j in judgments)
-    conclusion = "success" if passed else "failure"
-    summary = render_target_summary(judgments, sha, args.guard_sha)
+    error = next((j.error for j in judgments if j.error), list_error)
+    passed = all(j.passed for j in judgments) and not error
+    # A closed pull request can leave none open with this head: there is no verdict to give.
+    conclusion = "neutral" if not judgments and passed else "success" if passed else "failure"
+    summary = render_target_summary(judgments, sha, args.guard_sha, list_error)
     print(summary)
     if args.summary:
         with open(args.summary, "a", encoding="utf-8") as f:
             f.write(summary)
     _write_outputs({"conclusion": conclusion,
-                    **{label: str(all(j.verdicts[label][0] for j in judgments)).lower() for label in OWNER_LABELS}})
+                    **{label: str(bool(judgments) and all(j.verdicts[label][0] for j in judgments)).lower()
+                       for label in OWNER_LABELS}})
 
     annotations = []
     for j in judgments:
         annotations += [a for a in check_annotations(j.hits, j.approved) if a not in annotations]
     body = {"status": "completed", "conclusion": conclusion,
-            "output": {"title": check_title(judgments), "summary": fit_bytes(summary),
+            "output": {"title": check_title(judgments, list_error), "summary": fit_bytes(summary),
                        "annotations": annotations[:MAX_ANNOTATIONS]}}
     if args.dry_run:
         print(f"gate-guard: dry run; a {conclusion} {CHECK_NAME} check run would be posted on {sha}")

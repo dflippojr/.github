@@ -26,8 +26,9 @@ def reject(status, body):
 class FakeGitHub:
     """Answers the API calls of run_target and keeps the check runs it creates and updates.
 
-    prs maps each open pull request with head `head` to its base, head branch,
-    labels, label events and push time; merge_bases maps each base to its merge
+    prs maps each pull request with head `head` to its base, head branch,
+    labels, label events and push time, and to closed=True for one the open
+    listing leaves out; merge_bases maps each base to its merge
     base with the head. Like the Checks API, it rejects an output over 65,535
     UTF-8 bytes, and any update that `refuse` returns true for.
     """
@@ -53,7 +54,7 @@ class FakeGitHub:
                      "base": {"ref": "main"}}
             return [other] + [{"number": n, "head": {"sha": self.head, "ref": p["head_ref"],
                                                      "repo": {"full_name": REPO}}, "base": {"ref": p["base"]}}
-                              for n, p in self.prs.items()]
+                              for n, p in self.prs.items() if not p.get("closed")]
         for number, s in self.prs.items():
             if path == f"/repos/{REPO}/issues/{number}/labels":
                 return [{"name": n} for n in s["labels"]]
@@ -125,8 +126,8 @@ def make_remote(tmp, *trees):
     return pathlib.Path(tmp, "server").as_uri(), shas
 
 
-def event_pr(number, head, base, head_ref=HEAD_REF):
-    return {"number": number, "head": {"sha": head, "ref": head_ref, "repo": {"full_name": REPO}},
+def event_pr(number, head, base, head_ref=HEAD_REF, state="open"):
+    return {"number": number, "state": state, "head": {"sha": head, "ref": head_ref, "repo": {"full_name": REPO}},
             "base": {"ref": base}}
 
 
@@ -216,7 +217,8 @@ class SharedHead(unittest.TestCase):
     def judge(self, prs, action, number, base):
         """(exit code, check run, outputs) for an event on pull request `number` whose payload names `base`."""
         fake = FakeGitHub(self.head, self.merge_bases, prs)
-        event = {"action": action, "pull_request": event_pr(number, self.head, base, prs[number]["head_ref"])}
+        state = "closed" if prs[number].get("closed") else "open"
+        event = {"action": action, "pull_request": event_pr(number, self.head, base, prs[number]["head_ref"], state)}
         code, _, outputs = run_cli(self.tmp, self.server, event, fake)
         [check] = fake.posted
         self.assertEqual(check["head_sha"], self.head)
@@ -261,6 +263,35 @@ class SharedHead(unittest.TestCase):
         self.assertIn("Failing: none.", check["output"]["summary"])
         # The outputs say whether a label counts on every pull request with this head.
         self.assertIn("gate-change-approved=false", outputs)
+
+    def test_closing_the_failing_pull_request_rejudges_the_rest(self):
+        """closed re-judges the head: the pull requests still open with it decide, not the one that closed."""
+        prs = {NUMBER: self.pr("main", closed=True), 8: self.pr("stacked", head_ref="stacked-copy")}
+        code, check, outputs = self.judge(prs, "closed", NUMBER, "main")
+        self.assertEqual((code, check["conclusion"]), (0, "success"))
+        self.assertEqual(check["output"]["title"], "No removed tests, skips, retries or gate-config edits")
+        self.assertNotIn(f"#{NUMBER}", check["output"]["summary"])
+        self.assertIn("conclusion=success", outputs)
+
+    def test_closed_pull_request_the_listing_still_shows_is_left_out(self):
+        """The listing can lag the close; the payload says the pull request is closed."""
+        prs = {NUMBER: self.pr("main"), 8: self.pr("stacked", head_ref="stacked-copy")}
+        fake = FakeGitHub(self.head, self.merge_bases, prs)
+        event = {"action": "closed", "pull_request": event_pr(NUMBER, self.head, "main", state="closed")}
+        code, _, _ = run_cli(self.tmp, self.server, event, fake)
+        [check] = fake.posted
+        self.assertEqual((code, check["conclusion"]), (0, "success"))
+        self.assertNotIn(f"#{NUMBER}", check["output"]["summary"])
+
+    def test_closing_the_last_pull_request_with_the_head_posts_no_verdict(self):
+        code, check, outputs = self.judge({NUMBER: self.pr("main", closed=True)}, "closed", NUMBER, "main")
+        self.assertEqual((code, check["conclusion"]), (0, "neutral"))
+        self.assertEqual(check["output"]["title"], "No open pull request has this head")
+        self.assertNotIn(f"#{NUMBER}", check["output"]["summary"])
+        self.assertNotIn("removed-tests", check["output"]["summary"])
+        self.assertIn("conclusion=neutral", outputs)
+        self.assertIn("gate-change-approved=false", outputs)
+        self.assertIn("findings-accepted=false", outputs)
 
 
 class OversizedReport(unittest.TestCase):
@@ -480,6 +511,19 @@ class TargetFailures(unittest.TestCase):
         self.assertIn("could not list the open pull requests with this head (too many pages)",
                       body["output"]["summary"])
 
+    def test_closed_event_with_an_unlisted_head_fails_closed(self):
+        """With the closed pull request left out and no list, nothing would be judged; that can't pass."""
+        fake = self.github()
+        fake.pages.side_effect = gate_guard.urllib.error.URLError("rate limited")
+        event = {"action": "closed", "pull_request": dict(self.EVENT["pull_request"], state="closed")}
+        code, _ = self.run_target(fake, event)
+        self.assertEqual(code, 2)
+        body = fake.patch.call_args[0][1]
+        self.assertEqual((body["conclusion"], body["output"]["title"]),
+                         ("failure", "Could not list the open pull requests with this head"))
+        self.assertIn("could not list the open pull requests with this head (<urlopen error rate limited>)",
+                      body["output"]["summary"])
+
     def test_annotations_only_for_lines(self):
         hits = [gate_guard.Hit("retry", "a.ts", 3, "raised"), gate_guard.Hit("removed-tests", "b.py", None, "gone")]
         self.assertEqual(gate_guard.check_annotations(hits, approved=False), [
@@ -609,11 +653,12 @@ class WorkflowSafety(unittest.TestCase):
                                                  "checks:", "write"])
 
     def test_callers_rejudge_every_change_to_base_head_or_labels(self):
-        """edited covers a retarget: the same head against a new base can expose new hits."""
+        """edited covers a retarget: the same head against a new base can expose new hits. closed re-judges
+        the pull requests left open with a head when one of them closes."""
         for path in (WORKFLOWS / "gate-guard-base.yml", ROOT / "templates" / "gate-guard-target-caller.yml"):
             with self.subTest(caller=path.name):
                 types = re.search(r"(?m)^    types: \[(.*)\]$", self.text(path)).group(1).split(", ")
-                self.assertEqual(types, ["opened", "synchronize", "reopened", "edited", "labeled", "unlabeled"])
+                self.assertEqual(types, ["opened", "synchronize", "reopened", "edited", "labeled", "unlabeled", "closed"])
 
     def test_template_pins_one_sha_in_both_places(self):
         text = self.text(ROOT / "templates" / "gate-guard-target-caller.yml")
