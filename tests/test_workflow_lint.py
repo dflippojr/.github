@@ -504,6 +504,32 @@ def test_ambiguous_environment_file_writes_fail_closed(name, files, expected):
     assert policy_rules(files) == sorted(expected)
 
 
+def shell_write(shell, run, step_env=''):
+    """A job that inherits -n auto, a step in the given shell that writes GITHUB_ENV, then pytest."""
+    return {WORKFLOW: ('on: pull_request\njobs:\n  test:\n    runs-on: ubuntu-latest\n'
+                       "    env:\n      PYTEST_ADDOPTS: -n auto\n      env: ''\n    steps:\n"
+                       f'      - shell: {shell}\n        run: {json.dumps(run)}\n      - run: pytest\n{step_env}')}
+
+
+@pytest.mark.parametrize('name,files,expected', [
+    # Codex round 4 at d0fd0d9: a later overwrite or an earlier write without a newline undoes the clear.
+    ('later-overwrite-truncates-the-clear', shell_write('bash', "echo 'PYTEST_ADDOPTS=' >> \"$GITHUB_ENV\"\necho 'NOTE=1' > \"$GITHUB_ENV\""), CAP),
+    ('earlier-write-without-newline-merges-the-clear', shell_write('bash', "printf 'NOTE=' >> \"$GITHUB_ENV\"\necho 'PYTEST_ADDOPTS=' >> \"$GITHUB_ENV\""), CAP),
+    ('later-tee-overwrite-truncates-the-clear', shell_write('bash', "echo 'PYTEST_ADDOPTS=' >> \"$GITHUB_ENV\"\necho 'NOTE=1' | tee \"$GITHUB_ENV\""), CAP),
+    ('later-set-content-truncates-the-clear', shell_write('pwsh', "Add-Content -Path $env:GITHUB_ENV -Value 'PYTEST_ADDOPTS='\nSet-Content -Path $env:GITHUB_ENV -Value 'NOTE=1'"), CAP),
+    # Codex round 4: in bash, $env:GITHUB_ENV is $env followed by the literal text :GITHUB_ENV.
+    ('powershell-destination-in-a-bash-step', shell_write('bash', "echo 'PYTEST_ADDOPTS=' >> \"$env:GITHUB_ENV\""), CAP),
+    # Even a clear that does reach the file is not credited: the inherited value is what the YAML shows.
+    ('genuine-bash-clear', shell_write('bash', "echo 'PYTEST_ADDOPTS=' >> \"$GITHUB_ENV\""), CAP),
+    ('genuine-powershell-clear', shell_write('pwsh', "Add-Content -Path $env:GITHUB_ENV -Value 'PYTEST_ADDOPTS='"), CAP),
+    ('weaker-value-written', shell_write('bash', "echo 'PYTEST_ADDOPTS=-n 2' >> \"$GITHUB_ENV\""), CAP),
+    # A step-level env: block on the step that runs pytest is the way to change the inherited value.
+    ('step-env-clears-the-inherited-value', shell_write('bash', "echo 'NOTE=1' >> \"$GITHUB_ENV\"", '        env:\n          PYTEST_ADDOPTS: ""\n'), []),
+], ids=lambda value: value if isinstance(value, str) else None)
+def test_github_env_never_lifts_an_inherited_pytest_addopts(name, files, expected):
+    assert policy_rules(files) == expected
+
+
 @pytest.mark.parametrize('command,expected', [
     ('npx playwright test -j 8', CAP), ('npx playwright test -j8', CAP), ('playwright test -j=8', CAP), ('playwright test -j 50%', CAP),
     ('playwright test -j 100%', CAP), ('playwright test -j 5', CAP), ('playwright test --workers 5 -j 2', CAP), ('playwright test -j 2 --workers 8', CAP),
