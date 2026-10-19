@@ -16,6 +16,13 @@ Default community health files for repositories owned by dflippojr. GitHub appli
 - `.github/workflows/gate-guard-target.yml`, `templates/gate-guard-target-caller.yml` and `.github/workflows/gate-guard-base.yml`: the gate guard on the default branch, its caller template, and this repository's own caller. See "Gate guard on the default branch".
 - `tests/`: tests for the label configuration, the issue forms and PR template, and the scripts. `tests/fixtures/gate_guard/` holds the gate guard's fixture diffs and `tests/fixtures/gate_guard_target/` its owner-label scenarios.
 
+## Secret scan
+
+The reusable **secret-scan** workflow, hashed private identifier configuration,
+financial fixture scan and owner push-protection setup are documented in
+[docs/secret-scan.md](docs/secret-scan.md). Use
+`templates/secret-scan-caller.yml` when wiring a repository.
+
 ## Gate guard
 
 A reusable workflow that makes "don't weaken the gate" a check. It reads what
