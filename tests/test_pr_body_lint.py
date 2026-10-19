@@ -404,6 +404,21 @@ def test_workflow_security_contract():
     assert not any("secrets." in str(step) for step in steps)
 
 
+def test_pr_body_always_runs_on_a_github_hosted_runner():
+    """The job only calls the API, so a private caller must not hold its single tower runner."""
+    workflow = yaml.safe_load((ROOT / ".github/workflows/pr-body-lint.yml").read_text())
+    caller_text = (ROOT / "templates/pr-body-lint-caller.yml").read_text()
+    caller = yaml.safe_load(caller_text)
+    assert workflow["jobs"]["pr-body"]["runs-on"] == "ubuntu-latest"
+    assert "runs-on" not in workflow[True]["workflow_call"]["inputs"]
+    assert "runs-on" not in caller["jobs"]["pr-body"].get("with", {})
+    assert "tower" not in caller_text and "self-hosted" not in caller_text
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    section = readme[readme.index("`lint-ref` is required"):]
+    section = section[:section.index("Run the fixtures")]
+    assert "tower" not in section and "self-hosted" not in section
+
+
 PROOF_LEAKS = {
     "fenced-log-then-paragraph": "```\nlog\n```\nSee logs above.",
     "tilde-fence-then-paragraph": "~~~\nlog\n~~~\nSee logs above.",
