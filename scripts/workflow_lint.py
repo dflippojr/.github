@@ -32,23 +32,15 @@ PYTEST_CONFIG = {'pytest.ini', '.pytest.ini', 'tox.ini', 'setup.cfg', 'pyproject
 ADDOPTS_TOKEN = re.compile(r'PYTEST_ADDOPTS=(.*)\Z', re.I | re.S)
 ADDOPTS_LITERAL = re.compile(r"""PYTEST_ADDOPTS["'`\]]*\s*[:=,)]\s*(["'`])((?:\\.|(?!\1).)*)\1""", re.I | re.S)
 ASSIGNMENT = re.compile(r'[A-Za-z_]\w*=')
-# The exact environment file as one raw word, bare or double-quoted: bash's $GITHUB_ENV or
-# ${GITHUB_ENV}, PowerShell's $env:GITHUB_ENV, and (only to flag it) cmd's %GITHUB_ENV%.
+# The environment file as one raw word, bare or double-quoted: bash's $GITHUB_ENV or
+# ${GITHUB_ENV}, PowerShell's $env:GITHUB_ENV and cmd's %GITHUB_ENV%.
 # A single-quoted '$GITHUB_ENV' is a literal path and $github_env another bash variable.
-BASH_ENV = re.compile(r'(")?(?:\$GITHUB_ENV|\$\{GITHUB_ENV\})(?(1)")')
-PWSH_ENV = re.compile(r'(")?(?i:\$env:GITHUB_ENV)(?(1)")')
 ANY_ENV = re.compile(r'(")?(?:\$GITHUB_ENV|\$\{GITHUB_ENV\}|(?i:\$env:GITHUB_ENV|%GITHUB_ENV%))(?(1)")')
 # Shell text split into raw words that keep their quotes, so a quoted or escaped '>>' stays an argument.
 REDIRECT = r'\d*(?:>>|>&|>\||<<<|<<-|<<|<&|<>|>|<)|&>>|&>'
 SHELL_SYNTAX = re.compile(r'''[ \t\r]+|(?P<comment>\#[^\n]*)|(?P<redirect>''' + REDIRECT + r''')|(?P<op>[;&|\n]+)'''
                           r'''|(?P<word>(?:'[^']*'|"(?:\\.|[^"\\])*"|\\.|[^\s;&|<>'"\\])+)''', re.S)
-# A word that expands nothing in bash or PowerShell: plain characters and quotes without $, ` or \.
-LITERAL_PART = re.compile(r'''('[^'\n\r]*'|"[^"\\$`\n\r]*")|[\w@%+=:./-]+''')
-PRINTF_LINE = re.compile(r'''(['"])([^'"\\%$`\n\r]*)\\n\1''')
 HEREDOC = re.compile(r'''(?<!<)<<(-?)[ \t]*(['"]?)([\w.-]+)\2''')
-# Shell and PowerShell blocks whose commands may not run.
-OPENERS = {'if', 'while', 'until', 'for', 'foreach', 'case', 'select', 'switch', 'function', 'try', '{', '('}
-CLOSERS = {'fi', 'done', 'esac', '}', ')'}
 FILE_WRITERS = {'tee', 'add-content', 'set-content', 'out-file'}
 EXPORTERS = {'export', 'declare', 'typeset', 'readonly', 'local'}
 # Words that precede the command in a shell segment without being the command.
@@ -333,9 +325,8 @@ def split_heredocs(command):
 
 def shell_pipelines(command):
     """Split command text into pipelines of simple commands made of raw words with their quotes.
-    Each pipeline is (operator before it, [words of each command]). None when a quote never closes."""
-    pipelines, words, before, position = [], [], '', 0
-    commands = []
+    Each pipeline is [words of each command]. None when a quote never closes."""
+    pipelines, words, commands, position = [], [], [], 0
     while position < len(command):
         match = SHELL_SYNTAX.match(command, position)
         if not match:
@@ -345,89 +336,12 @@ def shell_pipelines(command):
             commands.append(words)
             words = []
             if match.group() not in {'|', '|&'}:
-                pipelines.append((before, commands))
-                commands, before = [], match.group()
+                pipelines.append(commands)
+                commands = []
         elif match.lastgroup in {'redirect', 'word'}:
             words.append(match.group())
-    pipelines.append((before, commands + [words]))
+    pipelines.append(commands + [words])
     return pipelines
-
-
-def literal(word):
-    """The text of a raw word that expands nothing, or None."""
-    if not word or LITERAL_PART.sub('', word):
-        return None
-    return ''.join(match.group(1)[1:-1] if match.group(1) else match.group() for match in LITERAL_PART.finditer(word))
-
-
-def printed_line(words):
-    """The one line `echo TEXT` or `printf 'TEXT\\n'` prints, or None when it is not certain."""
-    if len(words) == 2 and words[0] == 'echo':
-        return literal(words[1])
-    if len(words) == 2 and words[0] == 'printf':
-        match = PRINTF_LINE.fullmatch(words[1])
-        return match.group(2) if match else None
-    if len(words) == 3 and words[0] == 'printf' and words[1] in {"'%s\\n'", '"%s\\n"'}:
-        return literal(words[2])
-    return None
-
-
-def cmdlet_target(words):
-    """For an Add-Content, Set-Content or Out-File call aimed at $env:GITHUB_ENV, its -Value word
-    ('' when the text comes down the pipeline); None for any other call or parameter."""
-    if not words or words[0].lower() not in FILE_WRITERS - {'tee'}:
-        return None
-    path, positional, rest = None, [], list(words[1:])
-    while rest:
-        word = rest.pop(0)
-        name = word.lower()
-        if name in {'-path', '-filepath', '-literalpath', '-value', '-encoding'} and rest:
-            value = rest.pop(0)
-            if name == '-value':
-                positional[1:1] = [value]
-            elif name != '-encoding':
-                path = value
-            elif literal(value) is None:
-                return None
-        elif name != '-append' and (name.startswith('-') or name.startswith('>')):
-            return None  # -NoNewline, -WhatIf, redirections and the like change what is written
-        elif name != '-append':
-            positional.append(word)
-    if path is None and positional:
-        path = positional.pop(0)
-    if path is None or not PWSH_ENV.fullmatch(path) or len(positional) > 1:
-        return None
-    return positional[0] if positional else ''
-
-
-def env_file_write(commands):
-    """The PYTEST_ADDOPTS value a pipeline certainly writes to the exact environment file, or None.
-
-    Only these forms count, so anything else leaves the earlier value in force:
-    `echo TEXT` or `printf 'TEXT\\n'` (or `printf '%s\\n' TEXT`) redirected with > or >> to
-    $GITHUB_ENV, or piped into `tee [-a] "$GITHUB_ENV"`; `echo TEXT` redirected to $env:GITHUB_ENV;
-    a PowerShell string or echo piped into Out-File/Add-Content/Set-Content $env:GITHUB_ENV, or
-    Add-Content/Set-Content $env:GITHUB_ENV with a literal -Value. TEXT must expand nothing."""
-    line = None
-    if len(commands) == 1:
-        words = commands[0]
-        value = cmdlet_target(words)
-        if value:
-            line = literal(value)
-        elif len(words) > 2 and words[-2] in {'>', '>>', '1>', '1>>'}:
-            target = words[-1]
-            if BASH_ENV.fullmatch(target) or PWSH_ENV.fullmatch(target) and words[0] == 'echo':
-                line = printed_line(words[:-2])
-    elif len(commands) == 2:
-        source, sink = commands
-        if sink[-2:] == ['>', '/dev/null']:
-            sink = sink[:-2]
-        if sink[:1] == ['tee'] and len(sink) in {2, 3} and sink[1:-1] in ([], ['-a'], ['--append']) and BASH_ENV.fullmatch(sink[-1]):
-            line = printed_line(source)
-        elif cmdlet_target(sink) == '':
-            line = literal(source[0]) if len(source) == 1 and source[0][:1] in {'"', "'"} else printed_line(source)
-    match = re.fullmatch(r'PYTEST_ADDOPTS=(.*)', line or '', re.S)
-    return match.group(1) if match else None
 
 
 def touches_env_file(commands):
@@ -442,41 +356,27 @@ def touches_env_file(commands):
     return False
 
 
-def env_file_writes(filename, command, bodies):
-    """Read the PYTEST_ADDOPTS writes to $GITHUB_ENV in a command, failing closed.
+def env_file_findings(filename, command, bodies):
+    """Judge the PYTEST_ADDOPTS values a command may write to $GITHUB_ENV.
 
-    Returns (the value last written by a recognised, unconditional write or None, findings).
-    A pipeline that sends text naming PYTEST_ADDOPTS to the file in any other form, inside a
-    block or after && or ||, does not change the value; it is flagged and any value it may
-    write is judged."""
+    Such a write never changes what later steps inherit: whether it reaches the file as its own
+    line depends on the shell, the stream, line breaks and later overwrites, none of which the
+    YAML shows. Only a step-level env: block changes the value. Any literal value the write may
+    carry is still checked here."""
     pipelines = shell_pipelines(command)
     if pipelines is None:
-        return None, []  # tokenizing failed; scan_command already warns
-    written, results, depth = None, [], 0
-    for before, commands in pipelines:
-        first = commands[0][0] if commands[0] else ''
-        if first in CLOSERS:
-            depth -= 1
-        conditional = depth != 0 or '&&' in before or '||' in before
-        if first in OPENERS or first.startswith('(') or first.endswith('()') or '{' in commands[0][1:]:
-            depth += 1
+        return []  # tokenizing failed; scan_command already warns
+    results = []
+    for commands in pipelines:
         if not touches_env_file(commands):
             continue
         words = [word for command_words in commands for word in command_words]
         text = '\n'.join([bodies[int(word[1:])] for word in words if word.startswith('\0')] + [
             ' '.join(plain(word) for word in words if not word.startswith('\0') and not ANY_ENV.fullmatch(word)
                      and not re.fullmatch(REDIRECT, word))])
-        if not re.search('PYTEST_ADDOPTS', text, re.I):
-            continue
-        value = None if conditional else env_file_write(commands)
-        if value is not None:
-            written = value
-            continue
-        results.append(finding('warning', 'unverified-env-write', filename,
-                               'Cannot tell what this writes to GITHUB_ENV; later steps are judged on the earlier PYTEST_ADDOPTS'))
         for match in re.finditer(r'PYTEST_ADDOPTS=([^\n]*)', text, re.I):
             results.extend(addopts_findings(filename, match.group(1)))
-    return written, results
+    return results
 
 
 def plain(word):
@@ -495,11 +395,10 @@ def scan_command(filename, command, addopts=None):
     but only for that command: a later command that may run pytest (make, tox,
     a script) still sees the value. An inline assignment belongs to its command;
     `export` and bare assignments persist. Text that only mentions the name, such
-    as `echo PYTEST_ADDOPTS=`, assigns nothing. A value written to $GITHUB_ENV
-    reaches the steps after this one, never the commands in it, so it is returned
-    separately.
+    as `echo PYTEST_ADDOPTS=`, assigns nothing. A value written to $GITHUB_ENV is
+    checked but changes nothing here or in later steps (env_file_findings).
     Returns (findings, addopts in effect afterwards, whether the value passed in
-    was judged against a command or replaced, the value written to GITHUB_ENV or None).
+    was judged against a command or replaced).
     """
     # Shell, cmd and PowerShell line continuations.
     command, bodies = split_heredocs(posix_env(re.sub(r'(?:\\|`|\^)\r?\n', ' ', command)))
@@ -509,7 +408,7 @@ def scan_command(filename, command, addopts=None):
         lexer.whitespace_split = True
         tokens = list(lexer)
     except ValueError:
-        return [finding('warning', 'unparsed-command', filename, 'Could not tokenize command; inspect manually')], addopts, True, None
+        return [finding('warning', 'unparsed-command', filename, 'Could not tokenize command; inspect manually')], addopts, True
     segments, current, piped = [], [], []
     for token in tokens:
         if token and all(c in ';&|\n' for c in token):
@@ -520,8 +419,7 @@ def scan_command(filename, command, addopts=None):
             current.append(token)
     segments.append(current)
     piped.append(False)
-    # The PYTEST_ADDOPTS value this command writes to GITHUB_ENV, read from its own shell syntax.
-    written, results = env_file_writes(filename, command, bodies)
+    results = env_file_findings(filename, command, bodies)
     inherited, resolved = bool(addopts), not addopts
     unjudged = False  # a value assigned by this script that no command has seen yet
     for number, segment in enumerate(segments):
@@ -557,9 +455,7 @@ def scan_command(filename, command, addopts=None):
             addopts, inherited, resolved, unjudged = assigned, False, True, bool(assigned)
     if addopts and unjudged:
         results.extend(addopts_findings(filename, addopts))
-    if written:
-        results.extend(addopts_findings(filename, written))
-    return results, addopts, resolved, written
+    return results, addopts, resolved
 
 
 def parallelism_findings(filename, command):
@@ -585,31 +481,29 @@ def workflow_parallelism(filename, document):
         job_env = env_addopts(job.get('env'))
         inherited = workflow_env if job_env is None else job_env
         steps = [step for step in job.get('steps') or [] if isinstance(step, dict)]
-        judged, persisted = not inherited, None
+        judged = not inherited
         for step in steps:
             own = env_addopts(step.get('env'))
-            # Step env beats a value exported through GITHUB_ENV, which beats job and workflow env.
-            effective = next((value for value in (own, persisted, inherited) if value is not None), None)
-            inherits = own is None and persisted is None
+            # Step env beats job and workflow env. A GITHUB_ENV write never replaces either:
+            # only what the YAML itself shows is credited.
+            effective = inherited if own is None else own
+            inherits = own is None
             uses = step.get('uses')
             opaque = isinstance(uses, str) and not NEUTRAL_ACTION.fullmatch(uses.split('@')[0])
             # A command handed to an action through with: (retry, xvfb, ...) runs like a run step.
             commands = [value for value in strings(step.get('with')) if TEST_TOOL.search(value)] if opaque else []
             if isinstance(step.get('run'), str):
-                found, _, resolved, written = scan_command(filename, step['run'], effective)
+                found, _, resolved = scan_command(filename, step['run'], effective)
                 results.extend(found)
                 if not inherits and own is not None and effective and not resolved:
                     results.extend(addopts_findings(filename, own))
                 judged = judged or (inherits and resolved)
-                # A step with its own if: may not run, so what it writes cannot replace the earlier value.
-                if written is not None and 'if' not in step:
-                    persisted = written
             elif opaque:
                 # The action may run pytest through an input the scan cannot read, so the value
                 # it inherits counts unless a with: command that names pytest overrode it.
                 covered = False
                 for command in commands:
-                    found, _, resolved, _ = scan_command(filename, command, effective)
+                    found, _, resolved = scan_command(filename, command, effective)
                     results.extend(found)
                     covered = covered or resolved
                 if effective and not covered:
