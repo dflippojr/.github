@@ -161,6 +161,119 @@ def test_runner_json_escapes_and_matrix_include():
     assert lint.runner_findings('ci.yml', {'jobs': {'test': matrix_job}}, 'a/b', 'public', CONFIG, TODAY)[0]['rule'] == 'public-self-hosted'
 
 
+def runner_job(runs_on, extra=''):
+    return f'on: pull_request\njobs:\n  test:\n    runs-on: {runs_on}\n{extra}    steps:\n      - run: echo ok\n'
+
+
+def rules(files, visibility='public', repository='dflippojr/example', config=CONFIG):
+    return [(item['severity'], item['rule']) for item in lint.lint_files(files, repository, visibility, config, TODAY)]
+
+
+CI = '.github/workflows/ci.yml'
+PLACEMENT = [('error', 'public-self-hosted')]
+
+
+@pytest.mark.parametrize('runs_on', [
+    '[Windows, X64]', 'agent-harness-review', '[linux, x64]', '[ubuntu-latest, gpu]', 'tower',
+    '[Self-Hosted, Linux]', '{group: tower-pool}', '{group: tower-pool, labels: [linux]}',
+    '${{ fromJSON(\'["Windows","X64"]\') }}', '${{ fromJSON(vars.RUNS_ON || \'["linux"]\') }}',
+    '${{ fromJSON(vars.RUNS_ON || \'["\\u0057indows"]\') }}', "${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'tower' }}",
+    '[ubuntu-latest, "ubuntu-latest-custom"]', 'ubuntu', 'windows', 'macos',
+], ids=lambda value: value[:40])
+def test_public_repositories_reject_runner_labels_that_are_not_github_hosted(runs_on):
+    assert rules({CI: runner_job(runs_on)}) == PLACEMENT
+
+
+@pytest.mark.parametrize('runs_on', [
+    'ubuntu-latest', 'ubuntu-24.04', 'ubuntu-22.04-arm', 'windows-latest', 'windows-2022', 'windows-11-arm', 'macos-15', 'macos-latest',
+    '[ubuntu-latest]', 'Ubuntu-Latest', '${{ fromJSON(vars.CI_RUNS_ON || \'["ubuntu-latest"]\') }}',
+    "${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'ubuntu-24.04' }}",
+])
+def test_public_repositories_accept_github_hosted_labels(runs_on):
+    assert rules({CI: runner_job(runs_on)}) == []
+
+
+def test_public_matrix_runner_values_must_all_be_github_hosted():
+    job = '    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        os: [%s]\n'
+    body = lambda labels: f'on: pull_request\njobs:\n  test:\n{job % labels}    steps:\n      - run: echo ok\n'
+    assert rules({CI: body('ubuntu-latest, windows-latest')}) == []
+    assert rules({CI: body('ubuntu-latest, [Windows, X64]')}) == PLACEMENT
+    assert rules({CI: body('ubuntu-latest, tower')}) == PLACEMENT
+
+
+def test_configured_larger_runner_names_are_github_hosted():
+    custom = {**CONFIG, 'hosted_runner_labels': ['ubuntu-latest-8-cores']}
+    files = {CI: runner_job('ubuntu-latest-8-cores')}
+    assert rules(files) == PLACEMENT
+    assert rules(files, config=custom) == []
+    assert rules({CI: runner_job('[ubuntu-latest-8-cores, tower]')}, config=custom) == PLACEMENT
+
+
+@pytest.mark.parametrize('runs_on', ['[Windows, X64]', 'agent-harness-review', '[self-hosted, tower]'])
+def test_private_repositories_may_use_any_runner_labels(runs_on):
+    assert rules({CI: runner_job(runs_on)}, visibility='private') == []
+
+
+@pytest.mark.parametrize('runs_on', ['${{ inputs.runner }}', '${{ vars.RUNNER }}'])
+def test_unresolvable_public_runner_expressions_still_warn(runs_on):
+    assert rules({CI: runner_job(runs_on)}) == [('warning', 'dynamic-runner')]
+
+
+def reusable_call(with_lines, uses='./.github/workflows/reusable.yml'):
+    return f'on: pull_request\njobs:\n  call:\n    uses: {uses}\n    with:\n{with_lines}'
+
+
+@pytest.mark.parametrize('with_lines', [
+    "      runs_on: '[\"Windows\",\"X64\",\"agent-harness-review\"]'\n",
+    '      runs_on: agent-harness-review\n',
+    '      runs-on: tower\n',
+    '      runner: self-hosted\n',
+    "      runner: '[\"self-hosted\"]'\n",
+    '      labels: [linux, x64]\n',
+    "      runs_on: '[\"ubuntu-latest\",\"gpu\"]'\n",
+    '      pool: self-hosted\n',
+    "      pool: ['Self-Hosted']\n",
+])
+@pytest.mark.parametrize('uses', ['./.github/workflows/reusable.yml', 'someone/else/.github/workflows/review.yml@main'])
+def test_public_reusable_calls_reject_runner_inputs_under_any_runner_style_name(uses, with_lines):
+    assert rules({CI: reusable_call(with_lines, uses)}) == PLACEMENT
+
+
+@pytest.mark.parametrize('with_lines', [
+    "      runs_on: '[\"ubuntu-latest\"]'\n",
+    '      runs_on: ubuntu-latest\n',
+    '      runner: ubuntu-24.04\n',
+    '      name: self-hosted-docs\n',
+    '      version: 3\n',
+    '      description: run on self-hosted hardware\n',
+])
+def test_public_reusable_calls_accept_hosted_runner_inputs_and_unrelated_values(with_lines):
+    assert rules({CI: reusable_call(with_lines)}) == []
+
+
+CALLEE = ('on:\n  workflow_call:\n    inputs:\n      target:\n        type: string\n'
+          '        default: ubuntu-latest\n      title:\n        type: string\n'
+          'jobs:\n  run:\n    runs-on: ${{ fromJSON(inputs.target) }}\n    name: ${{ inputs.title }}\n    steps:\n      - run: echo ok\n')
+
+
+@pytest.mark.parametrize('with_lines,expected', [
+    ("      target: '[\"tower\"]'\n", PLACEMENT),
+    ("      target: '[\"Windows\",\"X64\"]'\n", PLACEMENT),
+    ("      target: '[\"ubuntu-latest\"]'\n", []),
+    ('      title: tower\n', []),
+])
+def test_local_callee_inputs_that_reach_runs_on_are_runner_inputs(with_lines, expected):
+    files = {'.github/workflows/callee.yml': CALLEE, CI: reusable_call(with_lines, './.github/workflows/callee.yml')}
+    assert rules(files) == [('warning', 'dynamic-runner')] + expected
+
+
+def test_reusable_call_exception_still_covers_the_hub_review_job():
+    entry = CONFIG['review_exceptions'][1]
+    content = (REAL / 'agent-harness-hub-review.yml').read_text(encoding='utf-8')
+    assert rules({entry['workflow']: content}, repository=entry['repository']) == []
+    assert rules({entry['workflow']: content}, repository='someone/else') == PLACEMENT
+
+
 @pytest.mark.parametrize('filename,content', [
     ('ci-local.py', 'subprocess.run("pytest -n auto", shell=True)'),
     ('scripts/ci-local.mjs', 'execSync(`npx playwright test --workers=8`);'),
