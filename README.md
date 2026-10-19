@@ -248,9 +248,8 @@ and head's gate-guard report through the GitHub API. It requires:
   Known limits: until the guard posts its new in-progress check for a re-judge
   of the same head (for example after the base branch changes), the lint reads
   the previous completed check on that head; the owner's later `labeled` event
-  reruns it against the new report. On a runner pool of one, the wait holds the
-  only runner the guard needs, so the check cannot appear and the lint fails
-  closed after the wait.
+  reruns it against the new report. The lint runs on a GitHub-hosted runner,
+  so the wait never holds the runner the guard needs.
   **`gate-guard-target.yml` is required**: only its check run is named exactly
   `gate-guard`. The `pull_request` flavour (`gate-guard.yml`) reports
   `gate-guard / gate-guard` and writes no check output, and a repository with no
@@ -325,9 +324,9 @@ needed because Actions reports the job result. A fork cannot supply its own
 judge. As with gate guard, a compromised owner identity or a separate workflow
 spoofing a check name remains outside this protection.
 
-`lint-ref` is required; `runs-on` defaults to `'"ubuntu-latest"'` and accepts
-the same JSON runner-label input as gate guard. Private callers can select
-`'["self-hosted", "Linux", "X64", "tower-linux"]'`.
+`lint-ref` is required. There is no `runs-on` input: the job only reads the
+GitHub API, so it always runs on `ubuntu-latest`, private repositories
+included, and never holds the single tower runner that the gate guard needs.
 
 Run the fixtures and API/security tests locally with
 `python -m pytest -q tests/test_pr_body_lint.py`. For a live, read-only check

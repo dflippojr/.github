@@ -23,5 +23,5 @@ jobs:
     uses: dflippojr/.github/.github/workflows/pr-body-lint.yml@<full-sha>
     with:
       lint-ref: <full-sha>
-      # Private repositories run on the tower:
-      # runs-on: '["self-hosted", "Linux", "X64", "tower-linux"]'
+      # No runs-on: pr-body only calls the API and always runs on
+      # ubuntu-latest, even in private repositories.

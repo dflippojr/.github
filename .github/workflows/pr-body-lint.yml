@@ -10,10 +10,6 @@ on:
         description: Full commit SHA of dflippojr/.github; match the caller's uses pin.
         type: string
         required: true
-      runs-on:
-        description: Runner labels as JSON; private callers can use the tower labels.
-        type: string
-        default: '"ubuntu-latest"'
 
 permissions:
   contents: read
@@ -25,7 +21,9 @@ permissions:
 jobs:
   pr-body:
     name: pr-body
-    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    # API-only, so it never takes the single tower runner that gate-guard
+    # needs; private callers get a GitHub-hosted runner too.
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Require the trusted event and a full script pin

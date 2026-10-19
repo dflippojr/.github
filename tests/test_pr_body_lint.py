@@ -412,11 +412,11 @@ def test_pr_body_always_runs_on_a_github_hosted_runner():
     assert workflow["jobs"]["pr-body"]["runs-on"] == "ubuntu-latest"
     assert "runs-on" not in workflow[True]["workflow_call"]["inputs"]
     assert "runs-on" not in caller["jobs"]["pr-body"].get("with", {})
-    assert "tower" not in caller_text and "self-hosted" not in caller_text
+    assert "tower-linux" not in caller_text and "self-hosted" not in caller_text
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     section = readme[readme.index("`lint-ref` is required"):]
     section = section[:section.index("Run the fixtures")]
-    assert "tower" not in section and "self-hosted" not in section
+    assert "tower-linux" not in section and "self-hosted" not in section
 
 
 PROOF_LEAKS = {
