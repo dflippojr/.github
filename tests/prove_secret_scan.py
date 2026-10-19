@@ -11,7 +11,7 @@ import pathlib
 import sys
 import tempfile
 
-from test_secret_scan import commit, git, scan
+from test_secret_scan import commit, git, merge_only_history, scan
 
 
 def main():
@@ -22,6 +22,12 @@ def main():
         git(repo, "init", "-q")
         git(repo, "config", "user.email", "synthetic@example.invalid")
         git(repo, "config", "user.name", "Synthetic")
+        commit(repo, "initial.txt", "clean\n")
+        merge_base, _, _ = merge_only_history(repo)
+        merge_hits = scan.scan_gitleaks(repo, merge_base, "HEAD", executable)
+        assert ("merge-only.txt", 1, "github-pat") in merge_hits
+        assert ("side-only.txt", 1, "github-pat") in merge_hits
+        print("PASS: real gitleaks catches merge-only and removed side-branch PATs")
         commit(repo, "old.txt", "password=" + key + "\n")
         base = git(repo, "rev-parse", "HEAD")
         commit(repo, "new.txt", "clean\n")

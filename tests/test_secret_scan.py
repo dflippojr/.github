@@ -179,3 +179,84 @@ def test_workflow_uses_full_pins_read_only_token_and_required_secret():
             assert step["with"]["persist-credentials"] is False
     gitleaks = next(step for step in steps if step.get("with", {}).get("repository") == "gitleaks/gitleaks")
     assert scan.SHA.fullmatch(gitleaks["with"]["ref"])
+
+
+def merge_only_history(repo):
+    """Two clean parent trees, plus a side-branch secret removed before merging."""
+    base = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "-qb", "synthetic-side")
+    side_key = "ghp_" + "zY9xW8vU7tS6rQ5pO4nM3lK2jI1hG0fE9dC8"
+    commit(repo, "side-only.txt", "token=" + side_key + "\n")
+    commit(repo, "side-only.txt", "clean\n")
+    git(repo, "checkout", "--detach", base)
+    commit(repo, "first-parent.txt", "clean\n")
+    git(repo, "merge", "--no-ff", "--no-commit", "synthetic-side")
+    merge_key = "ghp_" + "aB7cD9eF2gH4iJ6kL8mN0pQ3rS5tU1vW9xY2"
+    commit(repo, "merge-only.txt", "token=" + merge_key + "\n")
+    return base, merge_key, side_key
+
+
+def test_gitleaks_log_options_cover_merge_results_and_side_commits(repo, monkeypatch):
+    base, merge_key, side_key = merge_only_history(repo)
+    # Neither parent contains the merge-only value in its tree or history.
+    for parent in ("HEAD^1", "HEAD^2"):
+        assert merge_key not in git(repo, "log", "-p", base + ".." + parent)
+        assert merge_key not in git(repo, "show", parent + ":side-only.txt") if parent == "HEAD^2" else True
+    original = scan.subprocess.run
+    options = []
+
+    def fake_run(command, **kwargs):
+        if command[0] != "gitleaks":
+            return original(command, **kwargs)
+        options.extend(command[command.index("--log-opts") + 1].split())
+        report = pathlib.Path(command[command.index("--report-path") + 1])
+        report.write_text("[]")
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    monkeypatch.setattr(scan.subprocess, "run", fake_run)
+    scan.scan_gitleaks(repo, base, "HEAD", "gitleaks")
+    patches = git(repo, "log", "-p", "-U0", *options)
+    assert merge_key in patches, "merge-result patch must reach gitleaks"
+    assert side_key in patches, "removed side-branch secrets must still reach gitleaks"
+
+
+@pytest.mark.parametrize("kind", ["pat", "financial", "financial-only"])
+def test_sensitive_filename_output_is_opaque(repo, monkeypatch, capsys, kind):
+    key = "ghp_" + "aB7cD9eF2gH4iJ6kL8mN0pQ3rS5tU1vW9xY2"
+    card = "4111" + "1111" * 3
+    path = "keys/" + key + ".txt" if kind == "pat" else "tests/fixtures/" + card + ".csv"
+    sensitive = key if kind == "pat" else card
+    monkeypatch.setenv("SECRET_SCAN_DENYLIST_SHA256", scan.digest("unrelated-synthetic-host"))
+    base = git(repo, "rev-parse", "HEAD")
+    commit(repo, path, "# SYNTHETIC\n" + sensitive + "\n")
+    monkeypatch.setattr(scan, "scan_gitleaks", lambda *args: {(path, 2, "github-pat")} if kind == "pat" else set())
+    args = ["--repo-dir", str(repo), "--base", base]
+    if kind != "pat":
+        args.append("--" + kind)
+    assert scan.main(args) == 1
+    captured = capsys.readouterr()
+    assert sensitive not in captured.out + captured.err, "matched value must never be logged"
+    expected = "<redacted-path:" + hashlib.sha256(path.encode()).hexdigest() + ">"
+    rows = [json.loads(line) for line in captured.out.splitlines()[:-1]]
+    assert rows and all(row["file"] == expected for row in rows)
+
+
+@pytest.mark.parametrize("text", [
+    "[Contact](mailto:owner@example.invalid)",
+    '<a href="MAILTO:OWNER@example.invalid">Contact</a>',
+    "mailto:owner@example.invalid?subject=Hello",
+    "mailto:owner@example.invalid,second@example.invalid",
+])
+def test_mailto_matches_denied_mailbox(text):
+    denied = {scan.digest("owner@example.invalid")}
+    assert "personal-identifier" in scan.identifier_rules(text, denied)
+    assert not scan.identifier_rules(text, {scan.digest("other@example.invalid")})
+
+
+@pytest.mark.parametrize("text", [
+    "mailto:other@example.invalid",
+    "mailto:prefixowner@example.invalid",
+    "mailto:owner@example.invalid.example",
+])
+def test_mailto_mailbox_near_misses_are_allowed(text):
+    assert not scan.identifier_rules(text, {scan.digest("owner@example.invalid")})
