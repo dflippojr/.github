@@ -16,6 +16,7 @@ import unicodedata
 
 SHA = re.compile(r"[0-9a-f]{40}")
 TOKEN = re.compile(r"[\w@.+:/\\-]+", re.UNICODE)
+MAILBOX = re.compile(r"[\w.+-]+@[\w.-]+", re.UNICODE)
 NUMBER = re.compile(r"(?<!\d)(?:\d[ -]?){8,}\d(?!\d)")
 
 
@@ -42,7 +43,11 @@ def load_denylist(value):
 def candidates(text):
     # Emit whole paths, every path prefix, email addresses and their hostnames.
     # JSON-escaped Windows separators normalize to the same path components.
-    for match in TOKEN.finditer(unicodedata.normalize("NFKC", text)):
+    text = unicodedata.normalize("NFKC", text)
+    # URI schemes must not become part of the mailbox denylist candidate.
+    for match in MAILBOX.finditer(text):
+        yield normalize(match.group())
+    for match in TOKEN.finditer(text):
         token = normalize(match.group()).strip(".")
         yield token
         parts = token.split("/")
