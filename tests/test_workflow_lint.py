@@ -409,7 +409,7 @@ INHERIT = ['PYTEST_ADDOPTS: -n auto']
     ('remote-action-after-override', {WORKFLOW: workflow(job_env=INHERIT, run='pytest -n 2 tests/unit', extra_steps='      - uses: org/pytest-action@0123456789abcdef0123456789abcdef01234567\n')}, CAP),
     ('remote-action-alone', {WORKFLOW: workflow(job_env=INHERIT, run='echo hi', extra_steps='      - uses: org/pytest-action@0123456789abcdef0123456789abcdef01234567\n')}, CAP),
     ('workflow-env-remote-action-after-override', {WORKFLOW: workflow(env=INHERIT, run='pytest -n 2', extra_steps='      - uses: org/pytest-action@v1\n')}, CAP),
-    ('remote-action-after-clear', {WORKFLOW: workflow(job_env=INHERIT, run='unset PYTEST_ADDOPTS', extra_steps='      - uses: org/pytest-action@v1\n')}, []),
+    ('remote-action-after-unset-in-another-step', {WORKFLOW: workflow(job_env=INHERIT, run='unset PYTEST_ADDOPTS', extra_steps='      - uses: org/pytest-action@v1\n')}, CAP),
     ('remote-action-own-env-clear', {WORKFLOW: workflow(job_env=INHERIT, run='pytest -n 2', extra_steps='      - uses: org/pytest-action@v1\n        env:\n          PYTEST_ADDOPTS: ""\n')}, []),
     ('checkout-after-override', {WORKFLOW: workflow(job_env=INHERIT, run='pytest -n 2', extra_steps='      - uses: actions/checkout@v4\n')}, []),
     ('setup-python-cache-artifacts', {WORKFLOW: workflow(job_env=INHERIT, run='pytest -n 2', extra_steps='      - uses: actions/setup-python@v5\n      - uses: actions/cache@v4\n      - uses: actions/upload-artifact@v4\n      - uses: actions/download-artifact@v4\n      - uses: astral-sh/setup-uv@v5\n')}, []),

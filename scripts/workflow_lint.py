@@ -22,7 +22,9 @@ HOSTED = re.compile(r"\b(?:ubuntu|windows|macos)-(?:latest|\d[^\s'\"\],}]*)", re
 # Labels GitHub assigns to its own hosted runners. Larger-runner names are chosen
 # by the organization, so config/workflow-lint.json lists those as hosted_runner_labels.
 HOSTED_LABEL = re.compile(r'(?:ubuntu|windows|macos)-(?:latest|slim|\d[\d.]*)(?:-(?:arm|arm64|intel|large|xlarge))?', re.I)
-RUNNER_INPUT = re.compile(r'(?:[\w-]*[-_])?(?:runs?[-_]?on|runners?|runner[-_]?labels?)', re.I)
+RUNNER_INPUT = re.compile(r'runs?[-_]?on|runners?|runner[-_]?labels?', re.I)
+# Actions that prepare or move files and never run the project's tests.
+NEUTRAL_ACTION = re.compile(r'actions/(?:checkout|cache(?:/\w+)?|upload-artifact|download-artifact)|[\w.-]+/setup-[\w.-]+', re.I)
 PYTEST_CONFIG = {'pytest.ini', '.pytest.ini', 'tox.ini', 'setup.cfg', 'pyproject.toml', 'pytest.toml', '.pytest.toml'}
 ADDOPTS_TOKEN = re.compile(r'PYTEST_ADDOPTS=(.*)\Z', re.I | re.S)
 ADDOPTS_LITERAL = re.compile(r"""PYTEST_ADDOPTS["'`\]]*\s*[:=,)]\s*(["'`])((?:\\.|(?!\1).)*)\1""", re.I | re.S)
@@ -224,7 +226,7 @@ def worker_flags(tool, tokens):
         if tool == 'pytest':
             match = re.fullmatch(r'(?:-n|--numprocesses)(?:=?(.+))?', token)
         else:
-            match = re.fullmatch(r'--workers(?:=(.+))?', token)
+            match = re.fullmatch(r'(?:--workers|-j)(?:=?(.+))?', token)
         if match:
             value = match.group(1)
             if value is None and index + 1 < len(tokens):
@@ -373,7 +375,7 @@ def workflow_parallelism(filename, document):
         job_env = env_addopts(job.get('env'))
         inherited = workflow_env if job_env is None else job_env
         steps = [step for step in job.get('steps') or [] if isinstance(step, dict)]
-        judged, exposed, persisted = not inherited, False, None
+        judged, persisted = not inherited, None
         for step in steps:
             own = env_addopts(step.get('env'))
             # Step env beats a value exported through GITHUB_ENV, which beats job and workflow env.
@@ -394,9 +396,12 @@ def workflow_parallelism(filename, document):
                 # A local action is code in this repository that may run pytest.
                 results.extend(addopts_findings(filename, effective))
                 judged = judged or inherits
-            elif effective and inherits:
-                exposed = True
-        if inherited and not judged and (exposed or not steps):
+            elif effective and isinstance(uses, str) and not NEUTRAL_ACTION.fullmatch(uses.split('@')[0]):
+                # A remote action is opaque and may run pytest. Judge it on the value it inherits,
+                # whatever earlier steps did with their own command lines.
+                results.extend(addopts_findings(filename, effective))
+                judged = judged or inherits
+        if inherited and not judged and not steps:
             results.extend(addopts_findings(filename, inherited))
     return results
 

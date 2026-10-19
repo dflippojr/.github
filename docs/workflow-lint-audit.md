@@ -85,7 +85,7 @@ custom-label rule adds no new finding on these repositories.
 
 ## Fixture and implementation proof
 
-`python -m pytest -q tests/test_workflow_lint.py`: **268 passed** (54 passed when this audit was first written; the later cases cover the review exceptions, runner labels and per-command PYTEST_ADDOPTS). The original set included
+`python -m pytest -q tests/test_workflow_lint.py`: **290 passed** (54 passed when this audit was first written; the later cases cover the review exceptions, runner labels and per-command PYTEST_ADDOPTS). The original set included
 28 named policy fixtures (runner visibility, matrix labels, JSON runner input,
 CI_RUNS_ON, both review exceptions, command caps, two-worker and four-worker
 counts, shell continuations, package scripts, comments and malformed files),
