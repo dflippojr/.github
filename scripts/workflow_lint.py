@@ -23,8 +23,11 @@ HOSTED = re.compile(r"\b(?:ubuntu|windows|macos)-(?:latest|\d[^\s'\"\],}]*)", re
 # by the organization, so config/workflow-lint.json lists those as hosted_runner_labels.
 HOSTED_LABEL = re.compile(r'(?:ubuntu|windows|macos)-(?:latest|slim|\d[\d.]*)(?:-(?:arm|arm64|intel|large|xlarge))?', re.I)
 RUNNER_INPUT = re.compile(r'runs?[-_]?on|runners?|runner[-_]?labels?', re.I)
-# Actions that prepare or move files and never run the project's tests.
-NEUTRAL_ACTION = re.compile(r'actions/(?:checkout|cache(?:/\w+)?|upload-artifact|download-artifact)|[\w.-]+/setup-[\w.-]+', re.I)
+# Actions that prepare or move files and never run a command from their inputs.
+# Matching on a name pattern such as setup-* would exempt coactions/setup-xvfb, which runs one.
+NEUTRAL_ACTION = re.compile(r'actions/(?:checkout|cache(?:/(?:restore|save))?|upload-artifact|download-artifact|setup-(?:python|node|java|go|dotnet|ruby))'
+                            r'|astral-sh/setup-uv|pnpm/action-setup|docker/setup-(?:buildx|qemu)-action', re.I)
+TEST_TOOL = re.compile(r'(?<![\w-])(?:pytest|py\.test|playwright)(?![\w-])', re.I)
 PYTEST_CONFIG = {'pytest.ini', '.pytest.ini', 'tox.ini', 'setup.cfg', 'pyproject.toml', 'pytest.toml', '.pytest.toml'}
 ADDOPTS_TOKEN = re.compile(r'PYTEST_ADDOPTS=(.*)\Z', re.I | re.S)
 ADDOPTS_LITERAL = re.compile(r"""PYTEST_ADDOPTS["'`\]]*\s*[:=,)]\s*(["'`])((?:\\.|(?!\1).)*)\1""", re.I | re.S)
@@ -382,6 +385,8 @@ def workflow_parallelism(filename, document):
             effective = next((value for value in (own, persisted, inherited) if value is not None), None)
             inherits = own is None and persisted is None
             uses = step.get('uses')
+            # A command handed to an action through with: (retry, xvfb, ...) runs like a run step.
+            commands = [value for value in strings(step.get('with')) if TEST_TOOL.search(value)] if isinstance(uses, str) and not NEUTRAL_ACTION.fullmatch(uses.split('@')[0]) else []
             if isinstance(step.get('run'), str):
                 found, after, resolved = scan_command(filename, step['run'], effective)
                 results.extend(found)
@@ -390,6 +395,11 @@ def workflow_parallelism(filename, document):
                 judged = judged or (inherits and resolved)
                 if 'GITHUB_ENV' in step['run'].upper() and after != effective:
                     persisted = after
+            elif commands:
+                for command in commands:
+                    found, _, resolved = scan_command(filename, command, effective)
+                    results.extend(found)
+                    judged = judged or (inherits and resolved)
             elif own:
                 results.extend(addopts_findings(filename, own))
             elif effective and isinstance(uses, str) and uses.startswith('./'):
