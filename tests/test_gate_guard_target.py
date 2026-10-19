@@ -27,8 +27,9 @@ class FakeGitHub:
     """Answers the API calls of run_target and keeps the check runs it creates and updates.
 
     prs maps each pull request with head `head` to its base, head branch,
-    labels, label events and push time, and to closed=True for one the open
-    listing leaves out; merge_bases maps each base to its merge
+    labels, label events and push time, and to closed=True for a closed PR.
+    listed overrides its visibility in the open listing to simulate API lag;
+    head_sha overrides its current head. merge_bases maps each base to its merge
     base with the head. Like the Checks API, it rejects an output over 65,535
     UTF-8 bytes, and any update that `refuse` returns true for.
     """
@@ -42,19 +43,26 @@ class FakeGitHub:
         return cls(head, {base: merge_base}, {NUMBER: dict(scenario, base=base, head_ref=HEAD_REF)})
 
     def get(self, path):
+        for number in self.prs:
+            if path == f"/repos/{REPO}/pulls/{number}":
+                return self.pull_request(number)
         for base, merge_base in self.merge_bases.items():
             if path == f"/repos/{REPO}/compare/{base}...{self.head}?per_page=1":
                 return {"merge_base_commit": {"sha": merge_base}}
         raise AssertionError(f"unexpected API path {path}")
+
+    def pull_request(self, number):
+        pr = self.prs[number]
+        return event_pr(number, pr.get("head_sha", self.head), pr["base"], pr["head_ref"],
+                        "closed" if pr.get("closed") else "open")
 
     def pages(self, path):
         if path == f"/repos/{REPO}/pulls?state=open":
             # An open pull request with another head is noise.
             other = {"number": 99, "head": {"sha": "f" * 40, "ref": "other", "repo": {"full_name": REPO}},
                      "base": {"ref": "main"}}
-            return [other] + [{"number": n, "head": {"sha": self.head, "ref": p["head_ref"],
-                                                     "repo": {"full_name": REPO}}, "base": {"ref": p["base"]}}
-                              for n, p in self.prs.items() if not p.get("closed")]
+            return [other] + [dict(self.pull_request(n), state="open") for n, p in self.prs.items()
+                              if p.get("listed", not p.get("closed"))]
         for number, s in self.prs.items():
             if path == f"/repos/{REPO}/issues/{number}/labels":
                 return [{"name": n} for n in s["labels"]]
@@ -274,8 +282,8 @@ class SharedHead(unittest.TestCase):
         self.assertIn("conclusion=success", outputs)
 
     def test_closed_pull_request_the_listing_still_shows_is_left_out(self):
-        """The listing can lag the close; the payload says the pull request is closed."""
-        prs = {NUMBER: self.pr("main"), 8: self.pr("stacked", head_ref="stacked-copy")}
+        """The listing can lag the close; a fresh single-PR read confirms it is closed."""
+        prs = {NUMBER: self.pr("main", closed=True, listed=True), 8: self.pr("stacked", head_ref="stacked-copy")}
         fake = FakeGitHub(self.head, self.merge_bases, prs)
         event = {"action": "closed", "pull_request": event_pr(NUMBER, self.head, "main", state="closed")}
         code, _, _ = run_cli(self.tmp, self.server, event, fake)
@@ -319,6 +327,78 @@ class SharedHead(unittest.TestCase):
         self.assertIn(f"Failing: #{NUMBER}.", check["output"]["summary"])
         self.assertIn("conclusion=failure", outputs)
         self.assertIn("gate-change-approved=false", outputs)
+
+    def test_reopened_then_edited_pull_request_uses_current_base_even_when_unlisted(self):
+        """A reopen followed by a retarget must not reuse the old passing stacked base."""
+        fake = FakeGitHub(self.head, self.merge_bases, {NUMBER: self.pr("stacked")})
+        reopened = {"action": "reopened", "pull_request": event_pr(NUMBER, self.head, "stacked")}
+        code, _, _ = run_cli(self.tmp, self.server, reopened, fake)
+        self.assertEqual((code, fake.current()["conclusion"]), (0, "success"))
+        fake.prs[NUMBER].update(base="main", listed=False)
+        for action, state in (("edited", "open"), ("closed", "closed"), ("reopened", "open")):
+            with self.subTest(action=action):
+                event = {"action": action, "pull_request": event_pr(NUMBER, self.head, "stacked", state=state)}
+                code, _, _ = run_cli(self.tmp, self.server, event, fake)
+                self.assertEqual((code, fake.current()["conclusion"]), (1, "failure"))
+                self.assertIn(f"#{NUMBER} into `main`", fake.current()["output"]["summary"])
+
+    def test_synchronize_after_reopening_uses_current_head_and_branch(self):
+        """An old close judges only siblings still at H; synchronize judges the reopened PR's new head."""
+        old_head = self.merge_bases["stacked"]
+        prs = {NUMBER: self.pr("main", head_ref="reopened-branch", head_sha=old_head),
+               8: self.pr("main", head_ref="old-copy", head_sha=old_head, **self.APPROVED)}
+        fake = FakeGitHub(old_head, self.merge_bases, prs)
+        reopened = {"action": "reopened", "pull_request": event_pr(NUMBER, old_head, "main")}
+        code, _, _ = run_cli(self.tmp, self.server, reopened, fake)
+        self.assertEqual((code, fake.current()["conclusion"]), (1, "failure"))
+        fake.prs[NUMBER]["head_sha"] = self.head
+        closed = {"action": "closed", "pull_request": event_pr(NUMBER, old_head, "main", state="closed")}
+        code, _, _ = run_cli(self.tmp, self.server, closed, fake)
+        self.assertEqual((code, fake.current()["conclusion"]), (0, "success"))
+        self.assertEqual(fake.current()["head_sha"], old_head)
+        self.assertNotIn(f"#{NUMBER}", fake.current()["output"]["summary"])
+        fake.head = self.head
+        synchronized = {"action": "synchronize", "pull_request": event_pr(NUMBER, self.head, "main")}
+        code, _, outputs = run_cli(self.tmp, self.server, synchronized, fake)
+        self.assertEqual((code, fake.current()["conclusion"]), (1, "failure"))
+        self.assertEqual(fake.current()["head_sha"], self.head)
+        self.assertIn("conclusion=failure", outputs)
+
+    def test_stale_open_payload_cannot_restore_a_currently_closed_pull_request(self):
+        for action in ("reopened", "edited", "synchronize"):
+            with self.subTest(action=action):
+                fake = FakeGitHub(self.head, self.merge_bases, {NUMBER: self.pr("main", closed=True)})
+                event = {"action": action, "pull_request": event_pr(NUMBER, self.head, "main")}
+                code, _, _ = run_cli(self.tmp, self.server, event, fake)
+                self.assertEqual((code, fake.current()["conclusion"]), (0, "neutral"))
+
+    def test_closed_sibling_in_stale_listing_is_reconciled_too(self):
+        prs = {NUMBER: self.pr("main", closed=True, listed=True),
+               8: self.pr("stacked", head_ref="stacked-copy")}
+        code, check, _ = self.judge(prs, "edited", 8, "stacked")
+        self.assertEqual((code, check["conclusion"]), (0, "success"))
+        self.assertNotIn(f"#{NUMBER}", check["output"]["summary"])
+
+    def test_unresolved_current_state_fails_closed_even_with_an_approved_sibling(self):
+        for number in (NUMBER, 8):
+            with self.subTest(unreadable=number):
+                prs = {NUMBER: self.pr("main"), 8: self.pr("main", head_ref="approved-copy", **self.APPROVED)}
+                fake = FakeGitHub(self.head, self.merge_bases, prs)
+                get = fake.get
+
+                def read(path):
+                    if path == f"/repos/{REPO}/pulls/{number}":
+                        raise reject(403, {"message": "rate limited"})
+                    return get(path)
+
+                event = {"action": "closed", "pull_request": event_pr(NUMBER, self.head, "main", state="closed")}
+                with mock.patch.object(fake, "get", side_effect=read):
+                    code, _, outputs = run_cli(self.tmp, self.server, event, fake)
+                self.assertEqual((code, fake.current()["conclusion"]), (2, "failure"))
+                self.assertIn(f"could not read pull request #{number}'s current state",
+                              fake.current()["output"]["summary"])
+                self.assertIn("gate-change-approved=false", outputs)
+                self.assertIn("findings-accepted=false", outputs)
 
 
 class OversizedReport(unittest.TestCase):
@@ -442,6 +522,10 @@ class TargetFailures(unittest.TestCase):
         """A mock API whose check-run create answers with an id; the verdict arrives as an update."""
         fake = mock.Mock()
         fake.post.return_value = {"id": 5}
+        fake.get.return_value = {"merge_base_commit": {"sha": "e" * 40}}
+        fake.get.side_effect = lambda path: (
+            dict(TargetFailures.EVENT["pull_request"], state="open")
+            if path == f"/repos/{REPO}/pulls/{NUMBER}" else fake.get.return_value)
         return fake
 
     @staticmethod
@@ -465,7 +549,14 @@ class TargetFailures(unittest.TestCase):
 
     def test_unreadable_diff_posts_a_failure(self):
         fake = self.github()
-        fake.get.side_effect = gate_guard.urllib.error.URLError("offline")
+        get = fake.get.side_effect
+
+        def read(path):
+            if "/compare/" in path:
+                raise gate_guard.urllib.error.URLError("offline")
+            return get(path)
+
+        fake.get.side_effect = read
         fake.pages.return_value = []
         code, _ = self.run_target(fake, self.EVENT)
         self.assertEqual(code, 2)
@@ -543,6 +634,8 @@ class TargetFailures(unittest.TestCase):
         fake = self.github()
         fake.pages.side_effect = gate_guard.urllib.error.URLError("rate limited")
         event = {"action": "closed", "pull_request": dict(self.EVENT["pull_request"], state="closed")}
+        fake.get.side_effect = None
+        fake.get.return_value = event["pull_request"]
         code, _ = self.run_target(fake, event)
         self.assertEqual(code, 2)
         body = fake.patch.call_args[0][1]
@@ -550,6 +643,22 @@ class TargetFailures(unittest.TestCase):
                          ("failure", "Could not list the open pull requests with this head"))
         self.assertIn("could not list the open pull requests with this head (<urlopen error rate limited>)",
                       body["output"]["summary"])
+
+    def test_malformed_current_pull_request_fails_closed(self):
+        valid = dict(self.EVENT["pull_request"], state="open")
+        responses = [None, [], {}, dict(valid, number=8), dict(valid, state="unknown"),
+                     dict(valid, head=None), dict(valid, head={"sha": ""}), dict(valid, base={})]
+        for response in responses:
+            with self.subTest(response=response):
+                fake = self.github()
+                fake.pages.return_value = []
+                fake.get.side_effect = None
+                fake.get.return_value = response
+                code, _ = self.run_target(fake, self.EVENT)
+                self.assertEqual(code, 2)
+                body = fake.patch.call_args[0][1]
+                self.assertEqual(body["conclusion"], "failure")
+                self.assertIn(f"could not read pull request #{NUMBER}'s current state", body["output"]["summary"])
 
     def test_annotations_only_for_lines(self):
         hits = [gate_guard.Hit("retry", "a.ts", 3, "raised"), gate_guard.Hit("removed-tests", "b.py", None, "gone")]
@@ -577,6 +686,8 @@ class CutOffLabelHistory(unittest.TestCase):
             parts = urllib.parse.urlsplit(url)
             if method == "POST":
                 return {"id": 1}, None
+            if parts.path == f"/repos/{REPO}/pulls/{NUMBER}":
+                return event_pr(NUMBER, head, "main"), None
             if "/compare/" in parts.path:
                 return {"merge_base_commit": {"sha": "e" * 40}}, None
             if parts.path.endswith("/labels"):

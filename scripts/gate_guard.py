@@ -1113,22 +1113,31 @@ def pull_requests_with_head(github, repo, sha, event_pr):
 
     A check run lands on a commit, which any number of pull requests can share,
     each with its own base and labels. The listing gives each one's current
-    base, which a queued event's payload may predate. The event's own pull
-    request is judged from the payload if the listing doesn't show it, unless
-    the event closed it: then it is left out even if the listing still shows
-    it, and the pull requests still open with the head decide.
+    base, which a queued event's payload may predate. Reconcile each candidate,
+    including the event's PR even if unlisted, with a fresh single-PR read.
+    Only its current state/head/base decide whether and how it is judged;
+    neither an old event nor a stale listing can exclude a reopened PR or
+    restore a closed one. An unresolved current state fails closed.
     """
     try:
-        prs = {p["number"]: p for p in github.pages(f"/repos/{repo}/pulls?state=open")
-               if (p.get("head") or {}).get("sha") == sha}
+        numbers = {p["number"] for p in github.pages(f"/repos/{repo}/pulls?state=open")
+                   if (p.get("head") or {}).get("sha") == sha}
         error = None
     except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as e:
-        prs, error = {}, f"could not list the open pull requests with this head ({e})"
-    if event_pr.get("state", "open") == "open":
-        prs.setdefault(event_pr["number"], event_pr)
-    else:
-        prs.pop(event_pr["number"], None)
-    return [prs[n] for n in sorted(prs)], error
+        numbers, error = set(), f"could not list the open pull requests with this head ({e})"
+    numbers.add(event_pr["number"])
+    prs = []
+    for number in sorted(numbers):
+        try:
+            pr = github.get(f"/repos/{repo}/pulls/{number}")
+            if (pr["number"] != number or pr["state"] not in {"open", "closed"}
+                    or not pr["head"]["sha"] or not pr["base"]["ref"]):
+                raise ValueError("incomplete current pull request")
+            if pr["state"] == "open" and pr["head"]["sha"] == sha:
+                prs.append(pr)
+        except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as e:
+            error = error or f"could not read pull request #{number}'s current state ({e})"
+    return prs, error
 
 
 def run_target(args, github=None):
@@ -1170,7 +1179,8 @@ def run_target(args, github=None):
         with open(args.summary, "a", encoding="utf-8") as f:
             f.write(summary)
     _write_outputs({"conclusion": conclusion,
-                    **{label: str(bool(judgments) and all(j.verdicts[label][0] for j in judgments)).lower()
+                    **{label: str(bool(judgments) and not error and
+                                  all(j.verdicts[label][0] for j in judgments)).lower()
                        for label in OWNER_LABELS}})
 
     annotations = []

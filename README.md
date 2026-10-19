@@ -99,14 +99,18 @@ base: the same head against a new base can bring hits the old base hid.
 
 1. Loads `scripts/gate_guard.py` from this repository at the full commit SHA in
    `guard-ref`. Anything other than 40 hex characters fails the job.
-2. Lists every open pull request whose head is the event's head commit, with
-   each one's current base, and judges each of them as in steps 3 and 4. A
+2. Lists every open pull request whose head is the event's head commit, then
+   reads each candidate and the event's own PR individually for its current
+   state, head and base. It judges only those still open at that head, as in
+   steps 3 and 4; an unreadable current state fails closed. A
    check run belongs to a commit, not to a pull request, so the guard makes one
    decision per commit: two pull requests that share a head but not a base can't
    let the passing one's result replace the failing one's. The caller's
    concurrency group is keyed by the head SHA, so the newest decision for a
-   commit is the one that lands. On a `closed` event the closed pull request
-   is left out, so closing the one that fails lets the others pass. When none
+   commit is the one that lands. A currently closed pull request is left out,
+   so closing the one that fails lets the others pass. Rerunning an older
+   `closed` event after reopening judges the reopened PR too: the event's
+   payload never decides its current state, head or base. When none
    is left open with the head, the check completes as `neutral` with no
    verdict, and both label outputs are `false`.
 3. Asks the compare API for each pull request's merge base, then fetches the
