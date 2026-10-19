@@ -26,6 +26,14 @@ RUNNER_INPUT = re.compile(r'(?:[\w-]*[-_])?(?:runs?[-_]?on|runners?|runner[-_]?l
 PYTEST_CONFIG = {'pytest.ini', '.pytest.ini', 'tox.ini', 'setup.cfg', 'pyproject.toml', 'pytest.toml', '.pytest.toml'}
 ADDOPTS_TOKEN = re.compile(r'PYTEST_ADDOPTS=(.*)\Z', re.I | re.S)
 ADDOPTS_LITERAL = re.compile(r"""PYTEST_ADDOPTS["'`\]]*\s*[:=,)]\s*(["'`])((?:\\.|(?!\1).)*)\1""", re.I | re.S)
+ASSIGNMENT = re.compile(r'[A-Za-z_]\w*=')
+EXPORTERS = {'export', 'declare', 'typeset', 'readonly', 'local'}
+# Words that precede the command in a shell segment without being the command.
+SHELL_PREFIX = EXPORTERS | {'env', 'cross-env', 'if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{', '(', 'time'}
+# Commands that cannot start pytest, so an inherited PYTEST_ADDOPTS does not matter to them.
+NEUTRAL = {'echo', 'printf', 'cd', 'pushd', 'popd', 'mkdir', 'ls', 'dir', 'cat', 'pwd', 'true', 'false', ':', 'test', '[', '[[', 'sleep',
+           'rm', 'cp', 'mv', 'touch', 'exit', 'return', 'unset', 'set', 'fi', 'done', 'esac', '}', ')', 'for', 'case', 'git', 'gh', 'curl',
+           'wget', 'pip', 'pip3', 'apt', 'apt-get', 'brew', 'chmod', 'tar', 'unzip', 'write-host', 'write-output'}
 CI_SWITCH = re.compile(r"^\s*\$\{\{\s*fromJSON\(\s*vars\.CI_RUNS_ON\s*\|\|\s*'[^']+'\s*\)\s*}}\s*$", re.I)
 
 
@@ -255,13 +263,42 @@ def posix_env(command):
                   lambda m: assignment(next(group for group in m.groups() if group is not None)), command)
 
 
-def scan_command(filename, command, addopts=None, local=False):
-    """Check worker caps in one command string.
+def command_word(segment):
+    """Split a simple command into (inline PYTEST_ADDOPTS or None, whether assignments persist, command words)."""
+    inline, exporter, index = None, False, 0
+    while index < len(segment):
+        token = segment[index]
+        assign = ADDOPTS_TOKEN.fullmatch(token)
+        if token in SHELL_PREFIX:
+            exporter = exporter or token in EXPORTERS
+        elif token.startswith('-') and index and segment[index - 1] in {'env', 'cross-env'}:
+            pass  # env -i and similar options
+        elif assign:
+            inline = assign.group(1)
+        elif not ASSIGNMENT.match(token):
+            break
+        index += 1
+    words = [] if exporter else segment[index:]  # what follows `export` is a list of names
+    return inline, exporter or not words, words
 
-    addopts is the PYTEST_ADDOPTS value already in effect: pytest reads it
-    before the command line, so a worker flag on the command line replaces it.
-    Returns (findings, addopts in effect afterwards, whether an inherited,
-    non-local value was evaluated or replaced).
+
+def neutral_command(words):
+    """True for commands that cannot start pytest, so an inherited PYTEST_ADDOPTS does not matter to them."""
+    name = PurePosixPath(words[0].replace('\\', '/')).name.lower()
+    name = name[:-4] if name.endswith('.exe') else name
+    return name in NEUTRAL or (name.startswith('python') or name == 'py') and words[1:3] == ['-m', 'pip']
+
+
+def scan_command(filename, command, addopts=None):
+    """Check worker caps in one command string, judging each command on its own effective parallelism.
+
+    addopts is the PYTEST_ADDOPTS value already in effect. pytest reads it before
+    the command line, so a worker flag on pytest's own command line replaces it,
+    but only for that command: a later command that may run pytest (make, tox,
+    a script) still sees the value. An inline assignment belongs to its command;
+    `export` and bare assignments persist.
+    Returns (findings, addopts in effect afterwards, whether the value passed in
+    was judged against a command or replaced).
     """
     results = []
     # Shell, cmd and PowerShell line continuations.
@@ -273,9 +310,6 @@ def scan_command(filename, command, addopts=None, local=False):
         tokens = list(lexer)
     except ValueError:
         return [finding('warning', 'unparsed-command', filename, 'Could not tokenize command; inspect manually')], addopts, True
-    inherited = bool(addopts) and not local
-    resolved = not inherited
-    unchecked = bool(addopts) and local
     segments, current = [], []
     for token in tokens:
         if token and all(c in ';&|\n' for c in token):
@@ -284,25 +318,34 @@ def scan_command(filename, command, addopts=None, local=False):
         else:
             current.append(token)
     segments.append(current)
+    inherited, resolved = bool(addopts), not addopts
+    unjudged = False  # a value assigned by this script that no command has seen yet
     for segment in segments:
-        for index, token in enumerate(segment):
-            assign = ADDOPTS_TOKEN.fullmatch(token)
-            if assign or (index and segment[index - 1] == 'unset' and token.upper() == 'PYTEST_ADDOPTS'):
-                if inherited:
-                    inherited, resolved = False, True
-                addopts = assign.group(1) if assign else ''
-                unchecked = bool(addopts)
-        tools = [(index, 'pytest' if is_pytest(token) else 'playwright') for index, token in enumerate(segment) if is_pytest(token) or is_playwright(token)]
+        inline, persist, words = command_word(segment)
+        scoped = inline is not None and not persist
+        effective = inline if scoped else addopts
+        tools = [(index, 'pytest' if is_pytest(token) else 'playwright') for index, token in enumerate(words) if is_pytest(token) or is_playwright(token)]
+        judged = False
         for position, (index, tool) in enumerate(tools):
-            end = tools[position + 1][0] if position + 1 < len(tools) else len(segment)
-            flags = list(worker_flags(tool, segment[index + 1:end]))
+            end = tools[position + 1][0] if position + 1 < len(tools) else len(words)
+            flags = list(worker_flags(tool, words[index + 1:end]))
             results.extend(item for item in (worker_finding(filename, tool, token, value) for token, value in flags) if item)
-            if tool == 'pytest' and addopts:
-                resolved = resolved or inherited
-                unchecked = False
+            if tool == 'pytest' and effective:
+                judged = True
                 if not flags:
-                    results.extend(addopts_findings(filename, addopts))
-    if addopts and unchecked:
+                    results.extend(addopts_findings(filename, effective))
+        if not tools and words and effective and not neutral_command(words):
+            judged = True
+            results.extend(addopts_findings(filename, effective))
+        if judged and not scoped:
+            resolved, unjudged = resolved or inherited, False
+        # State changes take effect after the command that carries them.
+        assigned = inline if persist else next((m.group(1) for m in map(ADDOPTS_TOKEN.fullmatch, words[1:]) if m), None)
+        if assigned is None and words[:1] == ['unset'] and any(token.upper() == 'PYTEST_ADDOPTS' for token in words[1:]):
+            assigned = ''
+        if assigned is not None:
+            addopts, inherited, resolved, unjudged = assigned, False, True, bool(assigned)
+    if addopts and unjudged:
         results.extend(addopts_findings(filename, addopts))
     return results, addopts, resolved
 
@@ -329,23 +372,31 @@ def workflow_parallelism(filename, document):
             continue
         job_env = env_addopts(job.get('env'))
         inherited = workflow_env if job_env is None else job_env
-        used, persisted = False, None
-        for step in job.get('steps', []):
-            if not isinstance(step, dict):
-                continue
+        steps = [step for step in job.get('steps') or [] if isinstance(step, dict)]
+        judged, exposed, persisted = not inherited, False, None
+        for step in steps:
             own = env_addopts(step.get('env'))
             # Step env beats a value exported through GITHUB_ENV, which beats job and workflow env.
             effective = next((value for value in (own, persisted, inherited) if value is not None), None)
-            used = used or own is not None
+            inherits = own is None and persisted is None
+            uses = step.get('uses')
             if isinstance(step.get('run'), str):
-                found, after, resolved = scan_command(filename, step['run'], effective, local=own is not None)
+                found, after, resolved = scan_command(filename, step['run'], effective)
                 results.extend(found)
-                used = used or (resolved and own is None and persisted is None)
-                if 'GITHUB_ENV' in step['run'].upper():
+                if not inherits and own is not None and effective and not resolved:
+                    results.extend(addopts_findings(filename, own))
+                judged = judged or (inherits and resolved)
+                if 'GITHUB_ENV' in step['run'].upper() and after != effective:
                     persisted = after
             elif own:
                 results.extend(addopts_findings(filename, own))
-        if inherited and not used:
+            elif effective and isinstance(uses, str) and uses.startswith('./'):
+                # A local action is code in this repository that may run pytest.
+                results.extend(addopts_findings(filename, effective))
+                judged = judged or inherits
+            elif effective and inherits:
+                exposed = True
+        if inherited and not judged and (exposed or not steps):
             results.extend(addopts_findings(filename, inherited))
     return results
 
