@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -15,6 +16,16 @@ import yaml
 
 DEFAULT_TEST_PATHS = ["tests/**", "test/**", "**/*_test.*", "**/*.test.*", "**/test_*"]
 CLOSES = re.compile(r"\b(?:closes|fixes|resolves)\s+(?:([\w.-]+/[\w.-]+))?#([1-9]\d*)\b", re.I)
+# Poll the gate-guard check for up to GATE_WAIT seconds; the job's timeout is 5 minutes.
+GATE_WAIT, GATE_INTERVAL = 180, 10
+THEMATIC_BREAK = re.compile(r"^ {0,3}([-*_])(?: *\1){2,} *$")
+# HTML blocks that interrupt a table (CommonMark start conditions 1-5 and 6).
+HTML_BLOCK = re.compile(
+    r"^ {0,3}<(?:/?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details"
+    r"|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html"
+    r"|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|section|source|summary"
+    r"|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:[\s/>]|$)|(?:script|pre|style|textarea)(?:[\s>]|$)|[?!])",
+    re.I)
 HIT = re.compile(r"^\|\s*(?:removed-tests|skip-marker|retry|gate-config)\s*\|", re.M)
 
 
@@ -30,9 +41,9 @@ def visible_markdown(body):
                 fence = token
             elif token[0] == fence[0] and len(token) >= len(fence):
                 fence = None
+            lines.append("")  # a removed fence still ends a table, as on GitHub
             continue
-        if fence is None:
-            lines.append(line)
+        lines.append(line if fence is None else "")
     return "\n".join(lines)
 
 
@@ -68,7 +79,8 @@ def has_table(text):
         if not all(re.fullmatch(r":?-+:?", c) for c in delimiter):
             continue
         for row in lines[i + 1:]:
-            if not row.strip() or re.match(r"^ {0,3}(?:#{1,6}(?:\s|$)|>|(?:[-+*]|\d+[.)])\s)", row):
+            if (not row.strip() or THEMATIC_BREAK.match(row) or HTML_BLOCK.match(row)
+                    or re.match(r"^ {0,3}(?:#{1,6}(?:\s|$)|>|(?:[-+*]|\d+[.)])\s)", row)):
                 break
             # GFM pads short rows and ignores cells beyond the header width.
             if any(cells(row)[:len(header)]):
@@ -169,14 +181,27 @@ def load_rules(api, repo):
     return parse_rules(base64.b64decode(data["content"]).decode("utf-8"))
 
 
-def gate_has_findings(api, repo, sha):
+def latest_gate_check(api, repo, sha):
     checks = api.pages(f"/repos/{repo}/commits/{sha}/check-runs?check_name=gate-guard&filter=latest", "check_runs")
     checks = [c for c in checks if c.get("name") == "gate-guard"]
-    if not checks:
-        raise ValueError("gate-guard check is missing; wire the guard and rerun pr-body after it completes")
-    check = max(checks, key=lambda c: c["id"])
+    return max(checks, key=lambda c: c["id"]) if checks else None
+
+
+def gate_has_findings(api, repo, sha):
+    # The guard and this lint start on the same event, so the guard's check may
+    # not exist yet or may still be in progress. Wait for a verdict; a check that
+    # is missing or unfinished when the wait ends is never read as passing.
+    check = None
+    for attempt in range(GATE_WAIT // GATE_INTERVAL + 1):
+        if attempt:
+            time.sleep(GATE_INTERVAL)
+        check = latest_gate_check(api, repo, sha)
+        if check and check.get("status") == "completed":
+            break
+    if check is None:
+        raise ValueError("gate-guard check is missing; install gate-guard-target.yml, then rerun pr-body")
     if check.get("status") != "completed":
-        raise ValueError("gate-guard is pending; rerun pr-body after it completes")
+        raise ValueError("gate-guard is still pending; rerun pr-body after it completes")
     output = check.get("output") or {}
     report = (output.get("summary") or "") + "\n" + (output.get("text") or "")
     if HIT.search(report):

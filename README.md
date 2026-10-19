@@ -227,10 +227,16 @@ and head's gate-guard report through the GitHub API. It requires:
 - Assignee `dflippojr`.
 - A non-empty `### Gate changes` explanation other than `None` when the
   latest head check named `gate-guard` reports findings, including when that
-  check passed with owner approval. A missing check, pending check or unreadable
-  report fails with a rerun instruction; rerun the lint after the guard completes.
-  Wire both checks and require the guard independently; this check does not
-  approve gate edits.
+  check passed with owner approval. The lint waits up to three minutes for the
+  guard's check to appear and complete, because both start on the same event.
+  A check still missing or pending after that, or an unreadable report, fails
+  closed with a rerun instruction; it never counts as passing.
+  **`gate-guard-target.yml` is required**: only its check run is named exactly
+  `gate-guard`. The `pull_request` flavour (`gate-guard.yml`) reports
+  `gate-guard / gate-guard` and writes no check output, and a repository with no
+  guard has no such check, so in both cases `pr-body` stays red until
+  `gate-guard-target.yml` is installed. Require the guard independently; this
+  check does not approve gate edits.
 - A changed test path when any linked issue has label `bug`. A `bug` label on
   the PR itself does not substitute for the linked issue's label. Renames count
   both old and new filenames, and deleted tests count as touched paths; the
