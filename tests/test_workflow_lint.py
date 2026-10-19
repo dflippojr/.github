@@ -111,6 +111,10 @@ def test_actionlint_only_receives_changed_workflows_and_trusted_config(monkeypat
     def execute(argv, **kwargs):
         seen.append(argv)
         assert Path(kwargs['cwd'], '.github/workflows/changed.yml').read_text() == 'changed'
+        assert Path(kwargs['cwd'], '.git').is_dir()
+        assert not list(Path(kwargs['cwd'], '.git').iterdir())
+        assert Path(kwargs['cwd'], '.github/workflows/old.yml').read_text() == 'old'
+        assert str(Path(kwargs['cwd'], '.github/workflows/old.yml')) not in argv
         assert not Path(kwargs['cwd'], '.github/actionlint.yaml').exists()
         return subprocess.CompletedProcess(argv, 1, stdout='schema error', stderr='')
 

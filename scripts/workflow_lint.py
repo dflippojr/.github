@@ -239,12 +239,16 @@ def run_actionlint(files, changed, executable):
     # A fresh directory excludes PR-controlled actionlint config, actions, executables,
     # symlinks and shell startup files. Disable external command execution by actionlint.
     with tempfile.TemporaryDirectory() as directory:
-        paths = []
-        for name in selected:
+        # actionlint requires both .git and .github/workflows to resolve local
+        # reusable calls. This empty marker contains no target git configuration.
+        Path(directory, '.git').mkdir()
+        for name in sorted(files):
+            if not workflow_path(name):
+                continue
             target = Path(directory, name)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(files[name], encoding='utf-8')
-            paths.append(str(target))
+        paths = [str(Path(directory, name)) for name in selected]
         result = subprocess.run([executable, '-shellcheck=', '-pyflakes=', '-config-file', str(ROOT / 'config/actionlint.yaml'), *paths], cwd=directory, capture_output=True, text=True, check=False)
         return {'files': selected, 'exit_code': result.returncode, 'output': (result.stdout + result.stderr).replace(directory, '<target>')}
 
