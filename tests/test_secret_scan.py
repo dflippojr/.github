@@ -288,6 +288,7 @@ UNTRUSTED_PATHS = [
     pytest.param(b":(glob)*.txt", id="glob-magic"),
     pytest.param(b":(icase)file.txt", id="icase-magic"),
     pytest.param(b":(literal)file.txt", id="literal-magic"),
+    pytest.param(b":(attr:synthetic)file.txt", id="attribute-magic"),
     pytest.param(b":/file.txt", id="top-magic"),
     pytest.param(b":(unknown)file.txt", id="unknown-magic"),
     pytest.param(b":", id="empty-pathspec"),
