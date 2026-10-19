@@ -22,6 +22,14 @@ GOOD = FIXTURES[0]["body"]
 SHA = "a" * 40
 
 
+@pytest.fixture(autouse=True)
+def sleeps(monkeypatch):
+    """Record waits instead of sleeping; the gate poll must never really block a test."""
+    waited = []
+    monkeypatch.setattr("time.sleep", waited.append)
+    return waited
+
+
 def pr(body=GOOD, **fields):
     return dict(body=body, user={"login": "worker"}, assignees=[{"login": "dflippojr"}],
                 labels=[], head={"sha": SHA}, base={"ref": "feature-base"}, changed_files=1, **fields)
@@ -183,21 +191,80 @@ class FakeAPI:
         return [check("No removed tests, skip markers, retries or gate-config edits.")]
 
 
-def test_missing_then_approved_findings_never_pass_without_gate_explanation():
+CLEAN = "No removed tests, skip markers, retries or gate-config edits."
+
+
+def sequence(*reports):
+    """API stub whose check-runs read returns each report in turn, then repeats the last."""
+    api, reads = mock.Mock(), iter(reports)
+    last = []
+
+    def pages(path, key=None):
+        nonlocal last
+        last = next(reads, last)
+        return last
+
+    api.pages.side_effect = pages
+    return api
+
+
+def test_gate_check_created_late_is_waited_for(sleeps):
+    api = sequence([], [dict(check(""), status="in_progress")], [check("| gate-config | workflow.yml | added |")])
+    assert lint.gate_has_findings(api, "o/r", SHA)
+    assert api.pages.call_count == 3 and len(sleeps) == 2
+
+
+def test_gate_check_created_late_and_clean_passes(sleeps):
+    api = sequence([], [check(CLEAN)])
+    assert not lint.gate_has_findings(api, "o/r", SHA)
+    assert len(sleeps) == 1
+
+
+def test_gate_check_pending_then_completed_passes(sleeps):
+    api = sequence([dict(check(""), status="queued")], [check(CLEAN)])
+    assert not lint.gate_has_findings(api, "o/r", SHA)
+
+
+@pytest.mark.parametrize("reports, message", [
+    ([[]], "missing"),
+    ([[dict(check(""), status="in_progress")]], "pending"),
+])
+def test_gate_wait_is_bounded_and_then_fails_closed(sleeps, reports, message):
+    api = sequence(*reports)
+    with pytest.raises(ValueError, match=message):
+        lint.gate_has_findings(api, "o/r", SHA)
+    assert 1 <= len(sleeps) and sum(sleeps) <= 180
+    assert api.pages.call_count == len(sleeps) + 1
+
+
+def test_unrecognized_completed_gate_report_is_not_waited_for(sleeps):
+    api = sequence([check("unknown report")], [check(CLEAN)])
+    with pytest.raises(ValueError, match="recognized"):
+        lint.gate_has_findings(api, "o/r", SHA)
+    assert not sleeps
+
+
+def test_missing_then_approved_findings_never_pass_without_gate_explanation(sleeps):
     api = FakeAPI()
     api.pull["body"] = GOOD.split("### Gate changes")[0]
     original = api.pages
-    reports = iter([[], [check("| gate-config | workflow.yml | added |")]])
+    reports = iter([[], [dict(check(""), status="in_progress")], [check("| gate-config | workflow.yml | added |")]])
 
     def ordered_checks(path, key=None):
         return next(reports) if key == "check_runs" else original(path, key)
 
     api.pages = ordered_checks
-    with pytest.raises(ValueError, match="gate-guard.*missing"):
-        lint.inspect_pr(api, "o/r", 7)
     assert lint.inspect_pr(api, "o/r", 7) == [
         "Describe the gate-guard findings under ### Gate changes.",
     ]
+    assert len(sleeps) == 2
+
+
+def test_gate_guard_that_never_posts_fails_closed_naming_the_required_guard(sleeps):
+    api = FakeAPI()
+    api.pages = lambda path, key=None: [] if key == "check_runs" else FakeAPI.pages(api, path, key)
+    with pytest.raises(ValueError, match="gate-guard-target"):
+        lint.inspect_pr(api, "o/r", 7)
 
 
 def test_inspection_reads_linked_issue_labels_and_default_branch_config():
@@ -298,3 +365,26 @@ def test_workflow_security_contract():
             assert step["with"]["sparse-checkout"] == "scripts/pr_body_lint.py"
         assert "${{ github.event.pull_request" not in step.get("run", "")
     assert not any("secrets." in str(step) for step in steps)
+
+
+PROOF_LEAKS = {
+    "fenced-log-then-paragraph": "```\nlog\n```\nSee logs above.",
+    "tilde-fence-then-paragraph": "~~~\nlog\n~~~\nSee logs above.",
+    "thematic-break": "---",
+    "underscore-thematic-break": "___",
+    "spaced-thematic-break": " * * * ",
+    "html-details": "<details><summary>x</summary>",
+    "html-div": "<div>x</div>",
+}
+EMPTY_PROOF = "Closes #20\n\n## Proof\n\n| Criterion | Evidence |\n| --- | --- |\n| | |\n"
+
+
+@pytest.mark.parametrize("name", PROOF_LEAKS)
+def test_blocks_after_an_empty_proof_table_do_not_fill_it(name):
+    body = EMPTY_PROOF + PROOF_LEAKS[name] + "\n\n### Not verified\nNone."
+    assert lint.lint(pr(body), [], False, False, lint.parse_rules("")) == ["Add a ## Proof table with at least one filled row."]
+
+
+def test_inline_html_and_code_rows_still_count_as_data():
+    body = "Closes #20\n\n## Proof\n\n| Criterion | Evidence |\n| --- | --- |\n<code>x</code> | <b>ok</b>\n\n### Not verified\nNone."
+    assert not lint.lint(pr(body), [], False, False, lint.parse_rules(""))
