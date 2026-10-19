@@ -32,13 +32,17 @@ PYTEST_CONFIG = {'pytest.ini', '.pytest.ini', 'tox.ini', 'setup.cfg', 'pyproject
 ADDOPTS_TOKEN = re.compile(r'PYTEST_ADDOPTS=(.*)\Z', re.I | re.S)
 ADDOPTS_LITERAL = re.compile(r"""PYTEST_ADDOPTS["'`\]]*\s*[:=,)]\s*(["'`])((?:\\.|(?!\1).)*)\1""", re.I | re.S)
 ASSIGNMENT = re.compile(r'[A-Za-z_]\w*=')
+# The exact environment file: $GITHUB_ENV, ${GITHUB_ENV}, $env:GITHUB_ENV, %GITHUB_ENV%, optionally wrapped in $( ).
+ENV_FILE = re.compile(r'(?:\$\()?(?:\$env:GITHUB_ENV|\$GITHUB_ENV|\$\{GITHUB_ENV\}|%GITHUB_ENV%)\)?', re.I)
+REDIRECT = re.compile(r'\d*>>?\|?(.*)\Z', re.S)
+FILE_WRITERS = {'tee', 'add-content', 'set-content', 'out-file'}
 EXPORTERS = {'export', 'declare', 'typeset', 'readonly', 'local'}
 # Words that precede the command in a shell segment without being the command.
 SHELL_PREFIX = EXPORTERS | {'env', 'cross-env', 'if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{', '(', 'time'}
 # Commands that cannot start pytest, so an inherited PYTEST_ADDOPTS does not matter to them.
 NEUTRAL = {'echo', 'printf', 'cd', 'pushd', 'popd', 'mkdir', 'ls', 'dir', 'cat', 'pwd', 'true', 'false', ':', 'test', '[', '[[', 'sleep',
            'rm', 'cp', 'mv', 'touch', 'exit', 'return', 'unset', 'set', 'fi', 'done', 'esac', '}', ')', 'for', 'case', 'git', 'gh', 'curl',
-           'wget', 'pip', 'pip3', 'apt', 'apt-get', 'brew', 'chmod', 'tar', 'unzip', 'write-host', 'write-output'}
+           'wget', 'pip', 'pip3', 'apt', 'apt-get', 'brew', 'chmod', 'tar', 'unzip', 'write-host', 'write-output'} | FILE_WRITERS
 CI_SWITCH = re.compile(r"^\s*\$\{\{\s*fromJSON\(\s*vars\.CI_RUNS_ON\s*\|\|\s*'[^']+'\s*\)\s*}}\s*$", re.I)
 
 
@@ -294,6 +298,22 @@ def neutral_command(words):
     return name in NEUTRAL or (name.startswith('python') or name == 'py') and words[1:3] == ['-m', 'pip']
 
 
+def writes_env_file(segment, following):
+    """True when a command writes to the exact environment file: a > or >> redirect, tee,
+    or a PowerShell file cmdlet, either in the segment or in the one it pipes into.
+    Printing the name (`echo PYTEST_ADDOPTS= "$GITHUB_ENV"`) or writing to a different
+    path (`"${GITHUB_ENV}.bak"`) does not count."""
+    for number, token in enumerate(segment):
+        redirect = REDIRECT.fullmatch(token)
+        if redirect and (ENV_FILE.fullmatch(redirect.group(1)) or not redirect.group(1) and number + 1 < len(segment) and ENV_FILE.fullmatch(segment[number + 1])):
+            return True
+    for words in (segment, following):
+        name = PurePosixPath(words[0].replace('\\', '/')).name.lower() if words else ''
+        if name in FILE_WRITERS and any(ENV_FILE.fullmatch(token) for token in words[1:]):
+            return True
+    return False
+
+
 def scan_command(filename, command, addopts=None):
     """Check worker caps in one command string, judging each command on its own effective parallelism.
 
@@ -352,10 +372,12 @@ def scan_command(filename, command, addopts=None):
             resolved, unjudged = resolved or inherited, False
         # State changes take effect after the command that carries them.
         assigned = inline if persist else None
-        # A segment writes to GITHUB_ENV when it names the file or pipes into the segment that does.
-        sinks = segment + (segments[number + 1] if piped[number] else [])
-        if any('GITHUB_ENV' in token.upper() for token in sinks):
+        # A segment writes to GITHUB_ENV when it redirects to the file or pipes into the segment that does.
+        if writes_env_file(segment, segments[number + 1] if piped[number] else []):
             written = next((m.group(1) for m in map(ADDOPTS_TOKEN.fullmatch, words[1:]) if m), written)
+            if not words and inline is not None:
+                # A bare PowerShell string piped into the file is text for the file, not an assignment.
+                written, assigned = inline, None
         if assigned is None and words[:1] == ['unset'] and any(token.upper() == 'PYTEST_ADDOPTS' for token in words[1:]):
             assigned = ''
         if assigned is not None:

@@ -411,6 +411,35 @@ def test_echoed_assignment_text_is_not_an_environment_assignment(name, files, ex
     assert policy_rules(files) == expected
 
 
+def env_write(run, job_env=ECHO_AUTO):
+    return {WORKFLOW: workflow(job_env=job_env, run=run, extra_steps='      - run: pytest\n')}
+
+
+@pytest.mark.parametrize('name,files,expected', [
+    # Only a write to the exact environment file changes what later steps inherit.
+    ('print-mentioning-github-env-keeps-inherited', env_write('echo PYTEST_ADDOPTS= "$GITHUB_ENV"'), CAP),
+    ('print-with-value-mentioning-github-env-keeps-inherited', env_write('echo "PYTEST_ADDOPTS=" "$GITHUB_ENV"'), CAP),
+    ('write-to-github-env-bak-keeps-inherited', env_write('echo "PYTEST_ADDOPTS=" >> "${GITHUB_ENV}.bak"'), CAP),
+    ('write-to-github-env-suffix-keeps-inherited', env_write('echo "PYTEST_ADDOPTS=" >> "$GITHUB_ENV.bak"'), CAP),
+    ('write-to-other-github-env-variable-keeps-inherited', env_write('echo "PYTEST_ADDOPTS=" >> "$GITHUB_ENV_COPY"'), CAP),
+    ('tee-to-github-env-bak-keeps-inherited', env_write('echo "PYTEST_ADDOPTS=" | tee -a "${GITHUB_ENV}.bak"'), CAP),
+    ('powershell-write-to-other-file-keeps-inherited', env_write('Add-Content -Path "$env:GITHUB_ENV.bak" -Value "PYTEST_ADDOPTS="'), CAP),
+    ('unsafe-value-written-elsewhere-never-reaches-pytest', env_write('echo "PYTEST_ADDOPTS=-n 16" >> "${GITHUB_ENV}.bak"', job_env=()), []),
+    ('unsafe-value-printed-with-github-env-never-reaches-pytest', env_write('echo "PYTEST_ADDOPTS=-n 16" "$GITHUB_ENV"', job_env=()), []),
+    # Real writes to the exact file still replace the inherited value for later steps.
+    ('clear-by-redirect-no-space', env_write('echo "PYTEST_ADDOPTS=" >>"$GITHUB_ENV"'), []),
+    ('clear-by-redirect-braces', env_write('echo "PYTEST_ADDOPTS=" >> "${GITHUB_ENV}"'), []),
+    ('clear-by-overwrite-redirect', env_write('echo "PYTEST_ADDOPTS=" > $GITHUB_ENV'), []),
+    ('clear-through-tee', env_write('echo "PYTEST_ADDOPTS=" | tee "$GITHUB_ENV"'), []),
+    ('clear-through-powershell-add-content', env_write('Add-Content -Path $env:GITHUB_ENV -Value "PYTEST_ADDOPTS="'), []),
+    ('clear-through-powershell-out-file', env_write('"PYTEST_ADDOPTS=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8'), []),
+    ('unsafe-write-by-redirect-no-space', env_write('echo "PYTEST_ADDOPTS=-n 16" >>"$GITHUB_ENV"', job_env=()), CAP),
+    ('unsafe-write-through-powershell-out-file', env_write('"PYTEST_ADDOPTS=-n 16" | Out-File -FilePath $env:GITHUB_ENV -Append', job_env=()), CAP),
+], ids=lambda value: value if isinstance(value, str) else None)
+def test_only_a_write_to_the_exact_environment_file_changes_later_steps(name, files, expected):
+    assert policy_rules(files) == expected
+
+
 @pytest.mark.parametrize('command,expected', [
     ('npx playwright test -j 8', CAP), ('npx playwright test -j8', CAP), ('playwright test -j=8', CAP), ('playwright test -j 50%', CAP),
     ('playwright test -j 100%', CAP), ('playwright test -j 5', CAP), ('playwright test --workers 5 -j 2', CAP), ('playwright test -j 2 --workers 8', CAP),
