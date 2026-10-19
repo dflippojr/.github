@@ -388,6 +388,43 @@ def test_each_command_is_judged_on_its_own_effective_parallelism(name, files, ex
     assert policy_rules(files) == expected
 
 
+@pytest.mark.parametrize('command,expected', [
+    ('npx playwright test -j 8', CAP), ('npx playwright test -j8', CAP), ('playwright test -j=8', CAP), ('playwright test -j 50%', CAP),
+    ('playwright test -j 100%', CAP), ('playwright test -j 5', CAP), ('playwright test --workers 5 -j 2', CAP), ('playwright test -j 2 --workers 8', CAP),
+    ('playwright test -j 4', []), ('playwright test -j4', []), ('playwright test -j 1', []), ('playwright test --workers=2', []),
+])
+def test_playwright_short_workers_alias_is_capped(command, expected):
+    for files in ({'package.json': json.dumps({'scripts': {'e2e': command}})}, {WORKFLOW: workflow(run=command)}, {'ci-local.sh': command + '\n'}):
+        assert policy_rules(files) == expected
+
+
+def test_pytest_j_is_not_a_worker_flag():
+    assert policy_rules({WORKFLOW: workflow(run='pytest -j 8')}) == []
+
+
+INHERIT = ['PYTEST_ADDOPTS: -n auto']
+
+
+@pytest.mark.parametrize('name,files,expected', [
+    ('remote-action-after-override', {WORKFLOW: workflow(job_env=INHERIT, run='pytest -n 2 tests/unit', extra_steps='      - uses: org/pytest-action@0123456789abcdef0123456789abcdef01234567\n')}, CAP),
+    ('remote-action-alone', {WORKFLOW: workflow(job_env=INHERIT, run='echo hi', extra_steps='      - uses: org/pytest-action@0123456789abcdef0123456789abcdef01234567\n')}, CAP),
+    ('workflow-env-remote-action-after-override', {WORKFLOW: workflow(env=INHERIT, run='pytest -n 2', extra_steps='      - uses: org/pytest-action@v1\n')}, CAP),
+    ('remote-action-after-clear', {WORKFLOW: workflow(job_env=INHERIT, run='unset PYTEST_ADDOPTS', extra_steps='      - uses: org/pytest-action@v1\n')}, []),
+    ('remote-action-own-env-clear', {WORKFLOW: workflow(job_env=INHERIT, run='pytest -n 2', extra_steps='      - uses: org/pytest-action@v1\n        env:\n          PYTEST_ADDOPTS: ""\n')}, []),
+    ('checkout-after-override', {WORKFLOW: workflow(job_env=INHERIT, run='pytest -n 2', extra_steps='      - uses: actions/checkout@v4\n')}, []),
+    ('setup-python-cache-artifacts', {WORKFLOW: workflow(job_env=INHERIT, run='pytest -n 2', extra_steps='      - uses: actions/setup-python@v5\n      - uses: actions/cache@v4\n      - uses: actions/upload-artifact@v4\n      - uses: actions/download-artifact@v4\n      - uses: astral-sh/setup-uv@v5\n')}, []),
+    ('no-env-remote-action', {WORKFLOW: workflow(run='pytest -n 2', extra_steps='      - uses: org/pytest-action@v1\n')}, []),
+], ids=lambda value: value if isinstance(value, str) else None)
+def test_inherited_pytest_addopts_reaches_every_remote_action_step(name, files, expected):
+    assert policy_rules(files) == expected
+
+
+def test_test_runner_names_are_not_runner_labels():
+    for key in ['test_runner', 'test-runner', 'e2e_runners']:
+        call = f'on: pull_request\njobs:\n  call:\n    uses: org/shared/.github/workflows/test.yml@main\n    with:\n      {key}: vitest\n'
+        assert policy_rules({WORKFLOW: call}) == []
+
+
 def test_policy_files_include_pytest_config():
     for name in ['pytest.ini', '.pytest.ini', 'tox.ini', 'setup.cfg', 'pyproject.toml', 'sub/pyproject.toml']:
         assert lint.policy_path(name), name
