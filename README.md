@@ -245,6 +245,12 @@ and head's gate-guard report through the GitHub API. It requires:
   guard's check to appear and complete, because both start on the same event.
   A check still missing or pending after that, or an unreadable report, fails
   closed with a rerun instruction; it never counts as passing.
+  Known limits: until the guard posts its new in-progress check for a re-judge
+  of the same head (for example after the base branch changes), the lint reads
+  the previous completed check on that head; the owner's later `labeled` event
+  reruns it against the new report. On a runner pool of one, the wait holds the
+  only runner the guard needs, so the check cannot appear and the lint fails
+  closed after the wait.
   **`gate-guard-target.yml` is required**: only its check run is named exactly
   `gate-guard`. The `pull_request` flavour (`gate-guard.yml`) reports
   `gate-guard / gate-guard` and writes no check output, and a repository with no
