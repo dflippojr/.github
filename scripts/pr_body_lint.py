@@ -46,22 +46,32 @@ def section(body, title, level):
 
 
 def cells(line):
-    return [c.strip() for c in re.split(r"(?<!\\)\|", line.strip().strip("|"))]
+    values = re.split(r"(?<!\\)\|", line.strip())
+    # Remove at most one outer pipe on each side, retaining empty cells and
+    # escaped pipes (including an escaped pipe at the end of the row).
+    if len(values) > 1 and not values[0]:
+        values = values[1:]
+    if len(values) > 1 and not values[-1]:
+        values = values[:-1]
+    return [c.strip() for c in values]
 
 
 def has_table(text):
     lines = (text or "").splitlines()
     for i in range(1, len(lines) - 1):
-        header, delimiter = cells(lines[i - 1]), cells(lines[i])
-        if len(header) < 2 or len(header) != len(delimiter):
+        # Without a pipe this could be a Setext heading rather than a table.
+        if "|" not in lines[i - 1] + lines[i]:
             continue
-        if not all(re.fullmatch(r":?-{3,}:?", c) for c in delimiter):
+        header, delimiter = cells(lines[i - 1]), cells(lines[i])
+        if len(header) != len(delimiter):
+            continue
+        if not all(re.fullmatch(r":?-+:?", c) for c in delimiter):
             continue
         for row in lines[i + 1:]:
-            if "|" not in row:
+            if not row.strip() or re.match(r"^ {0,3}(?:#{1,6}(?:\s|$)|>|(?:[-+*]|\d+[.)])\s)", row):
                 break
-            values = cells(row)
-            if len(values) == len(header) and any(values):
+            # GFM pads short rows and ignores cells beyond the header width.
+            if any(cells(row)[:len(header)]):
                 return True
     return False
 
