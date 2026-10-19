@@ -467,6 +467,27 @@ def test_setup_named_actions_are_not_neutral_unless_listed(uses):
     assert policy_rules(files) == CAP
 
 
+ENV_8 = ['PYTEST_ADDOPTS: -n 8']
+OWN_AUTO = '        env:\n          PYTEST_ADDOPTS: -n auto\n'
+
+
+@pytest.mark.parametrize('name,files,expected', [
+    # A with: value that names a test tool must not stand in for the command that runs the tests.
+    ('retry-playwright-install-beside-tox', {WORKFLOW: workflow(job_env=ENV_8, run='echo hi', extra_steps=action_step(RETRY, command='tox -e py', on_retry_command='npx playwright install --with-deps'))}, CAP),
+    ('retry-step-env-playwright-install-beside-make', {WORKFLOW: workflow(run='echo hi', extra_steps='      - uses: ' + RETRY + '\n' + OWN_AUTO + '        with:\n          command: make test\n          on_retry_command: npx playwright install\n')}, CAP),
+    ('xvfb-working-directory-names-playwright', {WORKFLOW: workflow(job_env=INHERIT, run='echo hi', extra_steps=action_step(XVFB, run='npm test', **{'working-directory': 'e2e/playwright'}))}, CAP),
+    ('xvfb-without-tool-name-in-with', {WORKFLOW: workflow(job_env=INHERIT, run='echo hi', extra_steps=action_step(XVFB, run='npm test'))}, CAP),
+    ('local-action-input-names-pytest', {WORKFLOW: workflow(job_env=INHERIT, run='echo hi', extra_steps=action_step('./.github/actions/test', suite='pytest-unit'))}, CAP),
+    ('step-env-and-unrelated-with-value', {WORKFLOW: workflow(run='echo hi', extra_steps='      - uses: ' + XVFB + '\n' + OWN_AUTO + '        with:\n          run: make test\n          working-directory: playwright\n')}, CAP),
+    # Still allowed: the command overrides the value, or nothing inherits one.
+    ('retry-override-beside-playwright-install', {WORKFLOW: workflow(job_env=ENV_8, run='echo hi', extra_steps=action_step(RETRY, command='pytest -n 2', on_retry_command='npx playwright install'))}, []),
+    ('retry-only-playwright-install-no-env', {WORKFLOW: workflow(run='echo hi', extra_steps=action_step(RETRY, command='tox -e py', on_retry_command='npx playwright install'))}, []),
+    ('ruby-setup-is-neutral', {WORKFLOW: workflow(job_env=INHERIT, run='pytest -n 2', extra_steps=action_step('ruby/setup-ruby@v1', **{'ruby-version': '3.3'}))}, []),
+], ids=lambda value: value if isinstance(value, str) else None)
+def test_with_values_that_name_a_test_tool_do_not_hide_the_effective_pytest_addopts(name, files, expected):
+    assert policy_rules(files) == expected
+
+
 def test_policy_files_include_pytest_config():
     for name in ['pytest.ini', '.pytest.ini', 'tox.ini', 'setup.cfg', 'pyproject.toml', 'sub/pyproject.toml']:
         assert lint.policy_path(name), name
