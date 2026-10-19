@@ -51,6 +51,20 @@ def main():
         assert '"rule": "github-pat"' in output.getvalue()
         assert '"rule": "personal-identifier"' in output.getvalue()
         print("PASS: real gitleaks + identifier CLI fails with redacted file/line/rule only")
+        commit(repo, "keys/" + key + ".txt", "token=" + key + "\n")
+        card = "4111" + "1111" * 3
+        commit(repo, "tests/fixtures/" + card + ".csv", "# SYNTHETIC\n" + card + "\n")
+        for mode in ("--financial", "--financial-only"):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                result = scan.main(["--repo-dir", str(repo), "--base", base, "--gitleaks", executable, mode])
+            assert result == 1
+            assert key not in output.getvalue() and card not in output.getvalue()
+            assert '"rule": "luhn-number"' in output.getvalue()
+            assert "redacted-path:" in output.getvalue()
+            if mode == "--financial":
+                assert '"rule": "github-pat"' in output.getvalue()
+        print("PASS: real gitleaks and both financial modes keep sensitive filenames opaque")
 
 
 if __name__ == "__main__":

@@ -38,7 +38,9 @@ write the hashes directly to a private file for secret upload. Do not pass raw
 identifiers on a command line or print them. Delete that private file afterward.
 
 The scanner extracts complete words, addresses, hostnames, path components and
-every path prefix, so a directory match also flags files below it. It also flags
+every path prefix, so a directory match also flags files below it. Mailboxes are
+also extracted independently of URI schemes, including Markdown/HTML `mailto:`
+links, without dropping whole-path or hostname candidates. It also flags
 all `*.ts.net` names, RFC1918 IPv4 and IPv6 ULA addresses without an inventory.
 Documentation IP ranges and localhost are allowed. This is token matching,
 not arbitrary substring matching: encodings other than normalization above,
@@ -52,7 +54,9 @@ secret to untrusted code. Caller pin changes need normal gate review.
 ## Commit scope and redaction
 
 The scanner fetches the PR's base and head into a temporary bare Git repository,
-finds their merge base, and runs gitleaks across `merge-base..head`. Personal
+finds their merge base, and runs gitleaks across `merge-base..head` with
+`--diff-merges=first-parent`. Merge-result patches are included while all side
+commits remain traversed, including secrets removed before a merge. Personal
 identifiers are checked on added lines in each commit in the same range,
 including intermediate commits whose content was later removed. Added or
 changed file paths are also checked. Merge commits are conservatively compared
@@ -69,8 +73,11 @@ environment, never a command-line argument or saved credential.
 Gitleaks stdout/stderr and its temporary report are never logged or uploaded.
 The report is generated with full redaction and deleted when scanning finishes.
 Only JSON-escaped **file, line and rule** are emitted, followed by a finding
-count. Paths containing denied identifiers are replaced by a stable SHA-256
-path reference, so a private hostname in a filename is not leaked. Errors
+count. Every file field is a stable `<redacted-path:SHA256>` reference computed
+from the UTF-8 repository-relative path, including in financial-only mode. Raw
+filenames are never printed: they can contain identifiers, API keys or financial
+numbers independently of their contents. To locate a finding, compare path hashes
+privately in a trusted checkout; do not publish that mapping. Errors
 produce a generic incomplete-scan failure, never raw exception
 or subprocess output. Exit codes: 0 clean, 1 findings, 2 incomplete/error.
 Text diffs are covered; binary/encrypted containers and arbitrary encodings

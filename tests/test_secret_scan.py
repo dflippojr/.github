@@ -201,7 +201,7 @@ def test_gitleaks_log_options_cover_merge_results_and_side_commits(repo, monkeyp
     # Neither parent contains the merge-only value in its tree or history.
     for parent in ("HEAD^1", "HEAD^2"):
         assert merge_key not in git(repo, "log", "-p", base + ".." + parent)
-        assert merge_key not in git(repo, "show", parent + ":side-only.txt") if parent == "HEAD^2" else True
+        assert "merge-only.txt" not in git(repo, "ls-tree", "-r", "--name-only", parent)
     original = scan.subprocess.run
     options = []
 
