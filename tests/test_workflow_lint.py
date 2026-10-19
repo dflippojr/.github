@@ -96,6 +96,80 @@ def test_script_command_literals(filename, content):
     assert lint.lint_files({filename: content}, 'a/b', 'public', CONFIG, TODAY)[0]['rule'] == 'parallelism-cap'
 
 
+def workflow(env=(), job_env=(), step_env=(), run='python -m pytest -q', extra_steps=''):
+    """A one-job workflow with optional workflow, job and step level env blocks."""
+    lines = ['on: pull_request']
+    if env:
+        lines += ['env:'] + [f'  {item}' for item in env]
+    lines += ['jobs:', '  test:', '    runs-on: ubuntu-latest']
+    if job_env:
+        lines += ['    env:'] + [f'      {item}' for item in job_env]
+    lines.append('    steps:')
+    if step_env:
+        lines += ['      - env:'] + [f'          {item}' for item in step_env] + ['        run: ' + json.dumps(run)]
+    else:
+        lines.append('      - run: ' + json.dumps(run))
+    return '\n'.join(lines) + '\n' + extra_steps
+
+
+def policy_rules(files):
+    findings = lint.lint_files(files, 'a/b', 'public', CONFIG, TODAY)
+    return sorted({(item['severity'], item['rule']) for item in findings})
+
+
+CAP = [('error', 'parallelism-cap')]
+WORKFLOW = '.github/workflows/ci.yml'
+INI = '[pytest]\naddopts = '
+
+
+@pytest.mark.parametrize('name,files,expected', [
+    ('workflow-env-auto', {WORKFLOW: workflow(env=['PYTEST_ADDOPTS: -n auto'])}, CAP),
+    ('job-env-8', {WORKFLOW: workflow(job_env=['PYTEST_ADDOPTS: -n 8'])}, CAP),
+    ('step-env-auto', {WORKFLOW: workflow(step_env=['PYTEST_ADDOPTS: "-n auto"'])}, CAP),
+    ('step-env-long-flag', {WORKFLOW: workflow(step_env=['PYTEST_ADDOPTS: --numprocesses=8'])}, CAP),
+    ('step-env-lowercase-name', {WORKFLOW: workflow(step_env=['pytest_addopts: -n8'])}, CAP),
+    ('step-env-4-allowed', {WORKFLOW: workflow(step_env=['PYTEST_ADDOPTS: -n 4'])}, []),
+    ('step-env-unrelated-options', {WORKFLOW: workflow(step_env=['PYTEST_ADDOPTS: -q --maxfail=1'])}, []),
+    ('step-env-cleared', {WORKFLOW: workflow(env=['PYTEST_ADDOPTS: -n auto'], step_env=['PYTEST_ADDOPTS: ""'])}, []),
+    ('command-line-override-allows', {WORKFLOW: workflow(env=['PYTEST_ADDOPTS: -n auto'], run='python -m pytest -n 2')}, []),
+    ('command-line-override-cannot-raise', {WORKFLOW: workflow(env=['PYTEST_ADDOPTS: -n 2'], run='python -m pytest -n 8')}, CAP),
+    ('step-env-dynamic', {WORKFLOW: workflow(step_env=['PYTEST_ADDOPTS: "${{ vars.PYTEST_OPTS }}"'])}, [('warning', 'dynamic-parallelism')]),
+    ('step-env-on-action-step', {WORKFLOW: 'on: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: ./.github/actions/test\n        env:\n          PYTEST_ADDOPTS: -n auto\n'}, CAP),
+    ('inline-assignment-in-run', {WORKFLOW: workflow(run="PYTEST_ADDOPTS='-n auto' python -m pytest")}, CAP),
+    ('inline-assignment-4-allowed', {WORKFLOW: workflow(run="PYTEST_ADDOPTS='-n 4' python -m pytest")}, []),
+    ('env-command', {WORKFLOW: workflow(run='env PYTEST_ADDOPTS="-n 12" pytest')}, CAP),
+    ('export-then-pytest', {WORKFLOW: workflow(run='export PYTEST_ADDOPTS="-n auto"\npytest')}, CAP),
+    ('export-then-other-runner', {WORKFLOW: workflow(run='export PYTEST_ADDOPTS="-n auto"\nmake test')}, CAP),
+    ('github-env-carries-to-next-step', {WORKFLOW: workflow(run='echo "PYTEST_ADDOPTS=-n 16" >> "$GITHUB_ENV"', extra_steps='      - run: python -m pytest\n')}, CAP),
+    ('unset-clears', {WORKFLOW: workflow(env=['PYTEST_ADDOPTS: -n auto'], run='unset PYTEST_ADDOPTS\npytest')}, []),
+    ('powershell-env', {WORKFLOW: workflow(run='$env:PYTEST_ADDOPTS = "-n auto"\npytest')}, CAP),
+    ('cmd-set', {WORKFLOW: workflow(run='set PYTEST_ADDOPTS=-n auto\npytest')}, CAP),
+    ('package-script', {'package.json': json.dumps({'scripts': {'test': "PYTEST_ADDOPTS='-n auto' pytest"}})}, CAP),
+    ('package-script-cross-env', {'package.json': json.dumps({'scripts': {'test': 'cross-env PYTEST_ADDOPTS=-n8 pytest'}})}, CAP),
+    ('ci-local-shell', {'ci-local.sh': "PYTEST_ADDOPTS='-n auto' pytest\n"}, CAP),
+    ('ci-local-python-env-dict', {'ci-local.py': "subprocess.run(['pytest'], env={**os.environ, 'PYTEST_ADDOPTS': '-n auto'})"}, CAP),
+    ('ci-local-python-environ', {'ci-local.py': "os.environ['PYTEST_ADDOPTS'] = '-n 8'"}, CAP),
+    ('ci-local-js-env', {'ci-local.mjs': "execSync('pytest', {env: {...process.env, PYTEST_ADDOPTS: '-n auto'}});"}, CAP),
+    ('ci-local-python-4-allowed', {'ci-local.py': "os.environ['PYTEST_ADDOPTS'] = '-n 4'"}, []),
+    ('pytest-ini', {'pytest.ini': INI + '-q -n auto\n'}, CAP),
+    ('pytest-ini-multiline', {'pytest.ini': INI + '\n    -q\n    --numprocesses=8\n'}, CAP),
+    ('pytest-ini-4-allowed', {'pytest.ini': INI + '-n 4\n'}, []),
+    ('tox-ini', {'tox.ini': INI + '-n logical\n[testenv]\ncommands = pytest\n'}, CAP),
+    ('setup-cfg', {'setup.cfg': '[tool:pytest]\naddopts = -n 50%\n'}, CAP),
+    ('pyproject-string', {'pyproject.toml': '[tool.pytest.ini_options]\naddopts = "-ra -n auto"\n'}, CAP),
+    ('pyproject-list', {'pyproject.toml': '[tool.pytest.ini_options]\naddopts = ["-ra", "-n", "9"]\n'}, CAP),
+    ('pyproject-unrelated-section', {'pyproject.toml': '[tool.other]\naddopts = "-n auto"\n'}, []),
+    ('hidden-pytest-ini', {'.pytest.ini': INI + '-n auto\n'}, CAP),
+], ids=lambda value: value if isinstance(value, str) else None)
+def test_pytest_environment_and_config_caps(name, files, expected):
+    assert policy_rules(files) == expected
+
+
+def test_policy_files_include_pytest_config():
+    for name in ['pytest.ini', '.pytest.ini', 'tox.ini', 'setup.cfg', 'pyproject.toml', 'sub/pyproject.toml']:
+        assert lint.policy_path(name), name
+
+
 def test_git_tree_does_not_read_symlinks(tmp_path):
     # A tree object with a symlink needs no platform symlink privileges.
     lint.git(tmp_path, 'init', '--bare', '--template=')
