@@ -1,0 +1,59 @@
+name: PR body lint
+
+# pull_request_target callers load this workflow and the pinned lint script
+# from trusted commits. PR bodies, labels and filenames are API data only;
+# no PR checkout, dependency file, hook or other PR code is used.
+on:
+  workflow_call:
+    inputs:
+      lint-ref:
+        description: Full commit SHA of dflippojr/.github; match the caller's uses pin.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+  # Read the head's gate-guard check in private repos; never post checks.
+  checks: read
+
+jobs:
+  pr-body:
+    name: pr-body
+    # API-only, so it never takes the single tower runner that gate-guard
+    # needs; private callers get a GitHub-hosted runner too.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require the trusted event and a full script pin
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          LINT_REF: ${{ inputs.lint-ref }}
+        run: |
+          if [ "$EVENT_NAME" != pull_request_target ]; then
+            echo '::error::Call pr-body-lint from pull_request_target.'
+            exit 1
+          fi
+          if ! printf '%s' "$LINT_REF" | grep -Eqx '[0-9a-f]{40}'; then
+            echo '::error::lint-ref must be a full 40-character commit SHA.'
+            exit 1
+          fi
+
+      - name: Load the trusted lint script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dflippojr/.github
+          ref: ${{ inputs.lint-ref }}
+          path: pr-body-lint
+          persist-credentials: false
+          sparse-checkout: scripts/pr_body_lint.py
+          sparse-checkout-cone-mode: false
+
+      - name: Install YAML reader
+        run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.3
+
+      - name: Check PR proof
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 pr-body-lint/scripts/pr_body_lint.py

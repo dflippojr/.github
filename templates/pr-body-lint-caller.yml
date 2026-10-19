@@ -1,0 +1,27 @@
+# Copy to .github/workflows/pr-body-lint.yml on the caller's default branch.
+# Replace BOTH <full-sha> placeholders with the same full commit SHA of
+# dflippojr/.github main. Never point lint-ref at the PR's head.
+name: PR body lint
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, labeled, unlabeled, assigned, unassigned]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+  # Read the head's gate-guard check in private repos; never post checks.
+  checks: read
+
+concurrency:
+  group: pr-body-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-body:
+    uses: dflippojr/.github/.github/workflows/pr-body-lint.yml@<full-sha>
+    with:
+      lint-ref: <full-sha>
+      # No runs-on: pr-body only calls the API and always runs on
+      # ubuntu-latest, even in private repositories.
