@@ -12,6 +12,7 @@
 {"file": "tests/huntington_fixtures.py", "line": 10, "rule": "account-like-number"}
 {"file": "tests/huntington_fixtures.py", "line": 14, "rule": "account-like-number"}
 {"file": "tests/huntington_fixtures.py", "line": 15, "rule": "account-like-number"}
+{"file": "tests/properties/strategies.py", "line": 125, "rule": "aba-routing-number"}
 {"file": "tests/test_audit.py", "line": 431, "rule": "account-like-number"}
 {"file": "tests/test_background.py", "line": 151, "rule": "account-like-number"}
 {"file": "tests/test_background.py", "line": 160, "rule": "account-like-number"}
@@ -59,6 +60,7 @@
 {"file": "tests/test_ofx_import.py", "line": 42, "rule": "account-like-number"}
 {"file": "tests/test_ofx_import.py", "line": 173, "rule": "account-like-number"}
 {"file": "tests/test_plan_link.py", "line": 199, "rule": "account-like-number"}
+{"file": "tests/test_plan_link.py", "line": 199, "rule": "luhn-number"}
 {"file": "tests/test_provider_profiles.py", "line": 67, "rule": "account-like-number"}
 {"file": "tests/test_provider_profiles.py", "line": 101, "rule": "account-like-number"}
 {"file": "tests/test_savings_goal_import.py", "line": 84, "rule": "account-like-number"}
@@ -76,4 +78,4 @@
 {"file": "tests/test_transactions.py", "line": 333, "rule": "account-like-number"}
 {"file": "tests/test_verify_skill.py", "line": 105, "rule": "account-like-number"}
 {"file": "tests/test_verify_skill.py", "line": 106, "rule": "account-like-number"}
-secret-scan: 78 finding(s)
+secret-scan: 80 finding(s)

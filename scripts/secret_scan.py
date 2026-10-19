@@ -77,7 +77,7 @@ def identifier_rules(text, denylist):
 
 
 def luhn(number):
-    if not 13 <= len(number) <= 19 or len(set(number)) == 1:
+    if not 13 <= len(number) <= 19:
         return False
     total = 0
     for index, char in enumerate(reversed(number)):
@@ -90,7 +90,7 @@ def luhn(number):
 
 
 def aba(number):
-    if len(number) != 9 or len(set(number)) == 1:
+    if len(number) != 9:
         return False
     return sum(int(char) * (3, 7, 1)[index % 3] for index, char in enumerate(number)) % 10 == 0
 
@@ -237,6 +237,8 @@ def main(argv=None):
             if args.financial or args.financial_only:
                 findings.update(scan_financial(repo, head))
             for path, line, rule in sorted(findings):
+                if not args.financial_only and identifier_rules(path, denylist):
+                    path = "<redacted-path:" + hashlib.sha256(path.encode()).hexdigest() + ">"
                 # JSON escaping prevents file names injecting workflow commands.
                 print(json.dumps({"file": path, "line": line, "rule": rule}, ensure_ascii=True))
             print(f"secret-scan: {len(findings)} finding(s)")

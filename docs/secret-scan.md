@@ -69,7 +69,9 @@ environment, never a command-line argument or saved credential.
 Gitleaks stdout/stderr and its temporary report are never logged or uploaded.
 The report is generated with full redaction and deleted when scanning finishes.
 Only JSON-escaped **file, line and rule** are emitted, followed by a finding
-count. Errors produce a generic incomplete-scan failure, never raw exception
+count. Paths containing denied identifiers are replaced by a stable SHA-256
+path reference, so a private hostname in a filename is not leaked. Errors
+produce a generic incomplete-scan failure, never raw exception
 or subprocess output. Exit codes: 0 clean, 1 findings, 2 incomplete/error.
 Text diffs are covered; binary/encrypted containers and arbitrary encodings
 need separate inspection. This check complements push protection.
@@ -85,8 +87,8 @@ lines. Other test source files are scanned for numbers but need no marker.
 
 It reports Luhn-valid 13–19 digit runs, ABA-checksum-valid nine-digit runs,
 and any account-like run of ten or more digits. Spaces and hyphens within a
-number are supported. Repeated-digit zero values do not satisfy Luhn/ABA,
-but long runs still trigger the account rule. A marker is mandatory provenance,
+number are supported. These are checksum checks, not issuer/account validation:
+even all-zero numbers with valid checksums are flagged. A marker is mandatory provenance,
 **not an exemption**: synthetic examples with valid checksums still fail.
 An invalid Luhn checksum can still match the independent account rule.
 

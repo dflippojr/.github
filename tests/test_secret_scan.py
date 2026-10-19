@@ -45,12 +45,12 @@ def test_documentation_and_close_network_negatives(text):
     assert not scan.identifier_rules(text, set())
 
 
-@pytest.mark.parametrize("value,valid", [("4111111111111111", True), ("4111111111111112", False), ("0000000000000", False), ("411111111111", False)])
+@pytest.mark.parametrize("value,valid", [("4111111111111111", True), ("4111111111111112", False), ("0000000000000", True), ("411111111111", False)])
 def test_luhn_positives_and_near_misses(value, valid):
     assert scan.luhn(value) is valid
 
 
-@pytest.mark.parametrize("value,valid", [("021000021", True), ("021000022", False), ("000000000", False), ("02100002", False)])
+@pytest.mark.parametrize("value,valid", [("021000021", True), ("021000022", False), ("000000000", True), ("02100002", False)])
 def test_aba_positives_and_near_misses(value, valid):
     assert scan.aba(value) is valid
 
@@ -154,6 +154,17 @@ def test_cli_errors_do_not_print_subprocess_or_config_values(repo, monkeypatch, 
     output = capsys.readouterr()
     assert "private-invalid-value" not in output.err
     assert "scan incomplete" in output.err
+
+
+def test_private_identifier_in_filename_is_not_logged(repo, monkeypatch, capsys):
+    monkeypatch.setenv("SECRET_SCAN_DENYLIST_SHA256", scan.digest("fake-desktop"))
+    monkeypatch.setattr(scan, "scan_gitleaks", lambda *args: set())
+    base = git(repo, "rev-parse", "HEAD")
+    commit(repo, "fake-desktop/config.txt", "clean\n")
+    assert scan.main(["--repo-dir", str(repo), "--base", base]) == 1
+    output = capsys.readouterr().out
+    assert "fake-desktop" not in output
+    assert "redacted-path:" in output
 
 
 def test_workflow_uses_full_pins_read_only_token_and_required_secret():
