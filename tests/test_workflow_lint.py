@@ -425,6 +425,48 @@ def test_test_runner_names_are_not_runner_labels():
         assert policy_rules({WORKFLOW: call}) == []
 
 
+XVFB = 'coactions/setup-xvfb@6b00cf1889f4e1d5a48635647013c0508128ee1a'
+RETRY = 'nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60'
+
+
+def action_step(uses, **inputs):
+    lines = [f'      - uses: {uses}']
+    if inputs:
+        lines += ['        with:'] + [f'          {key}: {json.dumps(value)}' for key, value in inputs.items()]
+    return '\n'.join(lines) + '\n'
+
+
+@pytest.mark.parametrize('name,files,expected', [
+    # Commands handed to an action through with: are test commands too.
+    ('xvfb-inherited-addopts', {WORKFLOW: workflow(job_env=INHERIT, run='echo hi', extra_steps=action_step(XVFB, run='pytest tests'))}, CAP),
+    ('xvfb-inherited-addopts-after-override', {WORKFLOW: workflow(job_env=INHERIT, run='pytest -n 2', extra_steps=action_step(XVFB, run='npm run e2e'))}, CAP),
+    ('xvfb-literal-flag', {WORKFLOW: workflow(run='echo hi', extra_steps=action_step(XVFB, run='pytest -n auto'))}, CAP),
+    ('xvfb-multiline-command', {WORKFLOW: workflow(run='echo hi', extra_steps=action_step(XVFB, run='cd app\npytest -n 12 tests'))}, CAP),
+    ('retry-literal-flag', {WORKFLOW: workflow(run='echo hi', extra_steps=action_step(RETRY, command='pytest -n auto', max_attempts=3))}, CAP),
+    ('retry-playwright-workers', {WORKFLOW: workflow(run='echo hi', extra_steps=action_step(RETRY, command='npx playwright test --workers 8'))}, CAP),
+    ('retry-playwright-j', {WORKFLOW: workflow(run='echo hi', extra_steps=action_step(RETRY, command='npx playwright test -j 8'))}, CAP),
+    ('retry-addopts-in-command', {WORKFLOW: workflow(run='echo hi', extra_steps=action_step(RETRY, command="PYTEST_ADDOPTS='-n auto' pytest"))}, CAP),
+    ('local-action-literal-flag', {WORKFLOW: workflow(run='echo hi', extra_steps=action_step('./.github/actions/test', command='pytest -n 9'))}, CAP),
+    ('retry-inherited-addopts-bare-pytest', {WORKFLOW: workflow(job_env=INHERIT, run='echo hi', extra_steps=action_step(RETRY, command='pytest'))}, CAP),
+    ('retry-step-env-addopts', {WORKFLOW: workflow(run='echo hi', extra_steps='      - uses: ' + RETRY + '\n        env:\n          PYTEST_ADDOPTS: -n auto\n        with:\n          command: pytest\n')}, CAP),
+    # Still allowed.
+    ('retry-capped-flag', {WORKFLOW: workflow(run='echo hi', extra_steps=action_step(RETRY, command='pytest -n 4'))}, []),
+    ('retry-override-of-inherited', {WORKFLOW: workflow(job_env=INHERIT, run='echo hi', extra_steps=action_step(RETRY, command='pytest -n 2'))}, []),
+    ('xvfb-playwright-capped', {WORKFLOW: workflow(run='echo hi', extra_steps=action_step(XVFB, run='npx playwright test --workers=2'))}, []),
+    ('retry-unrelated-command', {WORKFLOW: workflow(run='echo hi', extra_steps=action_step(RETRY, command='npm run lint'))}, []),
+    ('artifact-name-mentions-pytest', {WORKFLOW: workflow(job_env=INHERIT, run='pytest -n 2', extra_steps=action_step('actions/upload-artifact@v4', name='pytest-results', path='out'))}, []),
+    ('exact-neutral-setup-actions', {WORKFLOW: workflow(job_env=INHERIT, run='pytest -n 2', extra_steps=''.join(action_step(a) for a in ['actions/setup-python@v5', 'actions/setup-node@v4', 'astral-sh/setup-uv@v5']))}, []),
+], ids=lambda value: value if isinstance(value, str) else None)
+def test_commands_passed_to_actions_through_with_are_scanned(name, files, expected):
+    assert policy_rules(files) == expected
+
+
+@pytest.mark.parametrize('uses', ['coactions/setup-xvfb@v1', 'someone/setup-anything@v1', 'org/setup-tests@v2'])
+def test_setup_named_actions_are_not_neutral_unless_listed(uses):
+    files = {WORKFLOW: workflow(job_env=INHERIT, run='pytest -n 2', extra_steps=action_step(uses))}
+    assert policy_rules(files) == CAP
+
+
 def test_policy_files_include_pytest_config():
     for name in ['pytest.ini', '.pytest.ini', 'tox.ini', 'setup.cfg', 'pyproject.toml', 'sub/pyproject.toml']:
         assert lint.policy_path(name), name
