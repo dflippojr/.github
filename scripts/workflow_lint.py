@@ -2,6 +2,7 @@
 """Read workflow and test commands as data; never execute target repository code."""
 import argparse
 import base64
+import configparser
 import datetime
 import json
 import os
@@ -18,6 +19,9 @@ ROOT = Path(__file__).resolve().parent.parent
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 HOSTED = re.compile(r"\b(?:ubuntu|windows|macos)-(?:latest|\d[^\s'\"\],}]*)", re.I)
+PYTEST_CONFIG = {'pytest.ini', '.pytest.ini', 'tox.ini', 'setup.cfg', 'pyproject.toml', 'pytest.toml', '.pytest.toml'}
+ADDOPTS_TOKEN = re.compile(r'PYTEST_ADDOPTS=(.*)\Z', re.I | re.S)
+ADDOPTS_LITERAL = re.compile(r"""PYTEST_ADDOPTS["'`\]]*\s*[:=,)]\s*(["'`])((?:\\.|(?!\1).)*)\1""", re.I | re.S)
 CI_SWITCH = re.compile(r"^\s*\$\{\{\s*fromJSON\(\s*vars\.CI_RUNS_ON\s*\|\|\s*'[^']+'\s*\)\s*}}\s*$", re.I)
 
 
@@ -27,7 +31,8 @@ def workflow_path(name):
 
 
 def policy_path(name):
-    return workflow_path(name) or PurePosixPath(name).name.startswith('ci-local') or PurePosixPath(name).name == 'package.json'
+    base = PurePosixPath(name).name
+    return workflow_path(name) or base.startswith('ci-local') or base == 'package.json' or base in PYTEST_CONFIG
 
 
 def strings(value):
@@ -116,30 +121,17 @@ def runner_findings(filename, document, repository, visibility, config, today):
     return results
 
 
-def parallelism_findings(filename, command):
-    """Recognize literal CLI caps, scoped to pytest or Playwright invocations."""
-    results = []
-    # Shell, cmd and PowerShell line continuations.
-    command = re.sub(r'(?:\\|`|\^)\r?\n', ' ', command)
-    try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|\n')
-        lexer.whitespace = ' \t\r'
-        lexer.whitespace_split = True
-        tokens = list(lexer)
-    except ValueError:
-        return [finding('warning', 'unparsed-command', filename, 'Could not tokenize command; inspect manually')]
-    tool = None
+def is_pytest(token):
+    return token in {'pytest', 'pytest.exe', 'py.test'} or token.endswith('/pytest')
+
+
+def is_playwright(token):
+    return token in {'playwright', 'playwright.exe'} or token.endswith('/playwright')
+
+
+def worker_flags(tool, tokens):
+    """Yield (flag, value) for each literal worker-count option in an argument list."""
     for index, token in enumerate(tokens):
-        if token and all(c in ';&|\n' for c in token):
-            tool = None
-            continue
-        if token in {'pytest', 'pytest.exe', 'py.test'} or token.endswith('/pytest'):
-            tool = 'pytest'
-        elif token in {'playwright', 'playwright.exe'} or token.endswith('/playwright'):
-            tool = 'playwright'
-        if tool is None:
-            continue
-        value = None
         if tool == 'pytest':
             match = re.fullmatch(r'(?:-n|--numprocesses)(?:=?(.+))?', token)
         else:
@@ -148,14 +140,159 @@ def parallelism_findings(filename, command):
             value = match.group(1)
             if value is None and index + 1 < len(tokens):
                 value = tokens[index + 1]
-        if value is None:
-            continue
-        invalid = value.lower() in {'auto', 'logical'} or (value.isdigit() and int(value) > 4) or bool(re.fullmatch(r'\d+%', value))
-        if invalid:
-            results.append(finding('error', 'parallelism-cap', filename, f'{tool} {token} {value}: maximum is 4 workers (use a fixed count)'))
-        elif not value.isdigit():
-            results.append(finding('warning', 'dynamic-parallelism', filename, f'{tool}: cannot verify worker count {value!r}'))
+            if value is not None:
+                yield token, value
+
+
+def worker_finding(filename, label, token, value):
+    invalid = value.lower() in {'auto', 'logical'} or (value.isdigit() and int(value) > 4) or bool(re.fullmatch(r'\d+%', value))
+    if invalid:
+        return finding('error', 'parallelism-cap', filename, f'{label} {token} {value}: maximum is 4 workers (use a fixed count)')
+    if not value.isdigit():
+        return finding('warning', 'dynamic-parallelism', filename, f'{label}: cannot verify worker count {value!r}')
+    return None
+
+
+def addopts_findings(filename, value):
+    """Judge a literal PYTEST_ADDOPTS or addopts value, which pytest puts before the command line."""
+    try:
+        tokens = shlex.split(value)
+    except ValueError:
+        return [finding('warning', 'unparsed-command', filename, 'Could not tokenize PYTEST_ADDOPTS; inspect manually')]
+    results = [item for item in (worker_finding(filename, 'PYTEST_ADDOPTS', token, count) for token, count in worker_flags('pytest', tokens)) if item]
+    if not results and re.search(r'\$[\w{(]', value):
+        results.append(finding('warning', 'dynamic-parallelism', filename, 'PYTEST_ADDOPTS: cannot resolve options statically'))
     return results
+
+
+def posix_env(command):
+    """Rewrite cmd.exe and PowerShell PYTEST_ADDOPTS assignments as POSIX NAME='value'."""
+    def assignment(value):
+        return "PYTEST_ADDOPTS='" + value.strip().replace("'", "'\\''") + "'"
+    command = re.sub(r'(?im)^[ \t]*set[ \t]+"?PYTEST_ADDOPTS=([^\r\n"]*)"?[ \t]*\r?$', lambda m: assignment(m.group(1)), command)
+    return re.sub(r'''(?i)\$env:PYTEST_ADDOPTS[ \t]*=[ \t]*(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([^\r\n;]*))''',
+                  lambda m: assignment(next(group for group in m.groups() if group is not None)), command)
+
+
+def scan_command(filename, command, addopts=None, local=False):
+    """Check worker caps in one command string.
+
+    addopts is the PYTEST_ADDOPTS value already in effect: pytest reads it
+    before the command line, so a worker flag on the command line replaces it.
+    Returns (findings, addopts in effect afterwards, whether an inherited,
+    non-local value was evaluated or replaced).
+    """
+    results = []
+    # Shell, cmd and PowerShell line continuations.
+    command = posix_env(re.sub(r'(?:\\|`|\^)\r?\n', ' ', command))
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|\n')
+        lexer.whitespace = ' \t\r'
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return [finding('warning', 'unparsed-command', filename, 'Could not tokenize command; inspect manually')], addopts, True
+    inherited = bool(addopts) and not local
+    resolved = not inherited
+    unchecked = bool(addopts) and local
+    segments, current = [], []
+    for token in tokens:
+        if token and all(c in ';&|\n' for c in token):
+            segments.append(current)
+            current = []
+        else:
+            current.append(token)
+    segments.append(current)
+    for segment in segments:
+        for index, token in enumerate(segment):
+            assign = ADDOPTS_TOKEN.fullmatch(token)
+            if assign or (index and segment[index - 1] == 'unset' and token.upper() == 'PYTEST_ADDOPTS'):
+                if inherited:
+                    inherited, resolved = False, True
+                addopts = assign.group(1) if assign else ''
+                unchecked = bool(addopts)
+        tools = [(index, 'pytest' if is_pytest(token) else 'playwright') for index, token in enumerate(segment) if is_pytest(token) or is_playwright(token)]
+        for position, (index, tool) in enumerate(tools):
+            end = tools[position + 1][0] if position + 1 < len(tools) else len(segment)
+            flags = list(worker_flags(tool, segment[index + 1:end]))
+            results.extend(item for item in (worker_finding(filename, tool, token, value) for token, value in flags) if item)
+            if tool == 'pytest' and addopts:
+                resolved = resolved or inherited
+                unchecked = False
+                if not flags:
+                    results.extend(addopts_findings(filename, addopts))
+    if addopts and unchecked:
+        results.extend(addopts_findings(filename, addopts))
+    return results, addopts, resolved
+
+
+def parallelism_findings(filename, command):
+    """Recognize literal caps for pytest and Playwright, including PYTEST_ADDOPTS assignments."""
+    return scan_command(filename, command)[0]
+
+
+def env_addopts(env):
+    """The literal PYTEST_ADDOPTS in an env mapping, or None. Windows variable names ignore case."""
+    if isinstance(env, dict):
+        for key, value in env.items():
+            if str(key).upper() == 'PYTEST_ADDOPTS' and value is not None:
+                return str(value)
+    return None
+
+
+def workflow_parallelism(filename, document):
+    results = []
+    workflow_env = env_addopts(document.get('env'))
+    for job in (document.get('jobs') or {}).values():
+        if not isinstance(job, dict):
+            continue
+        job_env = env_addopts(job.get('env'))
+        inherited = workflow_env if job_env is None else job_env
+        used, persisted = False, None
+        for step in job.get('steps', []):
+            if not isinstance(step, dict):
+                continue
+            own = env_addopts(step.get('env'))
+            # Step env beats a value exported through GITHUB_ENV, which beats job and workflow env.
+            effective = next((value for value in (own, persisted, inherited) if value is not None), None)
+            used = used or own is not None
+            if isinstance(step.get('run'), str):
+                found, after, resolved = scan_command(filename, step['run'], effective, local=own is not None)
+                results.extend(found)
+                used = used or (resolved and own is None and persisted is None)
+                if 'GITHUB_ENV' in step['run'].upper():
+                    persisted = after
+            elif own:
+                results.extend(addopts_findings(filename, own))
+        if inherited and not used:
+            results.extend(addopts_findings(filename, inherited))
+    return results
+
+
+def pytest_config_findings(filename, content):
+    """Read addopts from pytest configuration as data."""
+    base = PurePosixPath(filename).name
+    values = []
+    if base.endswith('.toml'):
+        headers = r'tool\.pytest(?:\.ini_options)?' if base == 'pyproject.toml' else 'pytest'
+        for table in re.finditer(r'(?ms)^\[' + headers + r'\][ \t]*(?:#[^\n]*)?\n(.*?)(?=^\[|\Z)', content):
+            option = re.search(r'''(?ms)^addopts[ \t]*=[ \t]*(\[.*?\]|""".*?"""|\'\'\'.*?\'\'\'|"(?:[^"\\\n]|\\.)*"|'[^'\n]*')''', table.group(1))
+            if option:
+                text = option.group(1)
+                if text[:3] in {'"""', "'''"}:
+                    values.append(text[3:-3])
+                elif text[0] in '"\'':
+                    values.append(text[1:-1])
+                else:
+                    values.append(' '.join(a or b for a, b in re.findall(r'"((?:[^"\\]|\\.)*)"|\'([^\']*)\'', text)))
+    else:
+        parser = configparser.RawConfigParser(strict=False)
+        try:
+            parser.read_string(content)
+        except configparser.Error:
+            return []  # Not a readable INI file, so pytest cannot take options from it either.
+        values = [parser.get(section, 'addopts') for section in ('pytest', 'tool:pytest') if parser.has_option(section, 'addopts')]
+    return [item for value in values for item in addopts_findings(filename, value)]
 
 
 def script_findings(filename, content):
@@ -167,6 +304,9 @@ def script_findings(filename, content):
             literal = match.group(2)
             if re.search(r'\b(?:pytest|playwright)\b', literal):
                 results.extend(parallelism_findings(filename, literal))
+        # Environment mappings assign the options in a separate literal.
+        for match in ADDOPTS_LITERAL.finditer(content):
+            results.extend(addopts_findings(filename, match.group(2)))
         return results
     return parallelism_findings(filename, content)
 
@@ -181,21 +321,19 @@ def lint_files(files, repository, visibility, config, today=None):
                 if not isinstance(document, dict):
                     raise ValueError('Workflow must be a mapping')
                 results.extend(runner_findings(filename, document, repository, visibility, config, today))
-                for job in (document.get('jobs') or {}).values():
-                    if not isinstance(job, dict):
-                        continue
-                    for step in job.get('steps', []):
-                        if isinstance(step, dict) and isinstance(step.get('run'), str):
-                            results.extend(parallelism_findings(filename, step['run']))
+                results.extend(workflow_parallelism(filename, document))
             elif PurePosixPath(filename).name == 'package.json':
                 for script in json.loads(content).get('scripts', {}).values():
                     if isinstance(script, str):
                         results.extend(parallelism_findings(filename, script))
             elif PurePosixPath(filename).name.startswith('ci-local'):
                 results.extend(script_findings(filename, content))
+            elif PurePosixPath(filename).name in PYTEST_CONFIG:
+                results.extend(pytest_config_findings(filename, content))
         except (yaml.YAMLError, ValueError, TypeError, AttributeError) as error:
             results.append(finding('error', 'invalid-file', filename, str(error)))
-    return results
+    # The same literal can be reachable from several steps or scopes.
+    return [item for index, item in enumerate(results) if item not in results[:index]]
 
 
 def api(endpoint):

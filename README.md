@@ -232,6 +232,13 @@ depth, and `package.json` scripts are checked for pytest `-n`/`--numprocesses`
 and Playwright `--workers`. Literal counts above four, pytest `auto`/`logical`,
 and percentage counts fail. Two and four are allowed. Dynamic counts warn;
 the check does not interpret arbitrary shell logic, wrappers or computed flags.
+Options that pytest reads before the command line count too: a literal
+`PYTEST_ADDOPTS` in workflow, job or step `env`, or assigned in a `run` step, a
+package script, a `ci-local` shell or Python/JS launcher (including `export`,
+`env`, `$env:`, `set` and `$GITHUB_ENV`), and `addopts` in `pytest.ini`,
+`.pytest.ini`, `tox.ini`, `setup.cfg`, `pyproject.toml` and `pytest.toml`. A worker
+flag on the same pytest command line replaces the environment value, so it is
+judged instead. A value that depends on an expression or variable warns.
 Only `run` steps and package scripts are commands; comments and dependencies
 are not. This checks the whole head tree so an unchanged unsafe setting remains
 visible when another file changes.
@@ -240,7 +247,9 @@ Actionlint checks only added or modified PR workflows, relative to the API's
 merge base; deleted workflows and PRs with no workflow changes do not invoke it.
 Actionlint's source is pinned to a full commit SHA, as are all actions. A fresh
 temporary directory and trusted `config/actionlint.yaml` prevent PR config from
-suppressing diagnostics. Custom runner names are accepted by actionlint and
+suppressing diagnostics. The directory holds an empty `.git` marker and every head
+workflow, so local reusable calls resolve and a missing callee, a missing required
+input or an undefined input is reported; only the changed workflows are linted. Custom runner names are accepted by actionlint and
 judged by our visibility rules. ShellCheck and Pyflakes subprocesses are disabled.
 Target files are read from a shallow bare git repository, without checkout,
 hooks, submodules, symlink traversal, dependency installation or target execution.

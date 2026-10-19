@@ -144,6 +144,7 @@ INI = '[pytest]\naddopts = '
     ('unset-clears', {WORKFLOW: workflow(env=['PYTEST_ADDOPTS: -n auto'], run='unset PYTEST_ADDOPTS\npytest')}, []),
     ('powershell-env', {WORKFLOW: workflow(run='$env:PYTEST_ADDOPTS = "-n auto"\npytest')}, CAP),
     ('cmd-set', {WORKFLOW: workflow(run='set PYTEST_ADDOPTS=-n auto\npytest')}, CAP),
+    ('cmd-set-crlf', {WORKFLOW: workflow(run='set PYTEST_ADDOPTS=-n 5\r\npytest')}, CAP),
     ('package-script', {'package.json': json.dumps({'scripts': {'test': "PYTEST_ADDOPTS='-n auto' pytest"}})}, CAP),
     ('package-script-cross-env', {'package.json': json.dumps({'scripts': {'test': 'cross-env PYTEST_ADDOPTS=-n8 pytest'}})}, CAP),
     ('ci-local-shell', {'ci-local.sh': "PYTEST_ADDOPTS='-n auto' pytest\n"}, CAP),
