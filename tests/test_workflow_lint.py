@@ -229,7 +229,7 @@ def reusable_call(with_lines, uses='./.github/workflows/reusable.yml'):
     '      runs-on: tower\n',
     '      runner: self-hosted\n',
     "      runner: '[\"self-hosted\"]'\n",
-    '      labels: [linux, x64]\n',
+    '      runner_labels: [linux, x64]\n',
     "      runs_on: '[\"ubuntu-latest\",\"gpu\"]'\n",
     '      pool: self-hosted\n',
     "      pool: ['Self-Hosted']\n",
@@ -245,6 +245,7 @@ def test_public_reusable_calls_reject_runner_inputs_under_any_runner_style_name(
     '      runner: ubuntu-24.04\n',
     '      name: self-hosted-docs\n',
     '      version: 3\n',
+    '      labels: [bug, docs]\n',
     '      description: run on self-hosted hardware\n',
 ])
 def test_public_reusable_calls_accept_hosted_runner_inputs_and_unrelated_values(with_lines):

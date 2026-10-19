@@ -19,6 +19,10 @@ ROOT = Path(__file__).resolve().parent.parent
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 HOSTED = re.compile(r"\b(?:ubuntu|windows|macos)-(?:latest|\d[^\s'\"\],}]*)", re.I)
+# Labels GitHub assigns to its own hosted runners. Larger-runner names are chosen
+# by the organization, so config/workflow-lint.json lists those as hosted_runner_labels.
+HOSTED_LABEL = re.compile(r'(?:ubuntu|windows|macos)-(?:latest|slim|\d[\d.]*)(?:-(?:arm|arm64|intel|large|xlarge))?', re.I)
+RUNNER_INPUT = re.compile(r'(?:[\w-]*[-_])?(?:runs?[-_]?on|runners?|runner[-_]?labels?)', re.I)
 PYTEST_CONFIG = {'pytest.ini', '.pytest.ini', 'tox.ini', 'setup.cfg', 'pyproject.toml', 'pytest.toml', '.pytest.toml'}
 ADDOPTS_TOKEN = re.compile(r'PYTEST_ADDOPTS=(.*)\Z', re.I | re.S)
 ADDOPTS_LITERAL = re.compile(r"""PYTEST_ADDOPTS["'`\]]*\s*[:=,)]\s*(["'`])((?:\\.|(?!\1).)*)\1""", re.I | re.S)
@@ -128,7 +132,50 @@ def finding(severity, rule, filename, detail):
     return dict(severity=severity, rule=rule, path=filename, detail=detail)
 
 
-def runner_findings(filename, document, repository, visibility, config, today):
+def static_labels(values):
+    """Runner labels written out in the workflow: plain strings, JSON arrays and quoted literals inside expressions."""
+    labels = set()
+    for value in values:
+        parts = re.findall(r"'((?:[^']|'')*)'", value) if '${{' in value else [value]
+        for part in parts:
+            part = part.replace("''", "'")
+            try:
+                decoded = json.loads(part)
+            except ValueError:
+                decoded = part
+            labels.update(label.strip() for label in strings(decoded) if label.strip())
+    return labels
+
+
+def hosted_label(label, config):
+    return bool(HOSTED_LABEL.fullmatch(label)) or label.lower() in {name.lower() for name in config.get('hosted_runner_labels', [])}
+
+
+def callee_runner_inputs(documents):
+    """For each workflow, the workflow_call input names its jobs use in runs-on."""
+    names = {}
+    for filename, document in documents.items():
+        jobs = document.get('jobs') if isinstance(document, dict) else None
+        used = set()
+        for job in (jobs.values() if isinstance(jobs, dict) else []):
+            if isinstance(job, dict):
+                used.update(name for value in strings(job.get('runs-on')) for name in re.findall(r'\binputs\.([\w-]+)', value))
+        names[filename] = used
+    return names
+
+
+def reusable_runner_inputs(job, repository, callee_inputs):
+    """Values a reusable-workflow call passes that can select its runner."""
+    values = job.get('with')
+    if not isinstance(job.get('uses'), str) or not isinstance(values, dict):
+        return []
+    used = (callee_inputs or {}).get(local_workflow(job['uses'], repository), set())
+    return [value for key, value in values.items()
+            if RUNNER_INPUT.fullmatch(str(key)) or str(key) in used
+            or any(label.lower() == 'self-hosted' for label in static_labels(strings(value)))]
+
+
+def runner_findings(filename, document, repository, visibility, config, today, callee_inputs=None):
     results = []
     jobs = document.get('jobs', {})
     if not isinstance(jobs, dict):
@@ -136,21 +183,21 @@ def runner_findings(filename, document, repository, visibility, config, today):
     for job_id, job in jobs.items():
         if not isinstance(job, dict):
             continue
-        runner = job.get('runs-on')
-        # Reusable review callers supply their runner as JSON inputs.
-        if runner is None and isinstance(job.get('with'), dict):
-            runner = job['with'].get('runs_on', job['with'].get('runs-on'))
-        if runner is None:
+        # Reusable review callers supply their runner as inputs.
+        subjects = [item for item in [job.get('runs-on')] + reusable_runner_inputs(job, repository, callee_inputs) if item is not None]
+        if not subjects:
             continue
-        values = runner_values(runner, job)
+        values = [value for subject in subjects for value in runner_values(subject, job)]
         text = ' '.join(values)
         self_hosted = re.search(r'(?<![\w-])self-hosted(?![\w-])', text, re.I)
-        if visibility == 'public' and self_hosted:
+        placed = sorted(label for label in static_labels(values) if not hosted_label(label, config))
+        if visibility == 'public' and (self_hosted or placed):
             if not exception_allowed(config, repository, filename, job_id, job, today, document):
-                results.append(finding('error', 'public-self-hosted', filename, f'{job_id}: self-hosted is forbidden on public repositories'))
-        elif visibility == 'private' and HOSTED.search(text) and not (isinstance(runner, str) and CI_SWITCH.fullmatch(runner)):
+                labels = ', '.join(placed or ['self-hosted'])
+                results.append(finding('error', 'public-self-hosted', filename, f'{job_id}: self-hosted is forbidden on public repositories (labels not hosted by GitHub: {labels})'))
+        elif visibility == 'private' and HOSTED.search(text) and not (len(subjects) == 1 and isinstance(subjects[0], str) and CI_SWITCH.fullmatch(subjects[0])):
             results.append(finding('warning', 'private-hosted', filename, f'{job_id}: GitHub-hosted runner without the CI_RUNS_ON switch'))
-        if '${{' in text and not self_hosted and not HOSTED.search(text):
+        if '${{' in text and not self_hosted and not placed and not HOSTED.search(text):
             results.append(finding('warning', 'dynamic-runner', filename, f'{job_id}: runner expression cannot be resolved statically'))
     return results
 
@@ -349,12 +396,20 @@ def lint_files(files, repository, visibility, config, today=None):
     today = today or datetime.datetime.now(datetime.timezone.utc).date()
     results, documents = [], {}
     for filename, content in sorted(files.items()):
+        if workflow_path(filename):
+            try:
+                documents[filename] = yaml.safe_load(content)
+            except yaml.YAMLError:
+                pass  # reported as invalid-file below
+    callee_inputs = callee_runner_inputs(documents)
+    documents = {}
+    for filename, content in sorted(files.items()):
         try:
             if workflow_path(filename):
                 document = documents[filename] = yaml.safe_load(content)
                 if not isinstance(document, dict):
                     raise ValueError('Workflow must be a mapping')
-                results.extend(runner_findings(filename, document, repository, visibility, config, today))
+                results.extend(runner_findings(filename, document, repository, visibility, config, today, callee_inputs))
                 results.extend(workflow_parallelism(filename, document))
             elif PurePosixPath(filename).name == 'package.json':
                 for script in json.loads(content).get('scripts', {}).values():
