@@ -122,7 +122,8 @@ def test_latest_gate_check_is_used_not_stale_findings():
     api.pages.return_value = [latest, old]
     assert not lint.gate_has_findings(api, "o/r", SHA)
     api.pages.return_value = []
-    assert not lint.gate_has_findings(api, "o/r", SHA)
+    with pytest.raises(ValueError, match="gate-guard.*missing"):
+        lint.gate_has_findings(api, "o/r", SHA)
 
 
 @pytest.mark.parametrize("item", [check("unknown report"), dict(check(""), status="in_progress")])
@@ -130,6 +131,17 @@ def test_pending_or_unrecognized_gate_does_not_pass(item):
     api = mock.Mock()
     api.pages.return_value = [item]
     with pytest.raises(ValueError):
+        lint.gate_has_findings(api, "o/r", SHA)
+
+
+@pytest.mark.parametrize("status", ["queued", "in_progress"])
+def test_latest_pending_gate_cannot_reuse_an_older_clean_verdict(status):
+    api = mock.Mock()
+    api.pages.return_value = [
+        check("No removed tests, skip markers, retries or gate-config edits."),
+        dict(check(""), id=2, status=status),
+    ]
+    with pytest.raises(ValueError, match="pending"):
         lint.gate_has_findings(api, "o/r", SHA)
 
 
@@ -159,7 +171,24 @@ class FakeAPI:
         if path == "/repos/o/r/pulls/7/files":
             return self.files
         assert path.startswith(f"/repos/o/r/commits/{SHA}/check-runs?"), path
-        return []
+        return [check("No removed tests, skip markers, retries or gate-config edits.")]
+
+
+def test_missing_then_approved_findings_never_pass_without_gate_explanation():
+    api = FakeAPI()
+    api.pull["body"] = GOOD.split("### Gate changes")[0]
+    original = api.pages
+    reports = iter([[], [check("| gate-config | workflow.yml | added |")]])
+
+    def ordered_checks(path, key=None):
+        return next(reports) if key == "check_runs" else original(path, key)
+
+    api.pages = ordered_checks
+    with pytest.raises(ValueError, match="gate-guard.*missing"):
+        lint.inspect_pr(api, "o/r", 7)
+    assert lint.inspect_pr(api, "o/r", 7) == [
+        "Describe the gate-guard findings under ### Gate changes.",
+    ]
 
 
 def test_inspection_reads_linked_issue_labels_and_default_branch_config():
