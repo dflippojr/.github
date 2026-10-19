@@ -163,7 +163,7 @@ def gate_has_findings(api, repo, sha):
     checks = api.pages(f"/repos/{repo}/commits/{sha}/check-runs?check_name=gate-guard&filter=latest", "check_runs")
     checks = [c for c in checks if c.get("name") == "gate-guard"]
     if not checks:
-        return False  # The caller may not have wired gate-guard yet.
+        raise ValueError("gate-guard check is missing; wire the guard and rerun pr-body after it completes")
     check = max(checks, key=lambda c: c["id"])
     if check.get("status") != "completed":
         raise ValueError("gate-guard is pending; rerun pr-body after it completes")

@@ -227,10 +227,10 @@ and head's gate-guard report through the GitHub API. It requires:
 - Assignee `dflippojr`.
 - A non-empty `### Gate changes` explanation other than `None` when the
   latest head check named `gate-guard` reports findings, including when that
-  check passed with owner approval. A pending or unreadable report fails with
-  a rerun instruction; rerun the lint after the guard completes. Without a
-  gate-guard check there are no guard findings to enforce. Wire both checks
-  and require the guard independently; this check does not approve gate edits.
+  check passed with owner approval. A missing check, pending check or unreadable
+  report fails with a rerun instruction; rerun the lint after the guard completes.
+  Wire both checks and require the guard independently; this check does not
+  approve gate edits.
 - A changed test path when any linked issue has label `bug`. A `bug` label on
   the PR itself does not substitute for the linked issue's label. Renames count
   both old and new filenames, and deleted tests count as touched paths; the
