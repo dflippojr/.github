@@ -115,7 +115,8 @@ def financial_rules(text):
 
 def git(repo, *args, env=None):
     result = subprocess.run(
-        ["git", "-C", str(repo), "-c", "core.quotePath=false", *args],
+        # Repository paths are data, including any leading pathspec magic.
+        ["git", "-C", str(repo), "-c", "core.quotePath=false", "--literal-pathspecs", *args],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, check=False,
     )
     if result.returncode:
@@ -138,7 +139,8 @@ def added_lines(repo, base, head):
         for raw_path in paths.split(b"\0"):
             if not raw_path:
                 continue
-            path = raw_path.decode("utf-8", errors="replace")
+            # Round-trip arbitrary Git path bytes for selection and opaque output.
+            path = raw_path.decode("utf-8", errors="surrogateescape")
             yield path, 1, path
             patch = git(repo, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--unified=0", parent, commit, "--", path)
             line_number = None
@@ -166,7 +168,7 @@ def requires_synthetic_header(path):
 def scan_financial(repo, head):
     findings = set()
     for raw_path in git(repo, "ls-tree", "-r", "--name-only", "-z", head).split(b"\0"):
-        path = raw_path.decode("utf-8", errors="replace")
+        path = raw_path.decode("utf-8", errors="surrogateescape")
         if not path or not fixture_path(path):
             continue
         content = git(repo, "show", f"{head}:{path}").decode("utf-8", errors="replace")
@@ -244,7 +246,7 @@ def main(argv=None):
             for path, line, rule in sorted(findings):
                 # Paths can contain any secret class, including unknown key formats.
                 # Never expose raw filenames, even in financial-only mode.
-                path = "<redacted-path:" + hashlib.sha256(path.encode()).hexdigest() + ">"
+                path = "<redacted-path:" + hashlib.sha256(path.encode("utf-8", errors="surrogateescape")).hexdigest() + ">"
                 print(json.dumps({"file": path, "line": line, "rule": rule}, ensure_ascii=True))
             print(f"secret-scan: {len(findings)} finding(s)")
             return 1 if findings else 0

@@ -5,13 +5,16 @@ No network, credentials, real identifiers or real keys are used.
 """
 
 import contextlib
+import hashlib
 import io
+import json
 import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 
-from test_secret_scan import commit, git, merge_only_history, scan
+from test_secret_scan import ROOT, commit, commit_object_file, git, merge_only_history, scan
 
 
 def main():
@@ -65,6 +68,41 @@ def main():
             if mode == "--financial":
                 assert '"rule": "github-pat"' in output.getvalue()
         print("PASS: real gitleaks and both financial modes keep sensitive filenames opaque")
+        unusual_paths = [b":!*.txt", b":(exclude)*", b":(unknown)file.txt", b":/file.txt", b"invalid-\xff.txt"]
+        for raw_path in unusual_paths:
+            for renamed in (False, True):
+                content = b"fake-desktop\n"
+                if renamed:
+                    commit_object_file(repo, b"ordinary-source.txt", content)
+                base = git(repo, "rev-parse", "HEAD")
+                commit_object_file(repo, raw_path, content)
+                result = subprocess.run([
+                    sys.executable, str(ROOT / "scripts/secret_scan.py"),
+                    "--repo-dir", str(repo), "--base", base, "--gitleaks", executable,
+                ], capture_output=True, text=True)
+                assert result.returncode == 1
+                assert "fake-desktop" not in result.stdout + result.stderr
+                rows = [json.loads(line) for line in result.stdout.splitlines()[:-1]]
+                assert rows == [{
+                    "file": "<redacted-path:" + hashlib.sha256(raw_path).hexdigest() + ">",
+                    "line": 1, "rule": "personal-identifier",
+                }]
+        print("PASS: real scanner CLI catches 10 pathspec/non-UTF-8 addition and rename cases")
+        raw_path = b"test_invalid-\xff.csv"
+        base = git(repo, "rev-parse", "HEAD")
+        commit_object_file(repo, raw_path, ("# SYNTHETIC\n" + card + "\n").encode())
+        for mode in ("--financial", "--financial-only"):
+            result = subprocess.run([
+                sys.executable, str(ROOT / "scripts/secret_scan.py"), "--repo-dir", str(repo),
+                "--base", base, "--gitleaks", executable, mode,
+            ], capture_output=True, text=True)
+            assert result.returncode == 1
+            assert card not in result.stdout + result.stderr
+            rows = [json.loads(line) for line in result.stdout.splitlines()[:-1]]
+            assert {row["rule"] for row in rows} >= {"luhn-number", "account-like-number"}
+            expected = "<redacted-path:" + hashlib.sha256(raw_path).hexdigest() + ">"
+            assert all(row["file"] == expected for row in rows)
+        print("PASS: real scanner CLI reads non-UTF-8 fixture names in both financial modes")
 
 
 if __name__ == "__main__":
