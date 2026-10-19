@@ -440,6 +440,70 @@ def test_only_a_write_to_the_exact_environment_file_changes_later_steps(name, fi
     assert policy_rules(files) == expected
 
 
+UNVERIFIED = [('warning', 'unverified-env-write')]
+CONDITIONAL_STEP = ('on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n{env}    steps:\n'
+                    '      - if: github.event_name == \'push\'\n        run: echo "PYTEST_ADDOPTS={value}" >> "$GITHUB_ENV"\n      - run: pytest\n')
+
+
+@pytest.mark.parametrize('name,files,expected', [
+    # Fail closed: a step that touches GITHUB_ENV in a form the scan cannot read keeps the earlier
+    # PYTEST_ADDOPTS for later steps and is flagged. The first three are the reviewer's repros at 4933b5b.
+    ('stderr-only-redirect', env_write('echo "PYTEST_ADDOPTS=" 2>> "$GITHUB_ENV"'), CAP + UNVERIFIED),
+    ('printf-writes-another-variable', env_write("printf 'NOTE=%s\\n' 'PYTEST_ADDOPTS=' >> \"$GITHUB_ENV\""), CAP + UNVERIFIED),
+    ('quoted-redirect-operator-is-an-argument', env_write('echo "PYTEST_ADDOPTS=" \'>>\' "$GITHUB_ENV"'), CAP),
+    ('double-quoted-redirect-operator-is-an-argument', env_write('echo PYTEST_ADDOPTS= ">>" "$GITHUB_ENV"'), CAP),
+    ('escaped-redirect-operator-is-an-argument', env_write('echo PYTEST_ADDOPTS= \\>\\> "$GITHUB_ENV"'), CAP),
+    ('other-file-descriptor', env_write('echo "PYTEST_ADDOPTS=" 3>> "$GITHUB_ENV"'), CAP + UNVERIFIED),
+    ('extra-redirection', env_write('echo "PYTEST_ADDOPTS=" >&2 >> "$GITHUB_ENV"'), CAP + UNVERIFIED),
+    ('single-quoted-target-is-a-literal-path', env_write("echo \"PYTEST_ADDOPTS=\" >> '$GITHUB_ENV'"), CAP),
+    ('lowercase-target-variable', env_write('echo "PYTEST_ADDOPTS=" >> "$github_env"'), CAP),
+    ('echo-option-changes-output', env_write('echo -n "PYTEST_ADDOPTS=" >> "$GITHUB_ENV"'), CAP + UNVERIFIED),
+    ('echo-escape-option', env_write('echo -e "X=1\\nPYTEST_ADDOPTS=" >> "$GITHUB_ENV"'), CAP + UNVERIFIED),
+    ('printf-format-prints-the-argument-elsewhere', env_write("printf 'PYTEST_ADDOPTS=-n 2 %s\\n' x >> \"$GITHUB_ENV\""), CAP + UNVERIFIED),
+    ('printf-without-newline', env_write("printf 'PYTEST_ADDOPTS=' >> \"$GITHUB_ENV\""), CAP + UNVERIFIED),
+    ('variable-in-written-text', env_write('echo "PYTEST_ADDOPTS=$OPTS" >> "$GITHUB_ENV"'), CAP + UNVERIFIED + [('warning', 'dynamic-parallelism')]),
+    ('case-variant-name', env_write('echo "pytest_addopts=" >> "$GITHUB_ENV"'), CAP + UNVERIFIED),
+    ('write-after-and', env_write('test -f skip && echo "PYTEST_ADDOPTS=" >> "$GITHUB_ENV"'), CAP + UNVERIFIED),
+    ('write-after-or', env_write('test -f keep || echo "PYTEST_ADDOPTS=" >> "$GITHUB_ENV"'), CAP + UNVERIFIED),
+    ('write-inside-if', env_write('if [ -f skip ]; then\n  echo "PYTEST_ADDOPTS=" >> "$GITHUB_ENV"\nfi'), CAP + UNVERIFIED),
+    ('write-inside-powershell-if', env_write('if (Test-Path skip) {\n  Add-Content -Path $env:GITHUB_ENV -Value "PYTEST_ADDOPTS="\n}'), CAP + UNVERIFIED),
+    ('write-in-function-body', env_write('clear_opts() {\n  echo "PYTEST_ADDOPTS=" >> "$GITHUB_ENV"\n}'), CAP + UNVERIFIED),
+    ('tee-from-here-string', env_write('tee -a "$GITHUB_ENV" <<< "PYTEST_ADDOPTS="'), CAP + UNVERIFIED),
+    # cmd's echo keeps quotes and trailing spaces, so its text is not read.
+    ('cmd-echo', env_write('echo PYTEST_ADDOPTS= >> %GITHUB_ENV%'), CAP + UNVERIFIED),
+    ('bash-pipes-a-command-not-a-string', env_write('"PYTEST_ADDOPTS=" | tee -a "$GITHUB_ENV"'), CAP + UNVERIFIED),
+    ('powershell-no-newline', env_write('"PYTEST_ADDOPTS=" | Out-File -FilePath $env:GITHUB_ENV -Append -NoNewline'), CAP + UNVERIFIED),
+    ('powershell-variable-text', env_write('Add-Content -Path $env:GITHUB_ENV -Value "PYTEST_ADDOPTS=$opts"'), CAP + UNVERIFIED + [('warning', 'dynamic-parallelism')]),
+    ('heredoc-to-github-env', env_write('cat >> "$GITHUB_ENV" <<EOF\nPYTEST_ADDOPTS=\nEOF'), CAP + UNVERIFIED),
+    ('heredoc-unsafe-value-to-github-env', env_write("cat >> \"$GITHUB_ENV\" <<'EOF'\nPYTEST_ADDOPTS=-n auto\nEOF", job_env=()), CAP + UNVERIFIED),
+    # An ambiguous write that may carry an unsafe value is judged on that value.
+    ('ambiguous-unsafe-write-is-judged', env_write('echo "PYTEST_ADDOPTS=-n 16" 3>> "$GITHUB_ENV"', job_env=()), CAP + UNVERIFIED),
+    ('ambiguous-printf-argument-is-judged', env_write("printf 'PYTEST_ADDOPTS=%s\\n' '-n auto' >> \"$GITHUB_ENV\"", job_env=()), CAP + UNVERIFIED),
+    # A step with its own if: may not run, so its write cannot clear what later steps inherit.
+    ('conditional-step-clear', {WORKFLOW: CONDITIONAL_STEP.format(env='    env:\n      PYTEST_ADDOPTS: -n auto\n', value='')}, CAP),
+    ('conditional-step-unsafe-write-is-judged', {WORKFLOW: CONDITIONAL_STEP.format(env='', value='-n 16')}, CAP),
+    # Text in a heredoc body is data for its command, never an assignment in the step's shell.
+    ('heredoc-body-is-not-an-assignment', {WORKFLOW: workflow(run=AUTO + 'cat > notes.txt <<EOF\nPYTEST_ADDOPTS=\nEOF\npytest')}, CAP),
+    ('heredoc-body-is-still-scanned', {WORKFLOW: workflow(run='bash <<EOF\npytest -n auto\nEOF')}, CAP),
+    # A recognised, unconditional write to the exact file still changes what later steps inherit.
+    ('clear-after-semicolon', env_write('echo start; echo "PYTEST_ADDOPTS=" >> "$GITHUB_ENV"'), []),
+    ('clear-after-completed-if', env_write('if [ -f x ]; then echo found; fi\necho "PYTEST_ADDOPTS=" >> "$GITHUB_ENV"'), []),
+    ('clear-with-explicit-stdout', env_write('echo "PYTEST_ADDOPTS=" 1>> "$GITHUB_ENV"'), []),
+    ('clear-unquoted-value', env_write('echo PYTEST_ADDOPTS= >> $GITHUB_ENV'), []),
+    ('clear-printf-line', env_write("printf 'PYTEST_ADDOPTS=\\n' >> \"$GITHUB_ENV\""), []),
+    ('clear-printf-argument', env_write("printf '%s\\n' 'PYTEST_ADDOPTS=' >> \"$GITHUB_ENV\""), []),
+    ('clear-tee-to-dev-null', env_write('echo "PYTEST_ADDOPTS=" | tee -a "$GITHUB_ENV" > /dev/null'), []),
+    ('clear-powershell-echo', env_write("echo 'PYTEST_ADDOPTS=' >> $env:GITHUB_ENV"), []),
+    ('clear-powershell-add-content-positional', env_write("Add-Content $env:GITHUB_ENV 'PYTEST_ADDOPTS='"), []),
+    ('safe-value-written', env_write('echo "PYTEST_ADDOPTS=-n 2" >> "$GITHUB_ENV"'), []),
+    ('unsafe-value-written-through-printf-argument', env_write("printf '%s\\n' 'PYTEST_ADDOPTS=-n 16' >> \"$GITHUB_ENV\"", job_env=()), CAP),
+    ('later-ambiguous-write-keeps-a-recognised-clear', env_write('echo "PYTEST_ADDOPTS=" >> "$GITHUB_ENV"\necho "PYTEST_ADDOPTS=$X" 2>> "$GITHUB_ENV"'),
+     UNVERIFIED + [('warning', 'dynamic-parallelism')]),
+], ids=lambda value: value if isinstance(value, str) else None)
+def test_ambiguous_environment_file_writes_fail_closed(name, files, expected):
+    assert policy_rules(files) == sorted(expected)
+
+
 @pytest.mark.parametrize('command,expected', [
     ('npx playwright test -j 8', CAP), ('npx playwright test -j8', CAP), ('playwright test -j=8', CAP), ('playwright test -j 50%', CAP),
     ('playwright test -j 100%', CAP), ('playwright test -j 5', CAP), ('playwright test --workers 5 -j 2', CAP), ('playwright test -j 2 --workers 8', CAP),
