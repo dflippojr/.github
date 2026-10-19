@@ -206,6 +206,112 @@ anything from the pull request:
 - **`gate-guard.yml` callers.** Repositories still on the `pull_request`
   version keep the old hole until they move.
 
+## PR body lint
+
+`.github/workflows/pr-body-lint.yml` supplies an Actions job named **pr-body**.
+Copy `templates/pr-body-lint-caller.yml` to the calling repository's default
+branch and replace both `<full-sha>` placeholders with the same full commit
+SHA of this repository's `main`. Require the resulting `pr-body / pr-body`
+job in the caller's ruleset. Wiring individual repositories is separate work.
+
+The caller uses `pull_request_target` on opened, edited, synchronize,
+reopened and labeled events, plus unlabeled and assignee changes. The lint
+fetches the current body, labels, assignees, linked issues, changed filenames
+and head's gate-guard report through the GitHub API. It requires:
+
+- `## Proof` (also accepts `## Proof table`) containing a Markdown table with
+  at least one non-empty data row; a blank template row does not count.
+- `### Not verified` and `Closes #N`, `Fixes #N` or `Resolves #N` (case
+  insensitive). Cross-repository references such as `Fixes owner/repo#12`
+  also work; the token must be able to read the linked issue.
+- Assignee `dflippojr`.
+- A non-empty `### Gate changes` explanation other than `None` when the
+  latest head check named `gate-guard` reports findings, including when that
+  check passed with owner approval. A pending or unreadable report fails with
+  a rerun instruction; rerun the lint after the guard completes. Without a
+  gate-guard check there are no guard findings to enforce. Wire both checks
+  and require the guard independently; this check does not approve gate edits.
+- A changed test path when any linked issue has label `bug`. A `bug` label on
+  the PR itself does not substitute for the linked issue's label. Renames count
+  both old and new filenames, and deleted tests count as touched paths; the
+  gate guard separately checks removals.
+
+Comments and fenced examples do not satisfy these rules. Dependabot's exact
+login `dependabot[bot]` is exempt from the Proof section (including Not
+verified) and closing-reference requirements. Assignee, gate explanations,
+linked-bug test paths and custom proof requirements still apply.
+
+### Per-repository proof rules
+
+An optional `.github/pr-proof-rules.yml` is read from the caller's **default
+branch**, never the PR head or its chosen base. It contains `test_paths`
+(a replacement list of test globs) and `rules` (a mapping from changed-file
+globs to lists of required body regexes). Every regex for every matched glob
+must match visible body text. Regexes use Python syntax with case-insensitive
+and multiline matching. Invalid rules and incomplete API results fail closed.
+
+The default test globs are `tests/**`, `test/**`, `**/*_test.*`,
+`**/*.test.*` and `**/test_*`. Globs match repository-relative paths using
+Python `fnmatch`; `*` can include path separators, and a leading `**/` also
+matches files at the repository root.
+
+Examples for the four repositories in issue #20 (adjust the file globs to
+the repository's actual paths before adopting):
+
+```yaml
+# disc-golf-league: give changed money/standings logic a named invariant.
+rules:
+  '**/money/**': ['Invariant: .+']
+  '**/*standings*': ['Invariant: .+']
+```
+
+```yaml
+# fhir-crd-router: validator changes cite the specification.
+rules:
+  '**/*validator*': ['Spec: https://[^\s]+']
+```
+
+```yaml
+# open-payer-sandbox: list changed goldens in the body.
+rules:
+  '**/goldens/**': ['Changed goldens: .+']
+```
+
+```yaml
+# task-start-copilot: command changes carry an eval summary.
+test_paths: ['tests/**', 'evals/**']
+rules:
+  'commands/**': ['Eval summary: .+']
+```
+
+### Security and verification
+
+Like the default-branch gate guard, the caller and reusable workflow must be
+trusted default-branch definitions pinned to the same full script SHA.
+The only checkout is this repository's lint script at that pin, with persisted
+credentials disabled. It never checks out or runs PR code, reads PR dependency
+files, uses PR rules, or interpolates PR fields into shell commands. PyYAML
+is installed at a fixed version; rules use `safe_load`. No secrets are needed
+beyond the default `GITHUB_TOKEN`, restricted to `contents: read`,
+`issues: read`, `pull-requests: read`, and `checks: read`. The last permission
+reads gate-guard checks in private repositories; no check-write permission is
+needed because Actions reports the job result. A fork cannot supply its own
+judge. As with gate guard, a compromised owner identity or a separate workflow
+spoofing a check name remains outside this protection.
+
+`lint-ref` is required; `runs-on` defaults to `'"ubuntu-latest"'` and accepts
+the same JSON runner-label input as gate guard. Private callers can select
+`'["self-hosted", "Linux", "X64", "tower-linux"]'`.
+
+Run the fixtures and API/security tests locally with
+`python -m pytest -q tests/test_pr_body_lint.py`. For a live, read-only check
+of a scratch PR, set `GITHUB_TOKEN` to a token with those read permissions and
+run `python scripts/pr_body_lint.py --repo owner/repo --pr N`. Exit codes are
+0 (pass), 1 (body violations), and 2 (could not verify). Short error messages
+go to stdout and, in Actions, the step summary. Test both an incomplete and a
+complete scratch body. The reusable `pull_request_target` caller itself takes
+effect only after its trusted definition is on the default branch.
+
 ## CI and analysis
 
 Install the CI dependencies and run the full test suite:

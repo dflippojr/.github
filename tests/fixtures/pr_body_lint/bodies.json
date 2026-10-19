@@ -1,0 +1,166 @@
+[
+  {
+    "name": "good",
+    "body": "Closes #20\n\n## Proof\n\n| Criterion | How verified | Evidence |\n| --- | --- | --- |\n| Behavior | pytest | Passed |\n\n### Not verified\nPrivate callers.\n\n### Gate changes\nAdded the lint workflow.\n",
+    "errors": []
+  },
+  {
+    "name": "missing-proof",
+    "body": "Closes #20\n\n## Results\n\n| Criterion | How verified | Evidence |\n| --- | --- | --- |\n| Behavior | pytest | Passed |\n\n### Not verified\nPrivate callers.\n\n### Gate changes\nAdded the lint workflow.\n",
+    "errors": [
+      "## Proof"
+    ]
+  },
+  {
+    "name": "empty-row",
+    "body": "Closes #20\n\n## Proof\n\n| Criterion | How verified | Evidence |\n| --- | --- | --- |\n| | | |\n\n### Not verified\nPrivate callers.\n\n### Gate changes\nAdded the lint workflow.\n",
+    "errors": [
+      "## Proof"
+    ]
+  },
+  {
+    "name": "no-table-divider",
+    "body": "Closes #20\n\n## Proof\n\n| Criterion | How verified | Evidence |\n\n| Behavior | pytest | Passed |\n\n### Not verified\nPrivate callers.\n\n### Gate changes\nAdded the lint workflow.\n",
+    "errors": [
+      "## Proof"
+    ]
+  },
+  {
+    "name": "missing-not-verified",
+    "body": "Closes #20\n\n## Proof\n\n| Criterion | How verified | Evidence |\n| --- | --- | --- |\n| Behavior | pytest | Passed |\n\n### Limits\nPrivate callers.\n\n### Gate changes\nAdded the lint workflow.\n",
+    "errors": [
+      "### Not verified"
+    ]
+  },
+  {
+    "name": "missing-closes",
+    "body": "Related to #20\n\n## Proof\n\n| Criterion | How verified | Evidence |\n| --- | --- | --- |\n| Behavior | pytest | Passed |\n\n### Not verified\nPrivate callers.\n\n### Gate changes\nAdded the lint workflow.\n",
+    "errors": [
+      "Closes #N"
+    ]
+  },
+  {
+    "name": "missing-assignee",
+    "body": "Closes #20\n\n## Proof\n\n| Criterion | How verified | Evidence |\n| --- | --- | --- |\n| Behavior | pytest | Passed |\n\n### Not verified\nPrivate callers.\n\n### Gate changes\nAdded the lint workflow.\n",
+    "assignees": [],
+    "errors": [
+      "Assign dflippojr"
+    ]
+  },
+  {
+    "name": "bug-without-test",
+    "body": "Closes #20\n\n## Proof\n\n| Criterion | How verified | Evidence |\n| --- | --- | --- |\n| Behavior | pytest | Passed |\n\n### Not verified\nPrivate callers.\n\n### Gate changes\nAdded the lint workflow.\n",
+    "bug": true,
+    "files": [
+      "src/main.py"
+    ],
+    "errors": [
+      "Linked bug"
+    ]
+  },
+  {
+    "name": "bug-with-test",
+    "body": "Closes #20\n\n## Proof\n\n| Criterion | How verified | Evidence |\n| --- | --- | --- |\n| Behavior | pytest | Passed |\n\n### Not verified\nPrivate callers.\n\n### Gate changes\nAdded the lint workflow.\n",
+    "bug": true,
+    "files": [
+      "tests/test_main.py"
+    ],
+    "errors": []
+  },
+  {
+    "name": "pr-bug-label-alone",
+    "body": "Closes #20\n\n## Proof\n\n| Criterion | How verified | Evidence |\n| --- | --- | --- |\n| Behavior | pytest | Passed |\n\n### Not verified\nPrivate callers.\n\n### Gate changes\nAdded the lint workflow.\n",
+    "labels": [
+      "bug"
+    ],
+    "errors": []
+  },
+  {
+    "name": "gate-none",
+    "body": "Closes #20\n\n## Proof\n\n| Criterion | How verified | Evidence |\n| --- | --- | --- |\n| Behavior | pytest | Passed |\n\n### Not verified\nPrivate callers.\n\n### Gate changes\nNone.\n",
+    "gate": true,
+    "errors": [
+      "gate-guard findings"
+    ]
+  },
+  {
+    "name": "gate-empty",
+    "body": "Closes #20\n\n## Proof\n\n| Criterion | How verified | Evidence |\n| --- | --- | --- |\n| Behavior | pytest | Passed |\n\n### Not verified\nPrivate callers.\n\n### Gate changes\n<!-- list hits -->\n",
+    "gate": true,
+    "errors": [
+      "gate-guard findings"
+    ]
+  },
+  {
+    "name": "gate-missing",
+    "body": "Closes #20\n\n## Proof\n\n| Criterion | How verified | Evidence |\n| --- | --- | --- |\n| Behavior | pytest | Passed |\n\n### Not verified\nPrivate callers.\n\n### Config\nAdded the lint workflow.\n",
+    "gate": true,
+    "errors": [
+      "gate-guard findings"
+    ]
+  },
+  {
+    "name": "gate-described",
+    "body": "Closes #20\n\n## Proof\n\n| Criterion | How verified | Evidence |\n| --- | --- | --- |\n| Behavior | pytest | Passed |\n\n### Not verified\nPrivate callers.\n\n### Gate changes\nAdded the lint workflow.\n",
+    "gate": true,
+    "errors": []
+  },
+  {
+    "name": "dependabot",
+    "body": "",
+    "author": "dependabot[bot]",
+    "errors": []
+  },
+  {
+    "name": "dependabot-unassigned",
+    "body": "",
+    "author": "dependabot[bot]",
+    "assignees": [],
+    "errors": [
+      "Assign dflippojr"
+    ]
+  },
+  {
+    "name": "dependabot-gate",
+    "body": "",
+    "author": "dependabot[bot]",
+    "gate": true,
+    "errors": [
+      "gate-guard findings"
+    ]
+  },
+  {
+    "name": "dependabot-lookalike",
+    "body": "",
+    "author": "dependabot",
+    "errors": [
+      "## Proof",
+      "### Not verified",
+      "Closes #N"
+    ]
+  },
+  {
+    "name": "proof-table-heading",
+    "body": "Closes #20\n\n## Proof table\n\n| Criterion | How verified | Evidence |\n| --- | --- | --- |\n| Behavior | pytest | Passed |\n\n### Not verified\nPrivate callers.\n\n### Gate changes\nAdded the lint workflow.\n",
+    "errors": []
+  },
+  {
+    "name": "fixes",
+    "body": "Fixes #20\n\n## Proof\n\n| Criterion | How verified | Evidence |\n| --- | --- | --- |\n| Behavior | pytest | Passed |\n\n### Not verified\nPrivate callers.\n\n### Gate changes\nAdded the lint workflow.\n",
+    "errors": []
+  },
+  {
+    "name": "resolves-cross-repo",
+    "body": "Resolves dflippojr/demo#5\n\n## Proof\n\n| Criterion | How verified | Evidence |\n| --- | --- | --- |\n| Behavior | pytest | Passed |\n\n### Not verified\nPrivate callers.\n\n### Gate changes\nAdded the lint workflow.\n",
+    "errors": []
+  },
+  {
+    "name": "commented-body",
+    "body": "<!--Closes #20\n\n## Proof\n\n| Criterion | How verified | Evidence |\n| --- | --- | --- |\n| Behavior | pytest | Passed |\n\n### Not verified\nPrivate callers.\n\n### Gate changes\nAdded the lint workflow.\n-->",
+    "errors": [
+      "## Proof",
+      "### Not verified",
+      "Closes #N"
+    ]
+  }
+]
