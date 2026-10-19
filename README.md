@@ -262,9 +262,9 @@ and head's gate-guard report through the GitHub API. It requires:
   gate guard separately checks removals.
 
 Comments and fenced examples do not satisfy these rules. Dependabot's exact
-login `dependabot[bot]` is exempt from the Proof section (including Not
-verified) and closing-reference requirements. Assignee, gate explanations,
-linked-bug test paths and custom proof requirements still apply.
+login `dependabot[bot]` is exempt from the Proof table and closing-reference
+requirements. Not verified, assignee, gate explanations, linked-bug test paths
+and custom proof requirements still apply.
 
 ### Per-repository proof rules
 

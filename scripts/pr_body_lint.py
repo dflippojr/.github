@@ -120,11 +120,11 @@ def lint(pr, files, bug, gate_findings, rules):
     bot = pr.get("user", {}).get("login") == "dependabot[bot]"
     if not any(a.get("login", "").lower() == "dflippojr" for a in pr.get("assignees", [])):
         errors.append("Assign dflippojr to this PR.")
+    if section(body, "Not verified", 3) is None:
+        errors.append("Add ### Not verified.")
     if not bot:
         if not has_table(section(body, r"Proof(?: table)?", 2)):
             errors.append("Add a ## Proof table with at least one filled row.")
-        if section(body, "Not verified", 3) is None:
-            errors.append("Add ### Not verified.")
         if not CLOSES.search(body):
             errors.append("Add Closes #N, Fixes #N or Resolves #N.")
     if gate_findings:

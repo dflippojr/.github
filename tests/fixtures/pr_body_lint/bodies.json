@@ -107,13 +107,29 @@
   },
   {
     "name": "dependabot",
-    "body": "",
+    "body": "### Not verified\nMajor-version behavior.\n",
     "author": "dependabot[bot]",
     "errors": []
   },
   {
-    "name": "dependabot-unassigned",
+    "name": "dependabot-empty-body",
     "body": "",
+    "author": "dependabot[bot]",
+    "errors": [
+      "### Not verified"
+    ]
+  },
+  {
+    "name": "dependabot-no-not-verified",
+    "body": "Bumps foo from 1 to 2.\n",
+    "author": "dependabot[bot]",
+    "errors": [
+      "### Not verified"
+    ]
+  },
+  {
+    "name": "dependabot-unassigned",
+    "body": "### Not verified\nMajor-version behavior.\n",
     "author": "dependabot[bot]",
     "assignees": [],
     "errors": [
@@ -122,7 +138,7 @@
   },
   {
     "name": "dependabot-gate",
-    "body": "",
+    "body": "### Not verified\nMajor-version behavior.\n",
     "author": "dependabot[bot]",
     "gate": true,
     "errors": [

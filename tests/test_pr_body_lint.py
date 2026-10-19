@@ -83,7 +83,7 @@ def test_custom_globs_and_proof_patterns():
 
 
 def test_dependabot_still_needs_path_specific_proof():
-    pull = pr("")
+    pull = pr("### Not verified\nNone.")
     pull["user"]["login"] = "dependabot[bot]"
     assert len(lint.lint(pull, ["commands/x.md"], False, False,
                          lint.parse_rules("rules: {'commands/**': ['Eval summary: .+']}"))) == 1
