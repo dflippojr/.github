@@ -145,7 +145,7 @@ def test_cli_reports_only_file_line_rule(repo, monkeypatch, capsys):
     assert scan.main(["--repo-dir", str(repo), "--base", base]) == 1
     output = capsys.readouterr().out
     assert "fake-desktop" not in output and "password" not in output
-    assert json.loads(output.splitlines()[0]) == {"file": "fixture.txt", "line": 1, "rule": "personal-identifier"}
+    assert json.loads(output.splitlines()[0]) == {"file": "<redacted-path:" + hashlib.sha256(b"fixture.txt").hexdigest() + ">", "line": 1, "rule": "personal-identifier"}
 
 
 def test_cli_errors_do_not_print_subprocess_or_config_values(repo, monkeypatch, capsys):

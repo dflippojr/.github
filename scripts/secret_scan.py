@@ -237,9 +237,9 @@ def main(argv=None):
             if args.financial or args.financial_only:
                 findings.update(scan_financial(repo, head))
             for path, line, rule in sorted(findings):
-                if not args.financial_only and identifier_rules(path, denylist):
-                    path = "<redacted-path:" + hashlib.sha256(path.encode()).hexdigest() + ">"
-                # JSON escaping prevents file names injecting workflow commands.
+                # Paths can contain any secret class, including unknown key formats.
+                # Never expose raw filenames, even in financial-only mode.
+                path = "<redacted-path:" + hashlib.sha256(path.encode()).hexdigest() + ">"
                 print(json.dumps({"file": path, "line": line, "rule": rule}, ensure_ascii=True))
             print(f"secret-scan: {len(findings)} finding(s)")
             return 1 if findings else 0
