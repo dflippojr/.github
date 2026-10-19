@@ -54,15 +54,7 @@ def exception_allowed(config, repository, filename, job_id, job, today):
 
 def runner_values(runner, job):
     values = list(strings(runner))
-    # JSON label arrays also occur in reusable inputs and fromJSON expressions.
-    # Decode literals so JSON Unicode escapes cannot hide a self-hosted label.
     for value in list(values):
-        candidates = [value] + re.findall(r"'([^']*)'", value)
-        for candidate in candidates:
-            try:
-                values.extend(strings(json.loads(candidate)))
-            except (ValueError, TypeError):
-                pass
         matrix = job.get('strategy', {}).get('matrix', {})
         if isinstance(matrix, dict):
             for key in re.findall(r'\bmatrix\.([\w-]+)', value):
@@ -70,6 +62,16 @@ def runner_values(runner, job):
                 for row in matrix.get('include', []):
                     if isinstance(row, dict):
                         values.extend(strings(row.get(key, [])))
+        elif 'matrix.' in value:
+            values.extend(strings(matrix))
+    # JSON label arrays also occur in reusable inputs and fromJSON expressions.
+    # Decode literals so JSON Unicode escapes cannot hide a self-hosted label.
+    for value in list(values):
+        for candidate in [value] + re.findall(r"'([^']*)'", value):
+            try:
+                values.extend(strings(json.loads(candidate)))
+            except (ValueError, TypeError):
+                pass
     return values
 
 
@@ -233,7 +235,7 @@ def run_actionlint(files, changed, executable):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(files[name], encoding='utf-8')
             paths.append(str(target))
-        result = subprocess.run([executable, '-color', '-shellcheck=', '-pyflakes=', '-config-file', str(ROOT / 'config/actionlint.yaml'), *paths], cwd=directory, capture_output=True, text=True, check=False)
+        result = subprocess.run([executable, '-shellcheck=', '-pyflakes=', '-config-file', str(ROOT / 'config/actionlint.yaml'), *paths], cwd=directory, capture_output=True, text=True, check=False)
         return {'files': selected, 'exit_code': result.returncode, 'output': (result.stdout + result.stderr).replace(directory, '<target>')}
 
 

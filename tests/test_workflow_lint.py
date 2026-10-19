@@ -54,6 +54,9 @@ def test_runner_json_escapes_and_matrix_include():
     assert not lint.runner_findings('ci.yml', {'jobs': {'test': matrix_job}}, 'a/b', 'public', CONFIG, TODAY)
     matrix_job['strategy']['matrix']['include'] = [{'os': 'self-hosted'}]
     assert lint.runner_findings('ci.yml', {'jobs': {'test': matrix_job}}, 'a/b', 'public', CONFIG, TODAY)[0]['rule'] == 'public-self-hosted'
+    matrix_job['strategy']['matrix'] = {'os': ['["\\u0073elf-hosted"]']}
+    matrix_job['runs-on'] = '${{ fromJSON(matrix.os) }}'
+    assert lint.runner_findings('ci.yml', {'jobs': {'test': matrix_job}}, 'a/b', 'public', CONFIG, TODAY)[0]['rule'] == 'public-self-hosted'
 
 
 @pytest.mark.parametrize('filename,content', [
