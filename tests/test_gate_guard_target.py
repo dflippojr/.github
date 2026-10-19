@@ -293,6 +293,33 @@ class SharedHead(unittest.TestCase):
         self.assertIn("gate-change-approved=false", outputs)
         self.assertIn("findings-accepted=false", outputs)
 
+    def test_closed_rerun_after_reopening_cannot_clear_an_unapproved_head(self):
+        """Reopening fails first; rerunning the older close must not replace that failure with neutral."""
+        fake = FakeGitHub(self.head, self.merge_bases, {NUMBER: self.pr("main")})
+        reopened = {"action": "reopened", "pull_request": event_pr(NUMBER, self.head, "main")}
+        code, _, _ = run_cli(self.tmp, self.server, reopened, fake)
+        self.assertEqual((code, fake.current()["conclusion"]), (1, "failure"))
+        closed = {"action": "closed", "pull_request": event_pr(NUMBER, self.head, "main", state="closed")}
+        code, _, outputs = run_cli(self.tmp, self.server, closed, fake)
+        self.assertEqual((code, fake.current()["conclusion"]), (1, "failure"))
+        self.assertIn("conclusion=failure", outputs)
+        self.assertIn("gate-change-approved=false", outputs)
+
+    def test_closed_rerun_cannot_hide_a_reopened_pull_request_sharing_a_passing_head(self):
+        """The approved sibling must not let the stale close clear the reopened PR's unapproved deletion."""
+        prs = {NUMBER: self.pr("main"), 8: self.pr("main", head_ref="approved-copy", **self.APPROVED)}
+        fake = FakeGitHub(self.head, self.merge_bases, prs)
+        reopened = {"action": "reopened", "pull_request": event_pr(NUMBER, self.head, "main")}
+        code, _, _ = run_cli(self.tmp, self.server, reopened, fake)
+        self.assertEqual((code, fake.current()["conclusion"]), (1, "failure"))
+        closed = {"action": "closed", "pull_request": event_pr(NUMBER, self.head, "main", state="closed")}
+        code, _, outputs = run_cli(self.tmp, self.server, closed, fake)
+        check = fake.current()
+        self.assertEqual((code, check["conclusion"]), (1, "failure"))
+        self.assertIn(f"Failing: #{NUMBER}.", check["output"]["summary"])
+        self.assertIn("conclusion=failure", outputs)
+        self.assertIn("gate-change-approved=false", outputs)
+
 
 class OversizedReport(unittest.TestCase):
     """The review's scenario: C1 deletes a test and adds 300 skipped test modules with long non-ASCII names; C2
