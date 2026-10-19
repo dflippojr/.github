@@ -17,6 +17,7 @@ SPEC = importlib.util.spec_from_file_location("pr_body_lint", ROOT / "scripts/pr
 lint = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(lint)
 FIXTURES = json.loads((ROOT / "tests/fixtures/pr_body_lint/bodies.json").read_text())
+TABLES = json.loads((ROOT / "tests/fixtures/pr_body_lint/tables.json").read_text())
 GOOD = FIXTURES[0]["body"]
 SHA = "a" * 40
 
@@ -49,6 +50,14 @@ def test_table_must_be_inside_proof_not_another_section():
 
 def test_valid_table_without_outer_pipes_and_with_escaped_pipe():
     assert lint.has_table("A | B\n:--- | ---:\nproof \\| detail | passed")
+
+
+@pytest.mark.parametrize("case", TABLES, ids=lambda c: c["name"])
+def test_gfm_proof_table_variants(case):
+    assert lint.has_table(case["table"]) == case["valid"]
+    body = "Closes #20\n\n## Proof\n\n" + case["table"] + "\n\n### Not verified\nNone."
+    errors = lint.lint(pr(body), [], False, False, lint.parse_rules(""))
+    assert bool(errors) == (not case["valid"])
 
 
 @pytest.mark.parametrize("path", ["tests/a.py", "test/nested/a.js", "foo_test.go", "a.test.ts", "test_api.py",

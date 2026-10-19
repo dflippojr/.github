@@ -1,0 +1,117 @@
+[
+  {
+    "name": "one-hyphen-delimiters",
+    "table": "| Criterion | Evidence |\n| - | - |\n| Tests | pytest passed |",
+    "valid": true
+  },
+  {
+    "name": "single-column",
+    "table": "| Evidence |\n| --- |\n| pytest passed |",
+    "valid": true
+  },
+  {
+    "name": "fewer-data-cells",
+    "table": "| Criterion | Evidence |\n| --- | --- |\n| Tests |",
+    "valid": true
+  },
+  {
+    "name": "extra-data-cells",
+    "table": "| Criterion | Evidence |\n| --- | --- |\n| Tests | passed | extra |",
+    "valid": true
+  },
+  {
+    "name": "no-outer-pipes",
+    "table": "Criterion | Evidence\n- | -\nTests | passed",
+    "valid": true
+  },
+  {
+    "name": "mixed-pipes-and-alignment",
+    "table": "| Criterion | Evidence |\n:-: | -----------:\nTests | passed",
+    "valid": true
+  },
+  {
+    "name": "left-and-right-alignment",
+    "table": "Criterion | Evidence\n:- | -:\nTests | passed",
+    "valid": true
+  },
+  {
+    "name": "escaped-pipes",
+    "table": "| Criterion \\| detail | Evidence |\n| - | - |\n| Tests \\| fixtures | passed |",
+    "valid": true
+  },
+  {
+    "name": "single-column-inline-escaped-pipes",
+    "table": "| f\\|oo |\n| ------ |\n| b `\\|` az |\n| b **\\|** im |",
+    "valid": true
+  },
+  {
+    "name": "pipe-free-data-row",
+    "table": "| Criterion | Evidence |\n| --- | --- |\npytest passed",
+    "valid": true
+  },
+  {
+    "name": "single-column-no-trailing-pipes",
+    "table": "| Evidence\n| -\npytest passed",
+    "valid": true
+  },
+  {
+    "name": "empty-header-cell",
+    "table": "||Evidence|\n|-|-|\n||passed|",
+    "valid": true
+  },
+  {
+    "name": "trailing-escaped-header-pipe",
+    "table": "Criterion | Evidence \\|\n- | -\nTests | passed",
+    "valid": true
+  },
+  {
+    "name": "mismatched-header-delimiter",
+    "table": "| Criterion | Evidence |\n| - |\n| Tests | passed |",
+    "valid": false
+  },
+  {
+    "name": "no-data-row",
+    "table": "| Criterion | Evidence |\n| - | - |",
+    "valid": false
+  },
+  {
+    "name": "empty-data-row",
+    "table": "| Criterion | Evidence |\n| - | - |\n| | |",
+    "valid": false
+  },
+  {
+    "name": "only-ignored-extra-cell-filled",
+    "table": "| Criterion | Evidence |\n| - | - |\n| | | ignored |",
+    "valid": false
+  },
+  {
+    "name": "setext-heading-is-not-table",
+    "table": "Evidence\n---\npytest passed",
+    "valid": false
+  },
+  {
+    "name": "blank-line-ends-empty-table",
+    "table": "| Criterion | Evidence |\n| - | - |\n\nTests | passed",
+    "valid": false
+  },
+  {
+    "name": "heading-is-not-data",
+    "table": "| Criterion | Evidence |\n| - | - |\n### Details | passed",
+    "valid": false
+  },
+  {
+    "name": "blockquote-is-not-data",
+    "table": "| Criterion | Evidence |\n| - | - |\n> Tests | passed",
+    "valid": false
+  },
+  {
+    "name": "list-is-not-data",
+    "table": "| Criterion | Evidence |\n| - | - |\n- Tests | passed",
+    "valid": false
+  },
+  {
+    "name": "missing-delimiter-hyphen",
+    "table": "Criterion | Evidence\n: | -\nTests | passed",
+    "valid": false
+  }
+]
