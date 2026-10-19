@@ -75,11 +75,11 @@ def test_review_exception_admits_exactly_its_own_events(entry, form, event):
     assert [item['rule'] for item in findings] == ([] if event in ALLOWED_EVENTS[entry['repository']] else ['public-self-hosted'])
 
 
-@pytest.mark.parametrize('unsafe', [event for event in EVENTS if event not in {'pull_request', 'workflow_dispatch'}])
-@pytest.mark.parametrize('entry', CONFIG['review_exceptions'], ids=lambda entry: entry['repository'])
+UNAPPROVED = [(entry, event) for entry in CONFIG['review_exceptions'] for event in EVENTS if event not in ALLOWED_EVENTS[entry['repository']]]
+
+
+@pytest.mark.parametrize('entry,unsafe', UNAPPROVED, ids=lambda value: value if isinstance(value, str) else value['repository'])
 def test_review_exception_rejects_an_unapproved_event_next_to_an_approved_one(entry, unsafe):
-    if unsafe in ALLOWED_EVENTS[entry['repository']]:
-        pytest.skip('approved for this repository')
     assert [item['rule'] for item in review_findings(entry, f'[workflow_dispatch, {unsafe}]')] == ['public-self-hosted']
 
 
