@@ -45,6 +45,22 @@ def test_recursive_yaml_matrix_cannot_loop():
     assert list(lint.strings(document)) == ['self-hosted']
 
 
+@pytest.mark.parametrize('trigger', [
+    'pull_request_target', '[workflow_dispatch, pull_request_target]',
+    '{pull_request_target: {types: [opened]}}',
+    'repository_dispatch', 'workflow_run', 'workflow_call', 'null',
+])
+@pytest.mark.parametrize('entry', CONFIG['review_exceptions'], ids=lambda entry: entry['repository'])
+def test_review_exception_rejects_unapproved_triggers(entry, trigger):
+    content = (
+        f'on: {trigger}\njobs:\n  review:\n'
+        f'    if: {entry["fork_guard"]}\n'
+        '    runs-on: self-hosted\n    steps:\n      - run: echo review\n'
+    )
+    findings = lint.lint_files({entry['workflow']: content}, entry['repository'], 'public', CONFIG, TODAY)
+    assert [item['rule'] for item in findings] == ['public-self-hosted']
+
+
 def test_runner_json_escapes_and_matrix_include():
     runner = "${{ fromJSON('[\"\\u0073elf-hosted\"]') }}"
     job = {'runs-on': runner}
