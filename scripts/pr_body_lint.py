@@ -211,6 +211,16 @@ def gate_has_findings(api, repo, sha):
     raise ValueError("gate-guard report has no recognized verdict; inspect it and rerun pr-body")
 
 
+def verdict_inputs(pr):
+    # Only what the verdict depends on: head.repo/base.repo carry pushed_at and
+    # issue counts that move with unrelated activity in the repository.
+    return (
+        pr["head"]["sha"], pr["base"]["ref"], pr.get("body"),
+        sorted(a["login"] for a in pr.get("assignees") or []),
+        sorted(label["name"] for label in pr.get("labels") or []),
+    )
+
+
 def inspect_pr(api, repo, number):
     pr = api.get(f"/repos/{repo}/pulls/{number}")
     files = api.pages(f"/repos/{repo}/pulls/{number}/files")
@@ -226,7 +236,7 @@ def inspect_pr(api, repo, number):
     errors = lint(pr, paths, bug, findings, load_rules(api, repo))
     # An edit/push during the reads must not receive a verdict from an old body/head.
     current = api.get(f"/repos/{repo}/pulls/{number}")
-    if any(current.get(k) != pr.get(k) for k in ("head", "body", "assignees", "labels", "base")):
+    if verdict_inputs(current) != verdict_inputs(pr):
         raise ValueError("PR changed during inspection; rerun pr-body")
     return errors
 
