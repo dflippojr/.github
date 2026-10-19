@@ -36,7 +36,9 @@ on:
         default: ''
     outputs:
       conclusion:
-        description: success or failure, as posted on the gate-guard check run.
+        description: >-
+          success or failure, as posted on the gate-guard check run; neutral
+          when a closed event leaves no open pull request with the head.
         value: ${{ jobs.judge.outputs.conclusion }}
       gate-change-approved:
         description: "'true' when the owner's gate-change-approved label counts on every open pull request with the head."
