@@ -307,6 +307,43 @@ def test_missing_files_and_mid_inspection_edits_fail_closed():
         lint.inspect_pr(api, "o/r", 7)
 
 
+def test_unrelated_repository_activity_during_inspection_is_not_a_change():
+    api = FakeAPI()
+    original = api.get
+
+    def busy(path):
+        result = original(path)
+        if path == "/repos/o/r/pulls/7":
+            n = api.requests.count(path)
+            result["head"].update(repo={"pushed_at": f"t{n}", "open_issues_count": n})
+            result["base"].update(sha=f"{n:040d}", repo={"pushed_at": f"t{n}", "updated_at": f"t{n}"})
+        return result
+
+    api.get = busy
+    assert lint.inspect_pr(api, "o/r", 7) == []
+
+
+@pytest.mark.parametrize("field, value", [
+    ("head", {"sha": "b" * 40}),
+    ("base", {"ref": "other-base"}),
+    ("assignees", []),
+    ("labels", [{"name": "gate-change-approved"}]),
+])
+def test_changes_the_verdict_depends_on_still_fail_closed(field, value):
+    api = FakeAPI()
+    original = api.get
+
+    def changed(path):
+        result = original(path)
+        if path == "/repos/o/r/pulls/7" and api.requests.count(path) == 2:
+            result[field] = value
+        return result
+
+    api.get = changed
+    with pytest.raises(ValueError, match="changed during inspection"):
+        lint.inspect_pr(api, "o/r", 7)
+
+
 def test_api_pagination_and_bounds():
     api = lint.GitHub("test-token")
     with mock.patch.object(api, "get", side_effect=[[{}] * 100, [{}]]) as get:
