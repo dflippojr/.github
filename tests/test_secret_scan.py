@@ -260,3 +260,65 @@ def test_mailto_matches_denied_mailbox(text):
 ])
 def test_mailto_mailbox_near_misses_are_allowed(text):
     assert not scan.identifier_rules(text, {scan.digest("owner@example.invalid")})
+
+
+def commit_object_file(repo, raw_path, content):
+    """Create untrusted names as Git objects, without platform checkout rules."""
+    def object_git(*args, data):
+        return subprocess.run(
+            ["git", "-C", str(repo), *args], input=data,
+            check=True, capture_output=True,
+        ).stdout.strip()
+
+    blob = object_git("hash-object", "-w", "--stdin", data=content)
+    tree = object_git("mktree", "-z", data=b"100644 blob " + blob + b"\t" + raw_path + b"\0")
+    parent = git(repo, "rev-parse", "HEAD")
+    head = object_git("commit-tree", tree.decode(), "-p", parent, data=b"synthetic change\n")
+    git(repo, "update-ref", "HEAD", head.decode())
+
+
+UNTRUSTED_PATHS = [
+    pytest.param(b":!*.txt", id="short-exclude"),
+    pytest.param(b":^*.txt", id="short-exclude-caret"),
+    pytest.param(b":(exclude)*", id="long-exclude"),
+    pytest.param(b":(top,exclude)*", id="top-exclude"),
+    pytest.param(b":(glob)*.txt", id="glob-magic"),
+    pytest.param(b":(icase)file.txt", id="icase-magic"),
+    pytest.param(b":(literal)file.txt", id="literal-magic"),
+    pytest.param(b":/file.txt", id="top-magic"),
+    pytest.param(b":(unknown)file.txt", id="unknown-magic"),
+    pytest.param(b":", id="empty-pathspec"),
+    pytest.param(b"[ab].txt", id="bracket-glob"),
+    pytest.param(b"*.txt", id="star-glob"),
+    pytest.param(b"?.txt", id="question-glob"),
+    pytest.param(b"back\\slash.txt", id="backslash"),
+    pytest.param(b'-leading-"quote".txt', id="option-and-quotes"),
+    pytest.param(b"space tab\tline\nbreak.txt", id="whitespace"),
+    pytest.param("caf\u00e9.txt".encode(), id="unicode"),
+    pytest.param(b"invalid-\xff.txt", id="non-utf8"),
+]
+
+
+@pytest.mark.parametrize("raw_path", UNTRUSTED_PATHS)
+@pytest.mark.parametrize("renamed", [False, True], ids=["addition", "rename"])
+def test_untrusted_filename_contents_are_scanned(repo, monkeypatch, capsys, raw_path, renamed):
+    denied = "fake-desktop"
+    content = (denied + "\n").encode()
+    if renamed:
+        commit_object_file(repo, b"ordinary-source.txt", content)
+    base = git(repo, "rev-parse", "HEAD")
+    commit_object_file(repo, raw_path, content)
+    monkeypatch.setenv("SECRET_SCAN_DENYLIST_SHA256", scan.digest(denied))
+    monkeypatch.setattr(scan, "scan_gitleaks", lambda *args: set())
+    # The filename cannot satisfy the denylist: only the blob contains the value.
+    assert not scan.identifier_rules(raw_path.decode("utf-8", errors="replace"), {scan.digest(denied)})
+    result = scan.main(["--repo-dir", str(repo), "--base", base])
+    captured = capsys.readouterr()
+    assert denied not in captured.out + captured.err, "matched value must stay private"
+    assert json.dumps(raw_path.decode("utf-8", errors="replace")) not in captured.out + captured.err, "filename must stay private"
+    assert result == 1, "filename contents must produce a finding"
+    rows = [json.loads(line) for line in captured.out.splitlines()[:-1]]
+    assert rows == [{
+        "file": "<redacted-path:" + hashlib.sha256(raw_path).hexdigest() + ">",
+        "line": 1, "rule": "personal-identifier",
+    }], "the exact filename must identify the finding opaquely"
