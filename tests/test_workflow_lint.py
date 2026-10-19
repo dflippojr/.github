@@ -46,32 +46,105 @@ def test_recursive_yaml_matrix_cannot_loop():
     assert list(lint.strings(document)) == ['self-hosted']
 
 
-@pytest.mark.parametrize('trigger', [
-    'pull_request_target', '[workflow_dispatch, pull_request_target]',
-    '{pull_request_target: {types: [opened]}}',
-    'repository_dispatch', 'workflow_run', 'workflow_call', 'null',
-])
+REAL = ROOT / 'tests/fixtures/workflow_lint/real'
+ALLOWED_EVENTS = {
+    'dflippojr/agent-harness': {'pull_request', 'workflow_dispatch', 'workflow_call'},
+    'dflippojr/agent-harness-hub': {'pull_request_target', 'workflow_dispatch'},
+}
+EVENTS = ['pull_request', 'pull_request_target', 'workflow_dispatch', 'workflow_call', 'repository_dispatch', 'workflow_run', 'push']
+
+
+def review_job(entry):
+    return f'jobs:\n  review:\n    if: {entry["fork_guard"]}\n    runs-on: self-hosted\n    steps:\n      - run: echo review\n'
+
+
+def review_findings(entry, trigger, extra=None):
+    files = {entry['workflow']: f'on: {trigger}\n' + review_job(entry), **(extra or {})}
+    return lint.lint_files(files, entry['repository'], 'public', CONFIG, TODAY)
+
+
+def test_exception_events_are_the_ones_each_real_review_workflow_declares():
+    assert {entry['repository']: set(entry['allowed_events']) for entry in CONFIG['review_exceptions']} == ALLOWED_EVENTS
+
+
+@pytest.mark.parametrize('event', EVENTS)
+@pytest.mark.parametrize('form', ['{event}', '[{event}]', '{{{event}: null}}', '{{{event}: {{types: [opened]}}}}'], ids=['scalar', 'list', 'mapping', 'mapping-with-types'])
 @pytest.mark.parametrize('entry', CONFIG['review_exceptions'], ids=lambda entry: entry['repository'])
-def test_review_exception_rejects_unapproved_triggers(entry, trigger):
-    content = (
-        f'on: {trigger}\njobs:\n  review:\n'
-        f'    if: {entry["fork_guard"]}\n'
-        '    runs-on: self-hosted\n    steps:\n      - run: echo review\n'
-    )
-    findings = lint.lint_files({entry['workflow']: content}, entry['repository'], 'public', CONFIG, TODAY)
+def test_review_exception_admits_exactly_its_own_events(entry, form, event):
+    findings = review_findings(entry, form.format(event=event))
+    assert [item['rule'] for item in findings] == ([] if event in ALLOWED_EVENTS[entry['repository']] else ['public-self-hosted'])
+
+
+@pytest.mark.parametrize('unsafe', [event for event in EVENTS if event not in {'pull_request', 'workflow_dispatch'}])
+@pytest.mark.parametrize('entry', CONFIG['review_exceptions'], ids=lambda entry: entry['repository'])
+def test_review_exception_rejects_an_unapproved_event_next_to_an_approved_one(entry, unsafe):
+    if unsafe in ALLOWED_EVENTS[entry['repository']]:
+        pytest.skip('approved for this repository')
+    assert [item['rule'] for item in review_findings(entry, f'[workflow_dispatch, {unsafe}]')] == ['public-self-hosted']
+
+
+REAL_REVIEWS = [
+    ('dflippojr/agent-harness', 'agent-harness-review.yml', 'daf8267f499520b3d942b2b45342cd8c99d822bb'),
+    ('dflippojr/agent-harness-hub', 'agent-harness-hub-review.yml', '5d82be89d6445e243b205f0a80b23ff3d19317bb'),
+]
+
+
+@pytest.mark.parametrize('repository,name,revision', REAL_REVIEWS, ids=lambda value: value if value.startswith('dflippojr') else None)
+def test_real_allowlisted_review_workflows_pass(repository, name, revision):
+    """Copied byte for byte from each repository's default branch at `revision`."""
+    content = (REAL / name).read_bytes().decode('utf-8')
+    assert lint.lint_files({'.github/workflows/review.yml': content}, repository, 'public', CONFIG, TODAY) == []
+
+
+@pytest.mark.parametrize('repository,name,old,new', [
+    ('dflippojr/agent-harness', 'agent-harness-review.yml', '  pull_request:\n    types: [opened]\n', '  pull_request_target:\n    types: [opened]\n'),
+    ('dflippojr/agent-harness', 'agent-harness-review.yml', '  workflow_dispatch:\n', '  workflow_run:\n    workflows: [CI]\n  workflow_dispatch:\n'),
+    ('dflippojr/agent-harness-hub', 'agent-harness-hub-review.yml', '  pull_request_target:\n', '  pull_request:\n'),
+    ('dflippojr/agent-harness-hub', 'agent-harness-hub-review.yml', '  workflow_dispatch:\n', '  workflow_run:\n    workflows: [CI]\n  workflow_dispatch:\n'),
+    ('dflippojr/agent-harness-hub', 'agent-harness-hub-review.yml', "      github.event_name == 'workflow_dispatch' ||\n", ''),
+], ids=['harness-pull_request_target', 'harness-workflow_run', 'hub-pull_request', 'hub-workflow_run', 'hub-guard-dropped'])
+def test_real_review_workflows_fail_when_only_the_trigger_or_guard_changes(repository, name, old, new):
+    content = (REAL / name).read_bytes().decode('utf-8')
+    assert content.count(old) == 1
+    findings = lint.lint_files({'.github/workflows/review.yml': content.replace(old, new)}, repository, 'public', CONFIG, TODAY)
     assert [item['rule'] for item in findings] == ['public-self-hosted']
 
 
-@pytest.mark.parametrize('trigger', [
-    'on: pull_request', '"on": workflow_dispatch',
-    'on: [pull_request, workflow_dispatch]',
-    'on: {pull_request: {types: [opened]}, workflow_dispatch: null}',
+CALLER = 'on: {trigger}\njobs:\n  review:\n    uses: {uses}\n'
+LOCAL_USES = ['./.github/workflows/review.yml', 'dflippojr/agent-harness/.github/workflows/review.yml@review-v3']
+
+
+@pytest.mark.parametrize('uses', LOCAL_USES)
+@pytest.mark.parametrize('trigger,rules', [
+    ('pull_request', []), ('[pull_request, workflow_dispatch]', []),
+    ('pull_request_target', ['review-exception-caller']),
+    ('[pull_request, pull_request_target]', ['review-exception-caller']),
+    ('{issue_comment: {types: [created]}}', ['review-exception-caller']),
+    ('push', ['review-exception-caller']),
 ])
-@pytest.mark.parametrize('entry', CONFIG['review_exceptions'], ids=lambda entry: entry['repository'])
-def test_review_exception_accepts_only_guarded_safe_events(entry, trigger):
-    document = yaml.safe_load(trigger)
-    document['jobs'] = {'review': {'runs-on': 'self-hosted', 'if': entry['fork_guard']}}
-    assert not lint.runner_findings(entry['workflow'], document, entry['repository'], 'public', CONFIG, TODAY)
+def test_local_callers_of_an_excepted_workflow_use_only_its_events(uses, trigger, rules):
+    """A caller that omits runs_on is skipped by the runner rule, so its own trigger must be checked."""
+    entry = CONFIG['review_exceptions'][0]
+    extra = {'.github/workflows/ci.yml': CALLER.format(trigger=trigger, uses=uses)}
+    findings = review_findings(entry, 'workflow_call', extra)
+    assert [item['rule'] for item in findings] == rules
+
+
+def test_callers_of_callers_are_followed():
+    entry = CONFIG['review_exceptions'][0]
+    extra = {
+        '.github/workflows/mid.yml': CALLER.format(trigger='workflow_call', uses=LOCAL_USES[0]),
+        '.github/workflows/top.yml': CALLER.format(trigger='pull_request_target', uses='./.github/workflows/mid.yml'),
+    }
+    assert [(item['path'], item['rule']) for item in review_findings(entry, 'workflow_call', extra)] == [('.github/workflows/top.yml', 'review-exception-caller')]
+
+
+def test_callers_are_only_checked_in_the_excepted_repository_and_for_that_workflow():
+    entry = CONFIG['review_exceptions'][0]
+    caller = CALLER.format(trigger='pull_request_target', uses=LOCAL_USES[0])
+    assert lint.lint_files({'.github/workflows/ci.yml': caller}, 'someone/else', 'public', CONFIG, TODAY) == []
+    other = CALLER.format(trigger='pull_request_target', uses='./.github/workflows/other.yml')
+    assert review_findings(entry, 'workflow_call', {'.github/workflows/ci.yml': other}) == []
 
 
 def test_runner_json_escapes_and_matrix_include():
