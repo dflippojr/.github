@@ -1,0 +1,3 @@
+SYNTHETIC: fake nonfunctional GitHub token
+token=ghp_aB7cD9eF2gH4iJ6kL8mN0pQ3rS5tU1vW9xY2
+host=fake-desktop
