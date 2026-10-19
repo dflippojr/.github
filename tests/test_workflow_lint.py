@@ -353,6 +353,41 @@ def test_pytest_environment_and_config_caps(name, files, expected):
     assert policy_rules(files) == expected
 
 
+AUTO = 'export PYTEST_ADDOPTS="-n auto"\n'
+
+
+@pytest.mark.parametrize('name,files,expected', [
+    # One pytest -n override must not hide the literal value from the commands that follow it.
+    ('job-env-override-then-make', {WORKFLOW: workflow(job_env=['PYTEST_ADDOPTS: -n auto'], run='pytest -n 2 tests/unit', extra_steps='      - run: make test\n')}, CAP),
+    ('workflow-env-override-then-make', {WORKFLOW: workflow(env=['PYTEST_ADDOPTS: -n 8'], run='python -m pytest -n 2', extra_steps='      - run: make test\n')}, CAP),
+    ('job-env-override-then-bare-pytest', {WORKFLOW: workflow(job_env=['PYTEST_ADDOPTS: -n auto'], run='pytest -n 2 tests/unit', extra_steps='      - run: pytest\n')}, CAP),
+    ('job-env-override-then-local-action', {WORKFLOW: workflow(job_env=['PYTEST_ADDOPTS: -n auto'], run='pytest -n 2', extra_steps='      - uses: ./.github/actions/test\n')}, CAP),
+    ('export-override-then-make-in-run', {WORKFLOW: workflow(run=AUTO + 'pytest -n 2 tests/unit\nmake test')}, CAP),
+    ('export-make-then-override-in-run', {WORKFLOW: workflow(run=AUTO + 'make test\npytest -n 2 tests/unit')}, CAP),
+    ('export-override-then-tox-in-run', {WORKFLOW: workflow(run=AUTO + 'pytest -n 2 tests/unit && tox -e py')}, CAP),
+    ('export-override-then-make-ci-local', {'ci-local.sh': AUTO + 'pytest -n 2 tests/unit\nmake test\n'}, CAP),
+    ('export-make-then-override-ci-local', {'ci-local.sh': AUTO + 'make test\npytest -n 2 tests/unit\n'}, CAP),
+    ('export-override-then-npm-package-script', {'package.json': json.dumps({'scripts': {'test': 'export PYTEST_ADDOPTS="-n auto"; pytest -n 2 && npm run e2e'}})}, CAP),
+    ('step-env-override-then-make-same-step', {WORKFLOW: workflow(step_env=['PYTEST_ADDOPTS: -n auto'], run='pytest -n 2\nmake test')}, CAP),
+    ('github-env-override-then-make', {WORKFLOW: workflow(run='echo "PYTEST_ADDOPTS=-n 16" >> "$GITHUB_ENV"', extra_steps='      - run: pytest -n 2\n      - run: make test\n')}, CAP),
+    # An inline assignment belongs to its own command; it does not reach the commands after it.
+    ('inline-assignment-does-not-leak', {WORKFLOW: workflow(run="PYTEST_ADDOPTS='-n 8' pytest -n 2\npytest")}, []),
+    ('inline-assignment-on-other-command', {WORKFLOW: workflow(run="PYTEST_ADDOPTS='-n 8' make test")}, CAP),
+    ('inline-assignment-on-tox-then-clean-pytest', {WORKFLOW: workflow(run="PYTEST_ADDOPTS='-n 4' tox\npytest")}, []),
+    # Still allowed: every command that sees the value overrides it, or cannot run pytest.
+    ('export-override-only', {WORKFLOW: workflow(run=AUTO + 'pytest -n 2 tests/unit')}, []),
+    ('export-two-overrides', {WORKFLOW: workflow(run=AUTO + 'pytest -n 2 tests/unit\npytest -n 4 tests/slow')}, []),
+    ('export-override-then-echo', {WORKFLOW: workflow(run=AUTO + 'pytest -n 2 tests/unit\necho done\ncd ..')}, []),
+    ('export-override-then-unset-then-make', {WORKFLOW: workflow(run=AUTO + 'pytest -n 2\nunset PYTEST_ADDOPTS\nmake test')}, []),
+    ('export-four-then-make', {WORKFLOW: workflow(run='export PYTEST_ADDOPTS="-n 4"\nmake test')}, []),
+    ('job-env-override-only', {WORKFLOW: workflow(job_env=['PYTEST_ADDOPTS: -n auto'], run='pytest -n 2', extra_steps='      - uses: actions/checkout@v4\n')}, []),
+    ('job-env-override-then-echo-step', {WORKFLOW: workflow(job_env=['PYTEST_ADDOPTS: -n auto'], run='pytest -n 2', extra_steps='      - run: echo done\n')}, []),
+    ('job-env-cleared-before-make', {WORKFLOW: workflow(job_env=['PYTEST_ADDOPTS: -n auto'], run='pytest -n 2', extra_steps='      - env:\n          PYTEST_ADDOPTS: ""\n        run: make test\n')}, []),
+], ids=lambda value: value if isinstance(value, str) else None)
+def test_each_command_is_judged_on_its_own_effective_parallelism(name, files, expected):
+    assert policy_rules(files) == expected
+
+
 def test_policy_files_include_pytest_config():
     for name in ['pytest.ini', '.pytest.ini', 'tox.ini', 'setup.cfg', 'pyproject.toml', 'sub/pyproject.toml']:
         assert lint.policy_path(name), name
