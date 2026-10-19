@@ -32,12 +32,13 @@ def test_exception_expires_and_cannot_move_or_drop_fork_guard():
     entry = CONFIG['review_exceptions'][0]
     job = {'if': entry['fork_guard']}
     args = (CONFIG, entry['repository'], entry['workflow'], entry['job'], job)
-    assert lint.exception_allowed(*args, TODAY)
-    assert not lint.exception_allowed(*args, datetime.date(2027, 4, 12))
-    assert not lint.exception_allowed(CONFIG, entry['repository'], entry['workflow'], 'build', job, TODAY)
-    assert not lint.exception_allowed(CONFIG, entry['repository'], '.github/workflows/ci.yml', entry['job'], job, TODAY)
-    assert not lint.exception_allowed(CONFIG, 'someone/agent-harness', entry['workflow'], entry['job'], job, TODAY)
-    assert not lint.exception_allowed(CONFIG, entry['repository'], entry['workflow'], entry['job'], {}, TODAY)
+    document = {'on': 'pull_request'}
+    assert lint.exception_allowed(*args, TODAY, document)
+    assert not lint.exception_allowed(*args, datetime.date(2027, 4, 12), document)
+    assert not lint.exception_allowed(CONFIG, entry['repository'], entry['workflow'], 'build', job, TODAY, document)
+    assert not lint.exception_allowed(CONFIG, entry['repository'], '.github/workflows/ci.yml', entry['job'], job, TODAY, document)
+    assert not lint.exception_allowed(CONFIG, 'someone/agent-harness', entry['workflow'], entry['job'], job, TODAY, document)
+    assert not lint.exception_allowed(CONFIG, entry['repository'], entry['workflow'], entry['job'], {}, TODAY, document)
 
 
 def test_recursive_yaml_matrix_cannot_loop():
@@ -59,6 +60,18 @@ def test_review_exception_rejects_unapproved_triggers(entry, trigger):
     )
     findings = lint.lint_files({entry['workflow']: content}, entry['repository'], 'public', CONFIG, TODAY)
     assert [item['rule'] for item in findings] == ['public-self-hosted']
+
+
+@pytest.mark.parametrize('trigger', [
+    'on: pull_request', '"on": workflow_dispatch',
+    'on: [pull_request, workflow_dispatch]',
+    'on: {pull_request: {types: [opened]}, workflow_dispatch: null}',
+])
+@pytest.mark.parametrize('entry', CONFIG['review_exceptions'], ids=lambda entry: entry['repository'])
+def test_review_exception_accepts_only_guarded_safe_events(entry, trigger):
+    document = yaml.safe_load(trigger)
+    document['jobs'] = {'review': {'runs-on': 'self-hosted', 'if': entry['fork_guard']}}
+    assert not lint.runner_findings(entry['workflow'], document, entry['repository'], 'public', CONFIG, TODAY)
 
 
 def test_runner_json_escapes_and_matrix_include():

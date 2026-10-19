@@ -5,6 +5,7 @@
       "workflow": ".github/workflows/review.yml",
       "job": "review",
       "expires": "2027-04-12",
+      "allowed_events": ["pull_request", "workflow_dispatch"],
       "fork_guard": "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository",
       "reason": "Collaborator-only review runners; never schedule fork pull requests."
     },
@@ -13,6 +14,7 @@
       "workflow": ".github/workflows/review.yml",
       "job": "review",
       "expires": "2027-04-12",
+      "allowed_events": ["pull_request", "workflow_dispatch"],
       "fork_guard": "github.event_name == 'workflow_dispatch' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')",
       "reason": "Collaborator-only shared review caller; workflow_dispatch only."
     }

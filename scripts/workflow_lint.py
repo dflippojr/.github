@@ -42,12 +42,22 @@ def strings(value):
             pending.extend(item.values() if isinstance(item, dict) else item)
 
 
-def exception_allowed(config, repository, filename, job_id, job, today):
+def exception_allowed(config, repository, filename, job_id, job, today, document):
+    # PyYAML's YAML 1.1 loader reads the unquoted key `on` as True.
+    trigger = document.get('on', document.get(True))
+    if isinstance(trigger, str):
+        events = {trigger}
+    elif isinstance(trigger, (list, dict)):
+        events = set(trigger)
+    else:
+        return False
     guard = ' '.join(str(job.get('if', '')).split())
     for entry in config.get('review_exceptions', []):
         if (entry['repository'], entry['workflow'], entry['job']) != (repository, filename, job_id):
             continue
-        if today < datetime.date.fromisoformat(entry['expires']) and guard == entry['fork_guard']:
+        if (events and events <= set(entry['allowed_events'])
+                and today < datetime.date.fromisoformat(entry['expires'])
+                and guard == entry['fork_guard']):
             return True
     return False
 
@@ -97,7 +107,7 @@ def runner_findings(filename, document, repository, visibility, config, today):
         text = ' '.join(values)
         self_hosted = re.search(r'(?<![\w-])self-hosted(?![\w-])', text, re.I)
         if visibility == 'public' and self_hosted:
-            if not exception_allowed(config, repository, filename, job_id, job, today):
+            if not exception_allowed(config, repository, filename, job_id, job, today, document):
                 results.append(finding('error', 'public-self-hosted', filename, f'{job_id}: self-hosted is forbidden on public repositories'))
         elif visibility == 'private' and HOSTED.search(text) and not (isinstance(runner, str) and CI_SWITCH.fullmatch(runner)):
             results.append(finding('warning', 'private-hosted', filename, f'{job_id}: GitHub-hosted runner without the CI_RUNS_ON switch'))
