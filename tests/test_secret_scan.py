@@ -271,7 +271,10 @@ def commit_object_file(repo, raw_path, content):
         ).stdout.strip()
 
     blob = object_git("hash-object", "-w", "--stdin", data=content)
-    tree = object_git("mktree", "-z", data=b"100644 blob " + blob + b"\t" + raw_path + b"\0")
+    parts = raw_path.split(b"/")
+    tree = object_git("mktree", "-z", data=b"100644 blob " + blob + b"\t" + parts[-1] + b"\0")
+    for directory in reversed(parts[:-1]):
+        tree = object_git("mktree", "-z", data=b"040000 tree " + tree + b"\t" + directory + b"\0")
     parent = git(repo, "rev-parse", "HEAD")
     head = object_git("commit-tree", tree.decode(), "-p", parent, data=b"synthetic change\n")
     git(repo, "update-ref", "HEAD", head.decode())
