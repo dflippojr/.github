@@ -301,9 +301,12 @@ def scan_command(filename, command, addopts=None):
     the command line, so a worker flag on pytest's own command line replaces it,
     but only for that command: a later command that may run pytest (make, tox,
     a script) still sees the value. An inline assignment belongs to its command;
-    `export` and bare assignments persist.
+    `export` and bare assignments persist. Text that only mentions the name, such
+    as `echo PYTEST_ADDOPTS=`, assigns nothing. A value written to $GITHUB_ENV
+    reaches the steps after this one, never the commands in it, so it is returned
+    separately.
     Returns (findings, addopts in effect afterwards, whether the value passed in
-    was judged against a command or replaced).
+    was judged against a command or replaced, the value written to GITHUB_ENV or None).
     """
     results = []
     # Shell, cmd and PowerShell line continuations.
@@ -314,18 +317,21 @@ def scan_command(filename, command, addopts=None):
         lexer.whitespace_split = True
         tokens = list(lexer)
     except ValueError:
-        return [finding('warning', 'unparsed-command', filename, 'Could not tokenize command; inspect manually')], addopts, True
-    segments, current = [], []
+        return [finding('warning', 'unparsed-command', filename, 'Could not tokenize command; inspect manually')], addopts, True, None
+    segments, current, piped = [], [], []
     for token in tokens:
         if token and all(c in ';&|\n' for c in token):
             segments.append(current)
+            piped.append(token == '|')
             current = []
         else:
             current.append(token)
     segments.append(current)
+    piped.append(False)
+    written = None  # the PYTEST_ADDOPTS value this command writes to GITHUB_ENV
     inherited, resolved = bool(addopts), not addopts
     unjudged = False  # a value assigned by this script that no command has seen yet
-    for segment in segments:
+    for number, segment in enumerate(segments):
         inline, persist, words = command_word(segment)
         scoped = inline is not None and not persist
         effective = inline if scoped else addopts
@@ -345,14 +351,20 @@ def scan_command(filename, command, addopts=None):
         if judged and not scoped:
             resolved, unjudged = resolved or inherited, False
         # State changes take effect after the command that carries them.
-        assigned = inline if persist else next((m.group(1) for m in map(ADDOPTS_TOKEN.fullmatch, words[1:]) if m), None)
+        assigned = inline if persist else None
+        # A segment writes to GITHUB_ENV when it names the file or pipes into the segment that does.
+        sinks = segment + (segments[number + 1] if piped[number] else [])
+        if any('GITHUB_ENV' in token.upper() for token in sinks):
+            written = next((m.group(1) for m in map(ADDOPTS_TOKEN.fullmatch, words[1:]) if m), written)
         if assigned is None and words[:1] == ['unset'] and any(token.upper() == 'PYTEST_ADDOPTS' for token in words[1:]):
             assigned = ''
         if assigned is not None:
             addopts, inherited, resolved, unjudged = assigned, False, True, bool(assigned)
     if addopts and unjudged:
         results.extend(addopts_findings(filename, addopts))
-    return results, addopts, resolved
+    if written:
+        results.extend(addopts_findings(filename, written))
+    return results, addopts, resolved, written
 
 
 def parallelism_findings(filename, command):
@@ -389,19 +401,19 @@ def workflow_parallelism(filename, document):
             # A command handed to an action through with: (retry, xvfb, ...) runs like a run step.
             commands = [value for value in strings(step.get('with')) if TEST_TOOL.search(value)] if opaque else []
             if isinstance(step.get('run'), str):
-                found, after, resolved = scan_command(filename, step['run'], effective)
+                found, _, resolved, written = scan_command(filename, step['run'], effective)
                 results.extend(found)
                 if not inherits and own is not None and effective and not resolved:
                     results.extend(addopts_findings(filename, own))
                 judged = judged or (inherits and resolved)
-                if 'GITHUB_ENV' in step['run'].upper() and after != effective:
-                    persisted = after
+                if written is not None:
+                    persisted = written
             elif opaque:
                 # The action may run pytest through an input the scan cannot read, so the value
                 # it inherits counts unless a with: command that names pytest overrode it.
                 covered = False
                 for command in commands:
-                    found, _, resolved = scan_command(filename, command, effective)
+                    found, _, resolved, _ = scan_command(filename, command, effective)
                     results.extend(found)
                     covered = covered or resolved
                 if effective and not covered:

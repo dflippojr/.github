@@ -388,6 +388,29 @@ def test_each_command_is_judged_on_its_own_effective_parallelism(name, files, ex
     assert policy_rules(files) == expected
 
 
+ECHO_AUTO = ['PYTEST_ADDOPTS: -n auto']
+
+
+@pytest.mark.parametrize('name,files,expected', [
+    # Printing text that looks like an assignment does not change the environment pytest inherits.
+    ('echo-after-export', {WORKFLOW: workflow(run=AUTO + 'echo PYTEST_ADDOPTS=\npytest')}, CAP),
+    ('printf-after-export', {WORKFLOW: workflow(run=AUTO + 'printf PYTEST_ADDOPTS=\npytest')}, CAP),
+    ('echo-quoted-value-after-export', {WORKFLOW: workflow(run=AUTO + 'echo "PYTEST_ADDOPTS=-n 2"\npytest')}, CAP),
+    ('echo-after-job-env', {WORKFLOW: workflow(job_env=ECHO_AUTO, run='echo PYTEST_ADDOPTS=\npytest')}, CAP),
+    ('printf-after-workflow-env', {WORKFLOW: workflow(env=ECHO_AUTO, run='printf "PYTEST_ADDOPTS=%s" ""\npytest')}, CAP),
+    ('echo-then-pytest-in-next-step', {WORKFLOW: workflow(job_env=ECHO_AUTO, run='echo PYTEST_ADDOPTS=', extra_steps='      - run: pytest\n')}, CAP),
+    ('echo-printed-value-never-reaches-pytest', {WORKFLOW: workflow(run='echo "PYTEST_ADDOPTS=-n 16"', extra_steps='      - run: pytest\n')}, []),
+    # A GITHUB_ENV write reaches the steps after it, never the command that writes it.
+    ('github-env-write-then-same-step-pytest', {WORKFLOW: workflow(job_env=ECHO_AUTO, run='echo "PYTEST_ADDOPTS=-n 2" >> "$GITHUB_ENV"\npytest')}, CAP),
+    ('github-env-write-then-same-step-pytest-no-inherited', {WORKFLOW: workflow(run='echo "PYTEST_ADDOPTS=-n 2" >> "$GITHUB_ENV"\npytest')}, []),
+    ('github-env-clear-then-next-step-pytest', {WORKFLOW: workflow(job_env=ECHO_AUTO, run='echo "PYTEST_ADDOPTS=" >> "$GITHUB_ENV"', extra_steps='      - run: pytest\n')}, []),
+    ('github-env-write-through-tee', {WORKFLOW: workflow(run='echo "PYTEST_ADDOPTS=-n 16" | tee -a "$GITHUB_ENV"', extra_steps='      - run: pytest\n')}, CAP),
+    ('other-github-env-write-keeps-inherited', {WORKFLOW: workflow(job_env=ECHO_AUTO, run='echo PYTEST_ADDOPTS=\necho FOO=1 >> "$GITHUB_ENV"', extra_steps='      - run: pytest\n')}, CAP),
+], ids=lambda value: value if isinstance(value, str) else None)
+def test_echoed_assignment_text_is_not_an_environment_assignment(name, files, expected):
+    assert policy_rules(files) == expected
+
+
 @pytest.mark.parametrize('command,expected', [
     ('npx playwright test -j 8', CAP), ('npx playwright test -j8', CAP), ('playwright test -j=8', CAP), ('playwright test -j 50%', CAP),
     ('playwright test -j 100%', CAP), ('playwright test -j 5', CAP), ('playwright test --workers 5 -j 2', CAP), ('playwright test -j 2 --workers 8', CAP),
