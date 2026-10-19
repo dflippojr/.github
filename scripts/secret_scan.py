@@ -183,7 +183,7 @@ def scan_gitleaks(repo, base, head, executable):
         report = folder / "report.json"
         result = subprocess.run([
             executable, "git", git_dir, "--config", str(config),
-            "--log-opts", f"--no-ext-diff --no-textconv {base}..{head}",
+            "--log-opts", f"--no-ext-diff --no-textconv --diff-merges=first-parent {base}..{head}",
             "--ignore-gitleaks-allow", "--redact=100", "--no-banner",
             "--log-level=fatal", "--report-format=json", "--report-path", str(report),
             "--exit-code=42",
