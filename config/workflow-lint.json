@@ -5,18 +5,25 @@
       "workflow": ".github/workflows/review.yml",
       "job": "review",
       "expires": "2027-04-12",
-      "allowed_events": ["pull_request", "workflow_dispatch"],
+      "allowed_events": [
+        "pull_request",
+        "workflow_dispatch",
+        "workflow_call"
+      ],
       "fork_guard": "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository",
-      "reason": "Collaborator-only review runners; never schedule fork pull requests."
+      "reason": "Collaborator-only review runners; never schedule fork pull requests. workflow_call: other repositories and local callers run this shared workflow; local callers are held to these events."
     },
     {
       "repository": "dflippojr/agent-harness-hub",
       "workflow": ".github/workflows/review.yml",
       "job": "review",
       "expires": "2027-04-12",
-      "allowed_events": ["pull_request", "workflow_dispatch"],
+      "allowed_events": [
+        "pull_request_target",
+        "workflow_dispatch"
+      ],
       "fork_guard": "github.event_name == 'workflow_dispatch' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')",
-      "reason": "Collaborator-only shared review caller; workflow_dispatch only."
+      "reason": "Collaborator-only shared review caller; pull_request_target uses the base copy and the guard skips fork PRs, workflow_dispatch for re-reviews. Never pull_request."
     }
   ]
 }

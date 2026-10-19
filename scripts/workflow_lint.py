@@ -47,24 +47,58 @@ def strings(value):
             pending.extend(item.values() if isinstance(item, dict) else item)
 
 
-def exception_allowed(config, repository, filename, job_id, job, today, document):
-    # PyYAML's YAML 1.1 loader reads the unquoted key `on` as True.
+def trigger_events(document):
+    """The event names a workflow declares. PyYAML's YAML 1.1 loader reads the unquoted key `on` as True."""
     trigger = document.get('on', document.get(True))
     if isinstance(trigger, str):
-        events = {trigger}
-    elif isinstance(trigger, (list, dict)):
-        events = set(trigger)
-    else:
-        return False
+        return {trigger}
+    if isinstance(trigger, (list, dict)):
+        return set(trigger)
+    return set()
+
+
+def active_exceptions(config, repository, today):
+    return [entry for entry in config.get('review_exceptions', [])
+            if entry['repository'] == repository and today < datetime.date.fromisoformat(entry['expires'])]
+
+
+def exception_allowed(config, repository, filename, job_id, job, today, document):
+    events = trigger_events(document)
     guard = ' '.join(str(job.get('if', '')).split())
-    for entry in config.get('review_exceptions', []):
-        if (entry['repository'], entry['workflow'], entry['job']) != (repository, filename, job_id):
-            continue
-        if (events and events <= set(entry['allowed_events'])
-                and today < datetime.date.fromisoformat(entry['expires'])
-                and guard == entry['fork_guard']):
-            return True
-    return False
+    return any((entry['workflow'], entry['job']) == (filename, job_id)
+               and events and events <= set(entry['allowed_events']) and guard == entry['fork_guard']
+               for entry in active_exceptions(config, repository, today))
+
+
+def local_workflow(uses, repository):
+    """The workflow path a `uses:` reference calls inside this repository, or None."""
+    if uses.startswith('./'):
+        return PurePosixPath(uses[2:]).as_posix()
+    match = re.fullmatch(r'([^/@\s]+/[^/@\s]+)/(\.github/workflows/[^@\s]+)@\S+', uses)
+    return match.group(2) if match and match.group(1).lower() == repository.lower() else None
+
+
+def exception_caller_findings(documents, repository, config, today):
+    """Callers of an excepted workflow run it on its self-hosted runner, so their triggers must be safe too.
+
+    A caller that leaves out the runner input has no runner label for the runner
+    rule to read, and the callee's fork guard cannot see events it was not written for.
+    """
+    allowed = {entry['workflow']: set(entry['allowed_events']) for entry in active_exceptions(config, repository, today)}
+    results, changed = [], bool(allowed)
+    while changed:
+        changed = False
+        for filename, document in sorted(documents.items()):
+            events = trigger_events(document)
+            for job_id, job in (document.get('jobs') or {}).items():
+                target = local_workflow(job['uses'], repository) if isinstance(job, dict) and isinstance(job.get('uses'), str) else None
+                if target not in allowed:
+                    continue
+                if not events or not events <= allowed[target]:
+                    results.append(finding('error', 'review-exception-caller', filename, f'{job_id}: calls {target}, which may run on a self-hosted runner, from events outside {sorted(allowed[target])}'))
+                elif 'workflow_call' in events and filename not in allowed:
+                    allowed[filename], changed = allowed[target], True
+    return results
 
 
 def runner_values(runner, job):
@@ -313,11 +347,11 @@ def script_findings(filename, content):
 
 def lint_files(files, repository, visibility, config, today=None):
     today = today or datetime.datetime.now(datetime.timezone.utc).date()
-    results = []
+    results, documents = [], {}
     for filename, content in sorted(files.items()):
         try:
             if workflow_path(filename):
-                document = yaml.safe_load(content)
+                document = documents[filename] = yaml.safe_load(content)
                 if not isinstance(document, dict):
                     raise ValueError('Workflow must be a mapping')
                 results.extend(runner_findings(filename, document, repository, visibility, config, today))
@@ -332,6 +366,11 @@ def lint_files(files, repository, visibility, config, today=None):
                 results.extend(pytest_config_findings(filename, content))
         except (yaml.YAMLError, ValueError, TypeError, AttributeError) as error:
             results.append(finding('error', 'invalid-file', filename, str(error)))
+    if visibility == 'public':
+        try:
+            results.extend(exception_caller_findings({name: doc for name, doc in documents.items() if isinstance(doc, dict)}, repository, config, today))
+        except (ValueError, TypeError, AttributeError) as error:
+            results.append(finding('error', 'invalid-file', '.github/workflows', str(error)))
     # The same literal can be reachable from several steps or scopes.
     return [item for index, item in enumerate(results) if item not in results[:index]]
 
