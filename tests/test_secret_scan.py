@@ -322,3 +322,21 @@ def test_untrusted_filename_contents_are_scanned(repo, monkeypatch, capsys, raw_
         "file": "<redacted-path:" + hashlib.sha256(raw_path).hexdigest() + ">",
         "line": 1, "rule": "personal-identifier",
     }], "the exact filename must identify the finding opaquely"
+
+
+@pytest.mark.parametrize("mode", ["--financial", "--financial-only"])
+def test_non_utf8_financial_filename_is_scanned(repo, monkeypatch, capsys, mode):
+    raw_path = b"test_invalid-\xff.csv"
+    value = "4111" + "1111" * 3
+    base = git(repo, "rev-parse", "HEAD")
+    commit_object_file(repo, raw_path, ("# SYNTHETIC\n" + value + "\n").encode())
+    monkeypatch.setenv("SECRET_SCAN_DENYLIST_SHA256", scan.digest("unrelated-synthetic-host"))
+    monkeypatch.setattr(scan, "scan_gitleaks", lambda *args: set())
+    result = scan.main(["--repo-dir", str(repo), "--base", base, mode])
+    captured = capsys.readouterr()
+    assert value not in captured.out + captured.err, "matched value must stay private"
+    assert result == 1, "the exact fixture blob must be scanned"
+    rows = [json.loads(line) for line in captured.out.splitlines()[:-1]]
+    expected = "<redacted-path:" + hashlib.sha256(raw_path).hexdigest() + ">"
+    assert {row["rule"] for row in rows} == {"luhn-number", "account-like-number"}
+    assert all(row["file"] == expected and row["line"] == 2 for row in rows)
