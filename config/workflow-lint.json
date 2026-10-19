@@ -1,0 +1,20 @@
+{
+  "review_exceptions": [
+    {
+      "repository": "dflippojr/agent-harness",
+      "workflow": ".github/workflows/review.yml",
+      "job": "review",
+      "expires": "2027-04-12",
+      "fork_guard": "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository",
+      "reason": "Collaborator-only review runners; never schedule fork pull requests."
+    },
+    {
+      "repository": "dflippojr/agent-harness-hub",
+      "workflow": ".github/workflows/review.yml",
+      "job": "review",
+      "expires": "2027-04-12",
+      "fork_guard": "github.event_name == 'workflow_dispatch' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')",
+      "reason": "Collaborator-only shared review caller; workflow_dispatch only."
+    }
+  ]
+}

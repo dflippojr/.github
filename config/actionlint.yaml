@@ -1,0 +1,4 @@
+# Custom labels are judged by workflow_lint.py's visibility policy. Keep all
+# other actionlint diagnostics. This trusted config replaces target config.
+self-hosted-runner:
+  labels: ['*']
