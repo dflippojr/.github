@@ -107,10 +107,9 @@ For each caller: **Settings → Secrets and variables → Actions → New reposi
 secret**, name `SECRET_SCAN_DENYLIST_SHA256`. The owner must populate the private
 inventory before wiring callers. No production inventory has been verified.
 
-For every repository below: **Repository → Settings → Security → Advanced
-Security → Secret Protection → Secret scanning → Enable**, then **Push
-protection → Enable**. GitHub can show this section as **Code security** in some
-layouts. See [GitHub's push protection setup](https://docs.github.com/en/code-security/secret-scanning/enabling-secret-scanning-features/enabling-push-protection-for-your-repository).
+For every repository below: **Repository → Settings → Security and quality →
+Advanced Security → Secret Protection → Enable**, then **Secret Protection →
+Push protection → Enable**. See [GitHub's push protection setup](https://docs.github.com/en/code-security/how-tos/secure-your-secrets/prevent-future-leaks/enable-push-protection).
 The owner must perform this security-settings step; an unavailable control on
 a private repository needs an eligible GitHub Secret Protection plan.
 
