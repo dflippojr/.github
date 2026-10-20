@@ -1,0 +1,16 @@
+# Copy to .github/workflows/workflow-lint.yml. Replace BOTH <full-sha>
+# placeholders with the same full commit SHA of dflippojr/.github main.
+# This caller uses pull_request with no secrets and only contents: read.
+name: Workflow lint
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  workflow-lint:
+    uses: dflippojr/.github/.github/workflows/workflow-lint.yml@<full-sha>
+    with:
+      lint-ref: <full-sha>

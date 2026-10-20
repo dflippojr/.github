@@ -1,0 +1,11 @@
+on:
+  workflow_call:
+    inputs:
+      required_value:
+        type: string
+        required: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

@@ -1,0 +1,290 @@
+[
+  {
+    "name": "public-self-hosted",
+    "files": {
+      ".github/workflows/ci.yml": "on: pull_request\njobs:\n  test:\n    runs-on: [self-hosted, Linux, tower-linux]\n    steps:\n      - run: echo ok\n"
+    },
+    "expected": [
+      [
+        "error",
+        "public-self-hosted"
+      ]
+    ]
+  },
+  {
+    "name": "public-hosted",
+    "files": {
+      ".github/workflows/ci.yml": "on: pull_request\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"
+    },
+    "expected": []
+  },
+  {
+    "name": "private-hosted-warning",
+    "files": {
+      ".github/workflows/ci.yml": "on: pull_request\njobs:\n  test:\n    runs-on: windows-2025\n    steps:\n      - run: echo ok\n"
+    },
+    "expected": [
+      [
+        "warning",
+        "private-hosted"
+      ]
+    ],
+    "visibility": "private"
+  },
+  {
+    "name": "private-self-hosted",
+    "files": {
+      ".github/workflows/ci.yml": "on: pull_request\njobs:\n  test:\n    runs-on: [self-hosted, tower-linux]\n    steps:\n      - run: echo ok\n"
+    },
+    "expected": [],
+    "visibility": "private"
+  },
+  {
+    "name": "private-CI_RUNS_ON",
+    "files": {
+      ".github/workflows/ci.yml": "on: pull_request\njobs:\n  test:\n    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '[\"self-hosted\",\"tower-linux\"]') }}\n    steps:\n      - run: echo ok\n"
+    },
+    "expected": [],
+    "visibility": "private"
+  },
+  {
+    "name": "public-switch-still-forbidden",
+    "files": {
+      ".github/workflows/ci.yml": "on: pull_request\njobs:\n  test:\n    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '[\"self-hosted\",\"tower-linux\"]') }}\n    steps:\n      - run: echo ok\n"
+    },
+    "expected": [
+      [
+        "error",
+        "public-self-hosted"
+      ]
+    ]
+  },
+  {
+    "name": "private-switch-hosted-fallback",
+    "files": {
+      ".github/workflows/ci.yml": "on: pull_request\njobs:\n  test:\n    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '\"ubuntu-latest\"') }}\n    steps:\n      - run: echo ok\n"
+    },
+    "expected": [],
+    "visibility": "private"
+  },
+  {
+    "name": "private-unrelated-variable",
+    "files": {
+      ".github/workflows/ci.yml": "on: pull_request\njobs:\n  test:\n    runs-on: ${{ fromJSON(vars.OTHER || '\"ubuntu-latest\"') }}\n    steps:\n      - run: echo ok\n"
+    },
+    "expected": [
+      [
+        "warning",
+        "private-hosted"
+      ]
+    ],
+    "visibility": "private"
+  },
+  {
+    "name": "public-matrix",
+    "files": {
+      ".github/workflows/ci.yml": "on: pull_request\njobs:\n  test:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        runner: [ubuntu-latest, self-hosted]\n    steps:\n      - run: echo ok\n"
+    },
+    "expected": [
+      [
+        "error",
+        "public-self-hosted"
+      ]
+    ]
+  },
+  {
+    "name": "public-runner-group",
+    "files": {
+      ".github/workflows/ci.yml": "on: pull_request\njobs:\n  test:\n    runs-on: {group: review, labels: [self-hosted]}\n    steps:\n      - run: echo ok\n"
+    },
+    "expected": [
+      [
+        "error",
+        "public-self-hosted"
+      ]
+    ]
+  },
+  {
+    "name": "unresolved-runner-warning",
+    "files": {
+      ".github/workflows/ci.yml": "on: pull_request\njobs:\n  test:\n    runs-on: ${{ inputs.runner }}\n    steps:\n      - run: echo ok\n"
+    },
+    "expected": [
+      [
+        "warning",
+        "dynamic-runner"
+      ]
+    ]
+  },
+  {
+    "name": "dflippojr/agent-harness-review-exception",
+    "files": {
+      ".github/workflows/review.yml": "on: workflow_dispatch\njobs:\n  review:\n    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository\n    runs-on: [self-hosted, Windows]\n    steps:\n      - run: echo review\n"
+    },
+    "expected": [],
+    "repository": "dflippojr/agent-harness"
+  },
+  {
+    "name": "dflippojr/agent-harness-hub-review-exception",
+    "files": {
+      ".github/workflows/review.yml": "on: workflow_dispatch\njobs:\n  review:\n    if: github.event_name == 'workflow_dispatch' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')\n    runs-on: [self-hosted, Windows]\n    steps:\n      - run: echo review\n"
+    },
+    "expected": [],
+    "repository": "dflippojr/agent-harness-hub"
+  },
+  {
+    "name": "reusable-review-input",
+    "files": {
+      ".github/workflows/ci.yml": "on: pull_request\njobs:\n  review:\n    uses: a/b/.github/workflows/review.yml@main\n    with:\n      runs_on: '[\"self-hosted\",\"Windows\"]'\n"
+    },
+    "expected": [
+      [
+        "error",
+        "public-self-hosted"
+      ]
+    ]
+  },
+  {
+    "name": "workflow-pytest-auto",
+    "files": {
+      ".github/workflows/ci.yml": "on: pull_request\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          python -m pytest -n auto\n"
+    },
+    "expected": [
+      [
+        "error",
+        "parallelism-cap"
+      ]
+    ]
+  },
+  {
+    "name": "workflow-pytest-above-four",
+    "files": {
+      ".github/workflows/ci.yml": "on: pull_request\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          uv run pytest -n8\n"
+    },
+    "expected": [
+      [
+        "error",
+        "parallelism-cap"
+      ]
+    ]
+  },
+  {
+    "name": "workflow-playwright-above-four",
+    "files": {
+      ".github/workflows/ci.yml": "on: pull_request\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          npx playwright test --workers 8\n"
+    },
+    "expected": [
+      [
+        "error",
+        "parallelism-cap"
+      ]
+    ]
+  },
+  {
+    "name": "workflow-four",
+    "files": {
+      ".github/workflows/ci.yml": "on: pull_request\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          pytest -n 4\n          npx playwright test --workers=4\n"
+    },
+    "expected": []
+  },
+  {
+    "name": "shell-ci-local",
+    "files": {
+      "scripts/ci-local.sh": "#!/bin/sh\npytest \\\n -n 6\n"
+    },
+    "expected": [
+      [
+        "error",
+        "parallelism-cap"
+      ]
+    ]
+  },
+  {
+    "name": "powershell-ci-local",
+    "files": {
+      "ci-local.ps1": "python -m pytest `\n --numprocesses 7"
+    },
+    "expected": [
+      [
+        "error",
+        "parallelism-cap"
+      ]
+    ]
+  },
+  {
+    "name": "package-json",
+    "files": {
+      "web/package.json": "{\"scripts\":{\"test\":\"playwright test --workers=6\"}}"
+    },
+    "expected": [
+      [
+        "error",
+        "parallelism-cap"
+      ]
+    ]
+  },
+  {
+    "name": "dependencies-not-commands",
+    "files": {
+      "package.json": "{\"dependencies\":{\"pytest -n auto\":\"1\"},\"scripts\":{\"test\":\"echo ok\"}}"
+    },
+    "expected": []
+  },
+  {
+    "name": "safe-disc-golf-cap",
+    "files": {
+      "ci-local.sh": "pytest -n 2"
+    },
+    "expected": []
+  },
+  {
+    "name": "comments-ignored",
+    "files": {
+      "ci-local.sh": "# pytest -n auto\necho ok"
+    },
+    "expected": []
+  },
+  {
+    "name": "separate-commands",
+    "files": {
+      "ci-local.sh": "pytest -n 4; echo --workers=8\necho -n auto"
+    },
+    "expected": []
+  },
+  {
+    "name": "invalid-yaml",
+    "files": {
+      ".github/workflows/ci.yml": "jobs: ["
+    },
+    "expected": [
+      [
+        "error",
+        "invalid-file"
+      ]
+    ]
+  },
+  {
+    "name": "invalid-package-json",
+    "files": {
+      "package.json": "{"
+    },
+    "expected": [
+      [
+        "error",
+        "invalid-file"
+      ]
+    ]
+  },
+  {
+    "name": "dynamic-cap-warning",
+    "files": {
+      "ci-local.sh": "pytest -n \"$WORKERS\""
+    },
+    "expected": [
+      [
+        "warning",
+        "dynamic-parallelism"
+      ]
+    ]
+  }
+]

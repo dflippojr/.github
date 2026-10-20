@@ -1,0 +1,60 @@
+name: Automated Code Review
+
+# Thin caller for the shared review workflow in dflippojr/agent-harness, so fixes to the reviewer reach this repository
+# without a copy. The workflow and its tooling (tooling_ref) are both pinned to the review-v3 tag. See agent-harness
+# docs/CI-CD.md, "Adopting the review workflow".
+#
+# Reviews a PR once when it is opened; dispatch for a re-review after later commits.
+#
+# Never pull_request: the reviewer reads untrusted PR content with shell access on the self-hosted runner, and a
+# fork's pull_request run would execute the fork's copy of this file. pull_request_target uses the base copy; the
+# owner-installed job-started hook (ops/github/review-job-started.ps1) permits only this file on main for either
+# event. The workflow guard skips fork PRs, and the shared job refuses them too. Keep fork approval at all external
+# contributors; see docs/review-runner.md. The PR head is checked out only as review context; nothing from it runs.
+# No secrets are passed: the shared workflow needs only the GITHUB_TOKEN, which a called workflow always receives,
+# narrowed by the permissions below. Dependabot PRs are skipped, and a review on open lets the shared workflow
+# choose the backend: REVIEW_BACKENDS, then its default of codex,claude (GPT leads on purpose: a different model
+# family from the Claude author reviews differently). Models and effort come from the REVIEW_MODEL_* and
+# REVIEW_EFFORT_* repository variables, else the shared workflow's defaults.
+on:
+  pull_request_target:
+    types: [opened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to review"
+        required: true
+      backend:
+        description: "Review backend (auto uses REVIEW_BACKENDS)"
+        required: false
+        default: auto
+        type: choice
+        options: [auto, cursor, codex, claude]
+      mode:
+        description: "Review coverage (auto = incremental when safe)"
+        required: false
+        default: auto
+        type: choice
+        options: [auto, full]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+  # review-v3 reads the issues the pull request closes, the spec it reviews against. A called workflow can't hold
+  # more than its caller grants.
+  issues: read
+
+jobs:
+  review:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]')
+    uses: dflippojr/agent-harness/.github/workflows/review.yml@review-v3
+    with:
+      pr_number: ${{ inputs.pr_number || github.event.pull_request.number }}
+      backend: ${{ inputs.backend || 'auto' }}
+      mode: ${{ inputs.mode || 'full' }}
+      runs_on: '["self-hosted","Windows","X64","agent-harness-hub-review"]'
+      tooling_ref: review-v3

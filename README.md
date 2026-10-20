@@ -220,6 +220,80 @@ anything from the pull request:
 - **`gate-guard.yml` callers.** Repositories still on the `pull_request`
   version keep the old hole until they move.
 
+## Workflow lint
+
+`.github/workflows/workflow-lint.yml` is a reusable `workflow_call` check named
+`workflow-lint`. Copy `templates/workflow-lint-caller.yml` into a consumer and
+replace both placeholders with the same full SHA of this repository after merge.
+It uses plain `pull_request`, no secrets and only `contents: read` (GitHub's
+repository metadata access is implicit). Its job currently uses `ubuntu-latest`,
+including for private callers; that deliberate hosted job is visible as a private
+runner warning when auditing this reusable workflow. No consumer is migrated by
+this change. The check appears as `workflow-lint / workflow-lint` with the template.
+
+The script reads visibility from the repository API. It fails public repositories'
+`self-hosted` labels, including literal JSON expressions, matrix entries and
+reusable-call runner inputs. `config/workflow-lint.json` lists the only exceptions:
+the `review` jobs in the two harness repositories' `review.yml`, with their exact
+fork guards, expiring at 2027-04-12 UTC. A moved job, removed guard or expired
+entry fails. Private GitHub-hosted labels produce warnings; the
+`${{ fromJSON(vars.CI_RUNS_ON || '...') }}` form is allowed in private repositories.
+Unresolvable runner expressions produce warnings for manual review; static
+analysis cannot determine arbitrary runtime variables or called workflow code.
+
+All current workflows (`.yml` and `.yaml`), tracked `ci-local*` scripts at any
+depth, and `package.json` scripts are checked for pytest `-n`/`--numprocesses`
+and Playwright `--workers`. Literal counts above four, pytest `auto`/`logical`,
+and percentage counts fail. Two and four are allowed. Dynamic counts warn;
+the check does not interpret arbitrary shell logic, wrappers or computed flags.
+Options that pytest reads before the command line count too: a literal
+`PYTEST_ADDOPTS` in workflow, job or step `env`, or assigned in a `run` step, a
+package script, a `ci-local` shell or Python/JS launcher (including `export`,
+`env`, `$env:`, `set` and `$GITHUB_ENV`), and `addopts` in `pytest.ini`,
+`.pytest.ini`, `tox.ini`, `setup.cfg`, `pyproject.toml` and `pytest.toml`. A worker
+flag on the same pytest command line replaces the environment value, so it is
+judged instead. A `PYTEST_ADDOPTS` value the check cannot read exactly fails
+as a cap error: one that depends on an expression or variable, a quote that
+never closes, a worker count that is not a number, or text written through
+`printf` or `echo -e` with a backslash escape or `%` format.
+No clear or weaker value is credited. A `PYTEST_ADDOPTS` value written to
+`$GITHUB_ENV` is checked in the step that writes it, but never clears or
+weakens the value later steps inherit from workflow or job `env`: whether it
+lands as its own line depends on the shell, stream, line breaks and later
+overwrites, which the YAML does not show. Within a script, `unset` or a new
+assignment, inline or exported, never removes the value already in effect: it
+may sit in a branch that never runs, so every later command is judged on both.
+To change the inherited value for a step, set `PYTEST_ADDOPTS` in that step's
+own `env:` block.
+Only `run` steps and package scripts are commands; comments and dependencies
+are not. This checks the whole head tree so an unchanged unsafe setting remains
+visible when another file changes.
+
+Actionlint checks only added or modified PR workflows, relative to the API's
+merge base; deleted workflows and PRs with no workflow changes do not invoke it.
+Actionlint's source is pinned to a full commit SHA, as are all actions. A fresh
+temporary directory and trusted `config/actionlint.yaml` prevent PR config from
+suppressing diagnostics. The directory holds an empty `.git` marker and every head
+workflow, so local reusable calls resolve and a missing callee, a missing required
+input or an undefined input is reported; only the changed workflows are linted. Custom runner names are accepted by actionlint and
+judged by our visibility rules. ShellCheck and Pyflakes subprocesses are disabled.
+Target files are read from a shallow bare git repository, without checkout,
+hooks, submodules, symlink traversal, dependency installation or target execution.
+
+Local policy tests: `python -m pytest -q tests/test_workflow_lint.py`. With the
+pinned actionlint executable on PATH and `GITHUB_TOKEN` set, run:
+
+```sh
+python scripts/workflow_lint.py --repository dflippojr/some-repo --output report.json
+python scripts/workflow_lint.py --repository dflippojr/some-repo --event-file event.json
+python scripts/audit_workflow_lint.py --rulesets rulesets.yaml --rulesets-revision FULL_SHA --output audit.json
+```
+
+Without an event file, every current default-branch workflow is sent to actionlint.
+The audit includes all `repos` entries, even disabled/held ones, records each head
+and visibility, and reports fetch errors explicitly. Violations do not abort the
+inventory. See `docs/workflow-lint-audit.md` for the initial audit and limitations.
+
 ## PR body lint
 
 `.github/workflows/pr-body-lint.yml` supplies an Actions job named **pr-body**.

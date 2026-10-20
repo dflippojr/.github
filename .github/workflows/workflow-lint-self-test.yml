@@ -1,0 +1,13 @@
+name: Workflow lint integration
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  workflow-lint:
+    uses: ./.github/workflows/workflow-lint.yml
+    with:
+      lint-ref: ${{ github.sha }}

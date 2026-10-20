@@ -1,0 +1,57 @@
+name: workflow-lint
+
+on:
+  workflow_call:
+    inputs:
+      lint-ref:
+        description: Full commit SHA of dflippojr/.github containing the linter and config; match the caller's uses SHA.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  workflow-lint:
+    name: workflow-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Validate event and tooling revision
+        env:
+          LINT_REF: ${{ inputs.lint-ref }}
+        run: |
+          test "$GITHUB_EVENT_NAME" = pull_request
+          [[ "$LINT_REF" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Check out trusted tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dflippojr/.github
+          ref: ${{ inputs.lint-ref }}
+          persist-credentials: false
+          path: tooling
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.25.0'
+          cache: false
+
+      - name: Install pinned tooling
+        env:
+          GOBIN: ${{ runner.temp }}/workflow-lint-bin
+          GOMAXPROCS: '4'
+          GOFLAGS: '-p=4'
+        run: |
+          python -m pip install PyYAML==6.0.3
+          go install github.com/rhysd/actionlint/cmd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca
+          echo "$GOBIN" >> "$GITHUB_PATH"
+
+      - name: Lint PR data
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python tooling/scripts/workflow_lint.py --event-file "$GITHUB_EVENT_PATH"

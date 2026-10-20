@@ -1,0 +1,6 @@
+on: pull_request
+jobs:
+  test:
+    uses: ./.github/workflows/reusable.yml
+    with:
+      required_value: supplied
