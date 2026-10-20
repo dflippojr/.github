@@ -131,6 +131,101 @@ class RuleDetails(unittest.TestCase):
         self.assertEqual(hit.detail, "PlatformIO test_filter entry removed: test_controls")
         self.assertEqual(self.hits("pass-platformio-filter-widened"), [])
 
+    def test_platformio_filter_added_to_an_env_is_a_hit(self):
+        [hit] = self.hits("flag-skip-platformio-filter-added")
+        self.assertEqual(hit.detail, "PlatformIO test_filter added to env:native: runs only test_logic")
+
+    def test_platformio_filter_gained_through_extends_is_a_hit(self):
+        [hit] = self.hits("flag-skip-platformio-filter-extends")
+        self.assertEqual(hit.detail, "PlatformIO env:native-coverage now inherits a test_filter: runs only test_logic")
+
+    def test_platformio_filter_key_removed_runs_everything(self):
+        self.assertEqual(self.hits("pass-platformio-filter-removed"), [])
+
+    def platformio_diff(self, body):
+        lines = body.strip("\n").split("\n")
+        old = sum(1 for l in lines if l[0] in " -")
+        new = sum(1 for l in lines if l[0] in " +")
+        header = "diff --git a/platformio.ini b/platformio.ini\n--- a/platformio.ini\n+++ b/platformio.ini\n"
+        return header + f"@@ -1,{old} +1,{new} @@\n" + "\n".join(lines) + "\n"
+
+    def test_platformio_filter_added_to_a_default_reaches_each_env_without_one(self):
+        for section in ("env", "platformio"):
+            with self.subTest(section=section):
+                diff = self.platformio_diff(f""" [{section}]
++test_filter = test_logic
+ [env:a]
+ platform = native
+ [env:b]
+ platform = native
+ test_filter = test_logic test_io
+""")
+                details = [h.detail for h in analyze_text(diff)]
+                self.assertEqual(details, ["PlatformIO env:a now inherits a test_filter: runs only test_logic"])
+
+    def test_platformio_filter_added_to_an_extended_section_reaches_its_children(self):
+        diff = self.platformio_diff(""" [base]
+ platform = native
++test_filter = test_logic
+ [env:a]
+ extends = base
+ [env:b]
+ extends = env:a
+""")
+        details = sorted(h.detail for h in analyze_text(diff))
+        self.assertEqual(details, [
+            "PlatformIO env:a now inherits a test_filter: runs only test_logic",
+            "PlatformIO env:b now inherits a test_filter: runs only test_logic",
+        ])
+
+    def test_platformio_env_with_its_own_filter_ignores_a_new_default(self):
+        diff = self.platformio_diff(""" [env]
++test_filter = test_logic
+ [env:a]
+ test_filter = test_logic test_io
+""")
+        self.assertEqual(analyze_text(diff), [])
+
+    def test_platformio_new_env_with_a_filter_is_not_a_narrowing(self):
+        diff = self.platformio_diff(""" [env:a]
+ platform = native
++[env:b]
++extends = env:a
++test_filter = test_logic
+""")
+        self.assertEqual(analyze_text(diff), [])
+
+    def test_platformio_extends_switch_to_a_narrower_filter_is_a_hit(self):
+        diff = self.platformio_diff(""" [env:wide]
+ test_filter = test_logic test_io
+ [env:narrow]
+ test_filter = test_logic
+ [env:a]
+-extends = env:wide
++extends = env:narrow
+""")
+        [hit] = analyze_text(diff)
+        self.assertEqual(hit.detail, "PlatformIO test_filter entry removed: test_io")
+
+    def test_platformio_extends_cycle_does_not_hang(self):
+        diff = self.platformio_diff(""" [env:a]
+-extends = env:b
++extends = env:b
+ [env:b]
+ extends = env:a
+""")
+        self.assertEqual(analyze_text(diff), [])
+
+    def test_platformio_changed_extends_to_a_section_the_diff_lacks_is_a_hit(self):
+        diff = self.platformio_diff(""" [env:wide]
+ test_filter = test_logic
+ [env:a]
+-extends = env:wide
++extends = missing
+""")
+        [hit] = analyze_text(diff)
+        self.assertEqual(hit.detail, "PlatformIO env:a extends a section the diff does not show: missing")
+
     def test_platformio_filter_continuation_stays_with_its_option(self):
         diff = """diff --git a/platformio.ini b/platformio.ini
 --- a/platformio.ini

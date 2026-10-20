@@ -1,0 +1,26 @@
+# gate-guard fixture: a test_filter is added to an env that had none, so it narrows from every test to a subset
+# expect: skip-marker
+# hits: 1
+
+diff --git a/firmware/platformio.ini b/firmware/platformio.ini
+index 4a1c9e2..c70b3d8 100644
+--- a/firmware/platformio.ini
++++ b/firmware/platformio.ini
+@@ -1,15 +1,17 @@
+ [platformio]
+ default_envs = esp32
+ 
+ [env]
+ framework = arduino
+ lib_deps = throwtheswitch/Unity@^2.6.0
+ 
+ [env:esp32]
+ platform = espressif32
+ board = esp32dev
+ 
+ [env:native]
+ platform = native
+ test_framework = unity
++test_filter =
++    test_logic
+ build_flags = -std=gnu++17

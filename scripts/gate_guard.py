@@ -471,6 +471,7 @@ def _js_tests(path):
 # lists the only tests that run, so removing from it is.
 PIO_IGNORE_KEY = re.compile(r"^\s*test_ignore\s*[=:]")
 PIO_FILTER_KEY = re.compile(r"^\s*test_filter\s*[=:]")
+PIO_EXTENDS_KEY = re.compile(r"^\s*extends\s*[=:]")
 PIO_LABEL = "PlatformIO test_ignore"
 
 SKIP_RULES = [
@@ -562,44 +563,94 @@ def _filter_entries(value):
     return [e for e in re.split(r"[,\s]+", re.sub(r"\s[#;].*$", "", value.strip())) if e]
 
 
-def _filter_hits(files):
-    """Entries a PlatformIO test_filter lost: a filter that shrinks stops running those tests.
+def _ini_options(fd):
+    """Each side's test_filter and extends options, by section: {side: {section: {option: [entries]}}}.
 
-    Entries are compared per option and env, old side against new, so a
-    reformatted filter or one that grew is not a hit, and a continuation line
-    stays with the option it belongs to. Dropping the whole key runs everything.
+    The diff carries the whole file (git_diff asks for full context), so both
+    sides can be rebuilt from it. A continuation line stays with its option.
+    """
+    sides = {"-": {}, "+": {}}
+    section = {"-": "", "+": ""}
+    key = {"-": None, "+": None}
+    for l in fd.lines:
+        m = SECTION_RE.match(l.text)
+        stripped = l.text.strip()
+        for side in ("-", "+"):
+            if l.kind not in (" ", side):
+                continue
+            if m:
+                section[side] = m.group(1).lower()
+                key[side] = None
+                sides[side].setdefault(section[side], {})
+            elif not stripped or stripped.startswith(("#", ";")):
+                continue
+            elif PIO_FILTER_KEY.match(l.text) or PIO_EXTENDS_KEY.match(l.text):
+                option = "test_filter" if PIO_FILTER_KEY.match(l.text) else "extends"
+                key[side] = sides[side].setdefault(section[side], {}).setdefault(option, [])
+                key[side] += _filter_entries(re.split(r"[=:]", l.text, 1)[1])
+            elif not l.text[:1].isspace():
+                key[side] = None
+            elif key[side] is not None:
+                key[side] += _filter_entries(l.text)
+    return sides
+
+
+def _effective_filter(sections, name, seen=()):
+    """The test_filter entries a section runs with: its own, else those of the sections it extends."""
+    options = sections.get(name, {})
+    if "test_filter" in options:
+        return options["test_filter"] or None
+    found = []
+    for parent in options.get("extends", []):
+        if parent.lower() not in seen + (name,):
+            found += _effective_filter(sections, parent.lower(), seen + (name,)) or []
+    return list(dict.fromkeys(found)) or None
+
+
+def _env_filter(sections, name):
+    """An env's effective filter; [env] and then [platformio] supply defaults to an env with none."""
+    return _effective_filter(sections, name) or _effective_filter(sections, "env")         or _effective_filter(sections, "platformio")
+
+
+def _filter_hits(files):
+    """Where a PlatformIO test_filter narrows: a filter is an inclusion list, so fewer entries run fewer tests.
+
+    Hit when an env that ran every test now runs a subset, whether the key was
+    added to it, to [env] or [platformio], or to a section it extends, or the
+    env now extends a section that has one; and for each entry an env's
+    effective filter lost. A reformatted or widened filter, a whole key
+    dropped, and a new env are not hits. An env's filter comes from its own key,
+    else the union of the sections it extends, else [env], then [platformio]. If
+    a changed `extends` names a section the diff does not show while the file
+    has a test_filter, the guard cannot see what the env inherits and flags it.
     """
     hits = []
     for fd in files:
         if _ext(fd.path) != ".ini":
             continue
-        section = {"-": "", "+": ""}
-        key = {"-": None, "+": None}
-        entries = {"-": {}, "+": {}}
-        for l in fd.lines:
-            m = SECTION_RE.match(l.text)
-            stripped = l.text.strip()
-            for side in ("-", "+"):
-                if l.kind not in (" ", side):
-                    continue
-                if m:
-                    section[side] = m.group(1).lower()
-                    key[side] = None
-                elif not stripped or stripped.startswith(("#", ";")):
-                    continue
-                elif PIO_FILTER_KEY.match(l.text):
-                    key[side] = section[side]
-                    entries[side].setdefault(key[side], [])
-                    entries[side][key[side]] += _filter_entries(re.split(r"[=:]", l.text, 1)[1])
-                elif not l.text[:1].isspace():
-                    key[side] = None
-                elif key[side] is not None:
-                    entries[side][key[side]] += _filter_entries(l.text)
-        for env, old in entries["-"].items():
-            if env not in entries["+"]:
+        sides = _ini_options(fd)
+        old, new = sides["-"], sides["+"]
+        details = []
+        for name in new:
+            if not name.startswith("env:") or name not in old:
                 continue
-            for entry in dict.fromkeys(e for e in old if e not in entries["+"][env]):
-                hits.append(Hit("skip-marker", fd.path, None, f"PlatformIO test_filter entry removed: {entry}"))
+            before, after = _env_filter(old, name), _env_filter(new, name)
+            if before and after:
+                details += [f"PlatformIO test_filter entry removed: {e}" for e in before if e not in after]
+            elif after:
+                runs = f"runs only {', '.join(after[:5])}"
+                details.append(f"PlatformIO test_filter added to {name}: {runs}" if "test_filter" in new[name]
+                               else f"PlatformIO {name} now inherits a test_filter: {runs}")
+            parents = new[name].get("extends", [])
+            unseen = [p for p in parents if p.lower() not in new]
+            if unseen and parents != old[name].get("extends", []) and any("test_filter" in o for o in new.values()):
+                details.append(f"PlatformIO {name} extends a section the diff does not show: {', '.join(unseen)}")
+        # A section that lost an entry is also reported where it is edited, even if no env uses it.
+        for section, options in old.items():
+            if section in new and options.get("test_filter") and "test_filter" in new[section]:
+                details += [f"PlatformIO test_filter entry removed: {e}" for e in options["test_filter"]
+                            if e not in new[section]["test_filter"]]
+        hits += [Hit("skip-marker", fd.path, None, d) for d in dict.fromkeys(details)]
     return hits
 
 
