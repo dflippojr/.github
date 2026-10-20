@@ -17,17 +17,17 @@ permissions:
   contents: read
   issues: read
   pull-requests: read
-  checks: write
 
-# The check run lands on the head commit, which several pull requests can
+# The verdict is a check on the head commit, which several pull requests can
 # share, so each run judges every open pull request with that head and runs
 # alone for it: the newest decision for a commit is the one that lands.
 concurrency:
   group: gate-guard-target-${{ github.event.pull_request.head.sha }}
   cancel-in-progress: true
 
+# The job id names the required check: gate-guard-target / gate-guard.
 jobs:
-  judge:
+  gate-guard-target:
     uses: ./.github/workflows/gate-guard-target.yml
     with:
       guard-ref: ${{ github.sha }}

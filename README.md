@@ -110,7 +110,7 @@ base: the same head against a new base can bring hits the old base hid.
    reads each candidate and the event's own PR individually for its current
    state, head and base. It judges only those still open at that head, as in
    steps 3 and 4; an unreadable current state fails closed. A
-   check run belongs to a commit, not to a pull request, so the guard makes one
+   check belongs to a commit, not to a pull request, so the guard makes one
    decision per commit: two pull requests that share a head but not a base can't
    let the passing one's result replace the failing one's. The caller's
    concurrency group is keyed by the head SHA, so the newest decision for a
@@ -118,8 +118,8 @@ base: the same head against a new base can bring hits the old base hid.
    so closing the one that fails lets the others pass. Rerunning an older
    `closed` event after reopening judges the reopened PR too: the event's
    payload never decides its current state, head or base. When none
-   is left open with the head, the check completes as `neutral` with no
-   verdict, and both label outputs are `false`.
+   is left open with the head, the job passes with no verdict, its
+   `conclusion` output is `neutral`, and both label outputs are `false`.
 3. Asks the compare API for each pull request's merge base, then fetches the
    merge base and the head commit as git objects into an empty repository
    (`git fetch --depth=1`, no checkout) and reads their diff, with no external
@@ -135,27 +135,34 @@ base: the same head against a new base can bring hits the old base hid.
      no record of the push, the label doesn't count.
    - the whole label history was read. A list longer than 30 pages of 100
      fails the job rather than judge from its oldest part.
-5. Posts the verdict as a check run named **`gate-guard`** on the head commit,
-   with the hit table and the label verdicts of each pull request. It fails
-   when any of them has unapproved hits, as `gate-guard.yml` does. It also
-   fails while `findings-accepted` is on a pull request but doesn't count, so
-   nothing can lean on a label the owner didn't apply to this head. A job that
-   can't read a diff, the labels or the list of open pull requests posts a
-   failure.
+5. Ends the job with the verdict: the job fails when any of them has
+   unapproved hits, as `gate-guard.yml` does. It also fails while
+   `findings-accepted` is on a pull request but doesn't count, so nothing can
+   lean on a label the owner didn't apply to this head. A job that can't read
+   a diff, the labels or the list of open pull requests fails too.
 
-   Before judging anything, the job creates the check run as `in_progress`,
-   which replaces any earlier `gate-guard` result on the commit, and fills in
-   the verdict at the end. A job that dies or is cancelled in between leaves a
-   blocking check, never an earlier success. The report is cut to fit the
-   Checks API's limit, which counts UTF-8 bytes; if GitHub still rejects it,
-   the check fails with a short note and the job summary keeps the report.
+   The job summary has the hit table and the label verdicts of each pull
+   request, cut to fit GitHub's 1 MiB limit, which counts UTF-8 bytes. The
+   job's own check carries one notice annotation titled `gate-guard verdict`,
+   `hits=N; <conclusion>; <title>`, which the PR body lint reads, and an
+   annotation per hit. A job that couldn't judge gives an error annotation
+   instead of the notice. The report is printed inside a `stop-commands`
+   block, so no path, ref name or error message in it can act as a workflow
+   command.
 
-Require `gate-guard` in the ruleset. The workflow job's own check also shows
-on the pull request, but its name (`judge / judge` with the template) comes
-from the caller's job names, and it carries no report. The job also exposes
-`conclusion`, `gate-change-approved` and `findings-accepted` as outputs; a
-label output is `true` only when the label counts on every open pull request
-with the head.
+Require **`gate-guard-target / gate-guard`** in the ruleset: the caller's job
+id, then the reusable job's name, with the template. The verdict is the job's
+own result, not a check run posted through the Checks API, and the token has
+no `checks: write`. GitHub files a posted check run under a check suite it
+picks, the commit's oldest GitHub Actions suite. That suite can belong to
+another workflow, which the pull request's checks leave out (a Release run on
+wallpaper-rotator 4f90ff8), or a later run of this workflow can supersede it
+(personal-website#240). Either way the required check waited forever for a
+verdict GitHub had hidden. A job's check lives in its own run's suite, so every
+re-judge, whatever event starts it, brings its verdict with it. The job also
+exposes `conclusion`, `gate-change-approved` and `findings-accepted` as
+outputs; a label output is `true` only when the label counts on every open pull
+request with the head.
 
 Copy `templates/gate-guard-target-caller.yml` to
 `.github/workflows/gate-guard-target.yml` in each repository and put the same
@@ -189,9 +196,9 @@ anything from the pull request:
   workflow (local, or pinned by SHA) and the script (pinned by SHA) are all
   fixed by the default branch, even for a pull request into another branch.
   Every action is pinned by full SHA.
-- **No secrets.** Only the default `GITHUB_TOKEN`, with `contents: read`,
-  `issues: read`, `pull-requests: read` and `checks: write`. `checks: write` is
-  there only to post the `gate-guard` check run on the head commit. The token reaches git
+- **No secrets and no writes.** Only the default `GITHUB_TOKEN`, with
+  `contents: read`, `issues: read` and `pull-requests: read`. The verdict is
+  the job's result, so nothing needs `checks: write`. The token reaches git
   through the environment, never a command line or `.git/config`.
 - **No untrusted input in shell.** No `run:` step interpolates pull request
   fields such as the branch name or title. The script reads the event payload
@@ -199,10 +206,11 @@ anything from the pull request:
 
 ### Threats it still doesn't cover
 
-- **A spoofed `gate-guard` check.** Any workflow with `checks: write` can post
-  a check run named `gate-guard`, and so can a `pull_request` job named
-  `gate-guard`. Both come from the GitHub Actions app, as the real one does, so
-  `check_integration_id` can't tell them apart. A same-repository pull request
+- **A spoofed `gate-guard-target / gate-guard` check.** A `pull_request`
+  workflow whose job has the same names reports a check of that name, and any
+  workflow with `checks: write` can post one. Both come from the GitHub
+  Actions app, as the real one does, so `check_integration_id` can't tell them
+  apart. A same-repository pull request
   that adds such a workflow is itself a `gate-config` hit, and the real guard
   fails it, but if the spoof finishes later it may be the result a ruleset
   reads. The ruleset feature that pins a required workflow ("Require workflows
@@ -314,22 +322,25 @@ and head's gate-guard report through the GitHub API. It requires:
   also work; the token must be able to read the linked issue.
 - Assignee `dflippojr`.
 - A non-empty `### Gate changes` explanation other than `None` when the
-  latest head check named `gate-guard` reports findings, including when that
-  check passed with owner approval. The lint waits up to three minutes for the
-  guard's check to appear and complete, because both start on the same event.
-  A check still missing or pending after that, or an unreadable report, fails
-  closed with a rerun instruction; it never counts as passing.
-  Known limits: until the guard posts its new in-progress check for a re-judge
-  of the same head (for example after the base branch changes), the lint reads
-  the previous completed check on that head; the owner's later `labeled` event
-  reruns it against the new report. The lint runs on a GitHub-hosted runner,
+  latest head check named `gate-guard-target / gate-guard` reports findings,
+  including when that check passed with owner approval. The lint reads the
+  count from that job's one `gate-guard verdict` notice annotation. It waits
+  up to three minutes for the guard's check to appear and complete, because
+  both start on the same event. A check still missing or pending after that,
+  or one without exactly one well-formed verdict notice, fails closed with a
+  rerun instruction; it never counts as passing.
+  Known limits: until the guard's job for a re-judge of the same head (for
+  example after the base branch changes) is queued, the lint reads the
+  previous completed check on that head; the owner's later `labeled` event
+  reruns it against the new verdict. The lint runs on a GitHub-hosted runner,
   so the wait never holds the runner the guard needs.
-  **`gate-guard-target.yml` is required**: only its check run is named exactly
-  `gate-guard`. The `pull_request` flavour (`gate-guard.yml`) reports
-  `gate-guard / gate-guard` and writes no check output, and a repository with no
-  guard has no such check, so in both cases `pr-body` stays red until
-  `gate-guard-target.yml` is installed. Require the guard independently; this
-  check does not approve gate edits.
+  **`gate-guard-target.yml` is required, called as in the template**: only its
+  job, with the caller job id `gate-guard-target`, reports a check named
+  exactly `gate-guard-target / gate-guard`. The `pull_request` flavour
+  (`gate-guard.yml`) reports `gate-guard / gate-guard` with no verdict notice,
+  and a repository with no guard has no such check, so in both cases `pr-body`
+  stays red until `gate-guard-target.yml` is installed. Require the guard
+  independently; this check does not approve gate edits.
 - A changed test path when any linked issue has label `bug`. A `bug` label on
   the PR itself does not substitute for the linked issue's label. Renames count
   both old and new filenames, and deleted tests count as touched paths; the
