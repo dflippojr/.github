@@ -21,8 +21,12 @@ head is the head of a pull_request_target event, each against its current
 base. It fetches the merge base and head commits as data, never checking out
 or running them, and accepts an owner-only label (gate-change-approved,
 findings-accepted) only when the owner applied it after the head commit was
-pushed. It posts one verdict, failing if any of those pull requests fails, as a
-check run named gate-guard on the head commit.
+pushed. Its exit status is the verdict, failing if any of those pull requests
+fails, so the judging job's own check (gate-guard-target / gate-guard with the
+caller template) is the one a ruleset requires. It posts nothing through the
+Checks API: GitHub files a posted check run under a check suite it picks, which
+a later run of the workflow can hide. The report goes to the job summary, and
+one notice annotation states the verdict for pr_body_lint.py.
 
     python3 gate_guard.py --repo-dir . --base HEAD^1 --head HEAD
     python3 gate_guard.py --diff-file pr.diff
@@ -36,6 +40,7 @@ import json
 import os
 import posixpath
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -47,11 +52,13 @@ import urllib.request
 APPROVAL_LABEL = "gate-change-approved"
 FINDINGS_LABEL = "findings-accepted"
 OWNER_LABELS = (APPROVAL_LABEL, FINDINGS_LABEL)
-CHECK_NAME = "gate-guard"
-# The Checks API rejects an output.summary or output.text over 65,535 UTF-8
-# bytes; the guard stays a margin under it.
-MAX_CHECK_BYTES = 65000
-TRUNCATED = "\n\n… (truncated; the job summary has the rest)\n"
+# The judging job's check with the caller template: the caller's job id, then
+# the reusable workflow's job name. pr_body_lint.py reads its verdict annotation.
+REQUIRED_CHECK = "gate-guard-target / gate-guard"
+VERDICT_TITLE = "gate-guard verdict"
+# GitHub drops a step summary over 1 MiB; the guard stays a margin under it.
+MAX_SUMMARY_BYTES = 1000000
+TRUNCATED = "\n\n… (truncated; the job log has the rest)\n"
 MAX_ANNOTATIONS = 50
 MAX_API_PAGES = 30
 
@@ -889,12 +896,6 @@ class GitHub:
     def pages(self, path):
         return api_pages(self.api, path, self.token)
 
-    def post(self, path, body):
-        return api_request(self.api + path, self.token, "POST", body)[0]
-
-    def patch(self, path, body):
-        return api_request(self.api + path, self.token, "PATCH", body)[0]
-
 
 def git_diff(repo_dir, base, head):
     # Full context lets ini/TOML edits be placed in their section. No external
@@ -966,8 +967,8 @@ def render_target_summary(judgments, sha, guard_sha, list_error=None):
                 "isn't judged; reopening it, or opening another with this head, judges the head again.", ""]
     elif len(judgments) > 1:
         failing = ", ".join(f"#{j.number}" for j in judgments if not j.passed) or "none"
-        out += [f"{len(judgments)} open pull requests have head `{sha[:12]}`. A check run belongs to the commit, "
-                f"not to one pull request, so `{CHECK_NAME}` passes only when every one of them passes. "
+        out += [f"{len(judgments)} open pull requests have head `{sha[:12]}`. A check belongs to the commit, "
+                f"not to one pull request, so `{REQUIRED_CHECK}` passes only when every one of them passes. "
                 f"Failing: {failing}.", ""]
     out += [render_judgment(j) for j in judgments]
     guard = f" with `gate_guard.py` at `{guard_sha[:12]}`" if guard_sha else ""
@@ -1000,19 +1001,11 @@ def check_title(judgments, list_error=None):
     return f"#{failing[0].number} into {failing[0].base}: {_judgment_title(failing[0])}"
 
 
-def check_annotations(hits, approved):
-    """Line annotations for the check run; file-level hits stay in the summary table."""
-    level = "warning" if approved else "failure"
-    return [{"path": h.path, "start_line": h.line, "end_line": h.line, "annotation_level": level,
-             "title": f"gate-guard {h.rule}", "message": h.detail}
-            for h in hits if h.line][:MAX_ANNOTATIONS]
-
-
-def fit_bytes(text, limit=MAX_CHECK_BYTES, suffix=TRUNCATED):
+def fit_bytes(text, limit=MAX_SUMMARY_BYTES, suffix=TRUNCATED):
     """text, cut so that it and the suffix fit in limit UTF-8 bytes.
 
-    The Checks API counts bytes, not characters: a report of non-ASCII paths
-    can be far longer in bytes than in characters.
+    GitHub counts bytes, not characters: a report of non-ASCII paths can be
+    far longer in bytes than in characters.
     """
     data = text.encode("utf-8")
     if len(data) <= limit:
@@ -1020,44 +1013,37 @@ def fit_bytes(text, limit=MAX_CHECK_BYTES, suffix=TRUNCATED):
     return data[:limit - len(suffix.encode("utf-8"))].decode("utf-8", "ignore") + suffix
 
 
-def start_check(github, repo, sha, details_url):
-    """The id of a new in_progress gate-guard check run on sha, posted before any judging.
+def print_inert(text):
+    """Print text so that no line of it acts as a workflow command.
 
-    It supersedes whatever gate-guard result the commit had, so a job that
-    fails before it posts a verdict leaves a blocking check, not an earlier
-    success.
+    The report quotes paths, ref names and error messages; a line of it that
+    starts with :: must not add an annotation, a mask or anything else.
     """
-    body = {"name": CHECK_NAME, "head_sha": sha, "status": "in_progress",
-            "output": {"title": "Judging the pull requests with this head",
-                       "summary": "The verdict replaces this when the job finishes. If the job fails first, "
-                                  "this check stays in progress and blocks the merge."}}
-    if details_url:
-        body["details_url"] = details_url
-    return github.post(f"/repos/{repo}/check-runs", body)["id"]
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        print(text)
+        return
+    token = secrets.token_hex(16)
+    print(f"::stop-commands::{token}")
+    print(text)
+    print(f"::{token}::")
 
 
-def finish_check(github, repo, check_id, body):
-    """Complete the check run with body, or with a bare failure if GitHub rejects body.
+def verdict_commands(judgments, conclusion, title, error):
+    """The workflow commands that carry the verdict on the judging job's own check.
 
-    False when body didn't land. If the bare failure doesn't land either, the
-    check run stays in_progress, which blocks the merge too.
+    One notice states it, starting with the hit count, which pr_body_lint.py
+    reads. A job that could not judge gives an error instead, so nothing reads
+    it as clean.
     """
-    path = f"/repos/{repo}/check-runs/{check_id}"
-    try:
-        github.patch(path, body)
-        return True
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        print(f"gate-guard: GitHub rejected the {CHECK_NAME} report: {e}", file=sys.stderr)
-    failure = {"status": "completed", "conclusion": "failure",
-               "output": {"title": "Could not post the report",
-                          "summary": "GitHub rejected the full report, so this check fails whatever the verdict "
-                                     "was. The job summary, linked from Details, has the report."}}
-    try:
-        github.patch(path, failure)
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        print(f"gate-guard: could not complete the {CHECK_NAME} check run; it stays in progress: {e}",
-              file=sys.stderr)
-    return False
+    if error:
+        out = [f"::error title={_escape_property(title)}::{_escape_data(error)}"]
+    else:
+        hits = sum(len(j.hits) for j in judgments)
+        out = [f"::notice title={_escape_property(VERDICT_TITLE)}::"
+               f"{_escape_data(f'hits={hits}; {conclusion}; {title}')}"]
+    for j in judgments:
+        out += [a for a in annotations(j.hits, j.approved) if a not in out]
+    return out[:MAX_ANNOTATIONS + 1]
 
 
 def _write_outputs(values):
@@ -1141,7 +1127,7 @@ def pull_requests_with_head(github, repo, sha, event_pr):
 
 
 def run_target(args, github=None):
-    """Judge every open pull request with the event's head and post one gate-guard check run on that head."""
+    """Judge every open pull request with the event's head; the exit status is the verdict on that head."""
     pr = load_event(os.environ.get("GITHUB_EVENT_PATH")).get("pull_request") or {}
     head, base = pr.get("head") or {}, pr.get("base") or {}
     repo = args.repo or os.environ.get("GITHUB_REPOSITORY")
@@ -1154,16 +1140,6 @@ def run_target(args, github=None):
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
     github = github or GitHub(os.environ.get("GITHUB_API_URL", "https://api.github.com"), token)
-    run_id = os.environ.get("GITHUB_RUN_ID")
-    details_url = f"{server}/{repo}/actions/runs/{run_id}" if run_id else None
-    check_id = None
-    if not args.dry_run:
-        try:
-            check_id = start_check(github, repo, sha, details_url)
-        except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as e:
-            print(f"gate-guard: could not post the {CHECK_NAME} check run on {sha}: {e}", file=sys.stderr)
-            return 2
-
     prs, list_error = pull_requests_with_head(github, repo, sha, pr)
     judgments = [judge_pull_request(github, repo, p, sha, owner, server, token) for p in prs]
     if list_error:
@@ -1174,25 +1150,17 @@ def run_target(args, github=None):
     # A closed pull request can leave none open with this head: there is no verdict to give.
     conclusion = "neutral" if not judgments and passed else "success" if passed else "failure"
     summary = render_target_summary(judgments, sha, args.guard_sha, list_error)
-    print(summary)
+    print_inert(summary)
     if args.summary:
         with open(args.summary, "a", encoding="utf-8") as f:
-            f.write(summary)
+            f.write(fit_bytes(summary, MAX_SUMMARY_BYTES))
     _write_outputs({"conclusion": conclusion,
                     **{label: str(bool(judgments) and not error and
                                   all(j.verdicts[label][0] for j in judgments)).lower()
                        for label in OWNER_LABELS}})
-
-    annotations = []
-    for j in judgments:
-        annotations += [a for a in check_annotations(j.hits, j.approved) if a not in annotations]
-    body = {"status": "completed", "conclusion": conclusion,
-            "output": {"title": check_title(judgments, list_error), "summary": fit_bytes(summary),
-                       "annotations": annotations[:MAX_ANNOTATIONS]}}
-    if args.dry_run:
-        print(f"gate-guard: dry run; a {conclusion} {CHECK_NAME} check run would be posted on {sha}")
-    elif not finish_check(github, repo, check_id, body):
-        return 2
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        for line in verdict_commands(judgments, conclusion, check_title(judgments, list_error), error):
+            print(line)
     if error:
         return 2
     return 0 if passed else 1
@@ -1222,9 +1190,8 @@ def parse_args(argv):
                    help="append the Markdown report here (default: $GITHUB_STEP_SUMMARY)")
     p.add_argument("--pull-request-target", action="store_true",
                    help="judge the pull request of the pull_request_target event in $GITHUB_EVENT_PATH, "
-                        "date owner labels against the head push, and post a gate-guard check run")
-    p.add_argument("--guard-sha", help="commit of this script, named in the check run's summary")
-    p.add_argument("--dry-run", action="store_true", help="with --pull-request-target, do not post the check run")
+                        "date owner labels against the head push, and exit with the verdict")
+    p.add_argument("--guard-sha", help="commit of this script, named in the report")
     return p.parse_args(argv)
 
 

@@ -26,7 +26,11 @@ HTML_BLOCK = re.compile(
     r"|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|section|source|summary"
     r"|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:[\s/>]|$)|(?:script|pre|style|textarea)(?:[\s>]|$)|[?!])",
     re.I)
-HIT = re.compile(r"^\|\s*(?:removed-tests|skip-marker|retry|gate-config)\s*\|", re.M)
+# The gate-guard-target job's own check, and the notice in which it states its
+# verdict: the hit count first, then the conclusion and title.
+GATE_CHECK = "gate-guard-target / gate-guard"
+VERDICT_TITLE = "gate-guard verdict"
+VERDICT = re.compile(r"hits=(\d+); ")
 
 
 def visible_markdown(body):
@@ -182,9 +186,22 @@ def load_rules(api, repo):
 
 
 def latest_gate_check(api, repo, sha):
-    checks = api.pages(f"/repos/{repo}/commits/{sha}/check-runs?check_name=gate-guard&filter=latest", "check_runs")
-    checks = [c for c in checks if c.get("name") == "gate-guard"]
+    name = urllib.parse.quote(GATE_CHECK, safe="")
+    checks = api.pages(f"/repos/{repo}/commits/{sha}/check-runs?check_name={name}&filter=latest", "check_runs")
+    checks = [c for c in checks if c.get("name") == GATE_CHECK]
     return max(checks, key=lambda c: c["id"]) if checks else None
+
+
+def gate_hits(api, repo, check):
+    """The hit count the guard job's one verdict notice states, or None without exactly one well-formed notice.
+
+    A job's check run has no output text, so the guard states its verdict as an
+    annotation. A job that could not judge states none.
+    """
+    notes = [a for a in api.pages(f"/repos/{repo}/check-runs/{check['id']}/annotations")
+             if a.get("title") == VERDICT_TITLE and a.get("annotation_level") == "notice"]
+    match = VERDICT.match(notes[0].get("message") or "") if len(notes) == 1 else None
+    return int(match[1]) if match else None
 
 
 def gate_has_findings(api, repo, sha):
@@ -199,16 +216,14 @@ def gate_has_findings(api, repo, sha):
         if check and check.get("status") == "completed":
             break
     if check is None:
-        raise ValueError("gate-guard check is missing; install gate-guard-target.yml, then rerun pr-body")
+        raise ValueError(f"{GATE_CHECK} check is missing; install gate-guard-target.yml from the caller "
+                         "template, then rerun pr-body")
     if check.get("status") != "completed":
-        raise ValueError("gate-guard is still pending; rerun pr-body after it completes")
-    output = check.get("output") or {}
-    report = (output.get("summary") or "") + "\n" + (output.get("text") or "")
-    if HIT.search(report):
-        return True  # Findings still count on an owner-approved/passing check.
-    if "No removed tests, skip markers, retries or gate-config edits." in report:
-        return False
-    raise ValueError("gate-guard report has no recognized verdict; inspect it and rerun pr-body")
+        raise ValueError(f"{GATE_CHECK} is still pending; rerun pr-body after it completes")
+    hits = gate_hits(api, repo, check)
+    if hits is None:
+        raise ValueError(f"{GATE_CHECK} has no recognized verdict; inspect it and rerun pr-body")
+    return hits > 0  # Findings still count on an owner-approved/passing check.
 
 
 def verdict_inputs(pr):

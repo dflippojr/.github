@@ -24,19 +24,19 @@ def reject(status, body):
 
 
 class FakeGitHub:
-    """Answers the API calls of run_target and keeps the check runs it creates and updates.
+    """Answers the API calls of run_target and keeps the verdict of each job run against it.
 
     prs maps each pull request with head `head` to its base, head branch,
     labels, label events and push time, and to closed=True for a closed PR.
     listed overrides its visibility in the open listing to simulate API lag;
     head_sha overrides its current head. merge_bases maps each base to its merge
-    base with the head. Like the Checks API, it rejects an output over 65,535
-    UTF-8 bytes, and any update that `refuse` returns true for.
+    base with the head. Like the API for a token without checks: write, it
+    refuses every write, and keeps the path of each one tried.
     """
 
-    def __init__(self, head, merge_bases, prs, refuse=lambda _: False):
-        self.head, self.merge_bases, self.prs, self.refuse = head, merge_bases, prs, refuse
-        self.posted = []
+    def __init__(self, head, merge_bases, prs):
+        self.head, self.merge_bases, self.prs = head, merge_bases, prs
+        self.jobs, self.writes = [], []
 
     @classmethod
     def single(cls, merge_base, head, scenario, base="main"):
@@ -79,29 +79,15 @@ class FakeGitHub:
                 return noise + (push if s["pushed_at"] else [])
         raise AssertionError(f"unexpected API path {path}")
 
-    @staticmethod
-    def check_size(body):
-        for field in ("summary", "text"):
-            if len(body.get("output", {}).get(field, "").encode("utf-8")) > 65535:
-                raise reject(422, {"message": f"output.{field} is too long (maximum is 65535 bytes)"})
-
     def post(self, path, body):
-        assert path == f"/repos/{REPO}/check-runs", path
-        self.check_size(body)
-        self.posted.append(dict(body))
-        return {"id": len(self.posted)}
+        self.writes.append(path)
+        raise reject(403, {"message": "Resource not accessible by integration"})
 
-    def patch(self, path, body):
-        prefix = f"/repos/{REPO}/check-runs/"
-        assert path.startswith(prefix), path
-        self.check_size(body)
-        if self.refuse(body):
-            raise reject(422, {"message": "Invalid request"})
-        self.posted[int(path[len(prefix):]) - 1].update(body)
+    patch = post
 
     def current(self):
-        """The commit's gate-guard result: the newest check run of that name, as rulesets read it."""
-        return self.posted[-1]
+        """The commit's gate-guard-target / gate-guard result: the newest job's, as rulesets read it."""
+        return self.jobs[-1]
 
 
 def git(root, *args):
@@ -139,19 +125,64 @@ def event_pr(number, head, base, head_ref=HEAD_REF, state="open"):
             "base": {"ref": base}}
 
 
-def run_cli(tmp, server, event, fake):
-    """(exit code, stdout, outputs) of the CLI on a pull_request_target event, against a fake API."""
+VERDICT = "::notice title=gate-guard verdict::"
+
+
+def commands(stdout):
+    """The workflow commands the runner would act on: lines starting with ::, outside a stop-commands block."""
+    out, resume = [], None
+    for line in stdout.splitlines():
+        if resume:
+            resume = None if line == resume else resume
+        elif line.startswith("::stop-commands::"):
+            resume = f"::{line[len('::stop-commands::'):]}::"
+        elif line.startswith("::"):
+            out.append(line)
+    return out
+
+
+def _unescape(text):
+    for escaped, char in (("%0A", "\n"), ("%0D", "\r"), ("%3A", ":"), ("%2C", ","), ("%25", "%")):
+        text = text.replace(escaped, char)
+    return text
+
+
+def job_verdict(stdout, outputs, summary):
+    """What the job's own check shows: its conclusion, the title of its one verdict or error annotation, and the
+    job summary. A verdict notice reads hits=N; conclusion; title, and an error's title property is the title."""
+    found = [c for c in commands(stdout) if c.startswith((VERDICT, "::error title="))]
+    assert len(found) == 1, found
+    if found[0].startswith(VERDICT):
+        title = _unescape(found[0][len(VERDICT):]).split("; ", 2)[2]
+    else:
+        title = _unescape(re.match(r"::error title=([^:]*)::", found[0]).group(1))
+    conclusion = re.search(r"(?m)^conclusion=(\w+)$", outputs).group(1)
+    return {"conclusion": conclusion, "title": title, "summary": summary}
+
+
+def run_job(tmp, event, github, server=None):
+    """(exit code, job verdict or None, stdout, outputs, stderr) of the guard as the job runs it."""
     path = pathlib.Path(tmp, "event.json")
     path.write_text(json.dumps(event), encoding="utf-8")
-    outputs = pathlib.Path(tmp, "outputs.txt")
+    outputs, summary = pathlib.Path(tmp, "outputs.txt"), pathlib.Path(tmp, "summary.md")
     outputs.write_text("", encoding="utf-8")
+    summary.write_text("", encoding="utf-8")
     env = clean_env({"GITHUB_EVENT_PATH": str(path), "GITHUB_REPOSITORY": REPO, "GITHUB_REPOSITORY_OWNER": OWNER,
-                     "GITHUB_SERVER_URL": server, "GITHUB_OUTPUT": str(outputs), "GITHUB_RUN_ID": "99"})
-    out = io.StringIO()
-    with mock.patch.dict(os.environ, env, clear=True), mock.patch("sys.stdout", out), \
-            mock.patch.object(gate_guard, "GitHub", return_value=fake):
+                     "GITHUB_OUTPUT": str(outputs), "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_ACTIONS": "true",
+                     **({"GITHUB_SERVER_URL": server} if server else {})})
+    out, err = io.StringIO(), io.StringIO()
+    with mock.patch.dict(os.environ, env, clear=True), mock.patch("sys.stdout", out), mock.patch("sys.stderr", err),             mock.patch.object(gate_guard, "GitHub", return_value=github):
         code = gate_guard.main(["--pull-request-target", "--guard-sha", "a" * 40])
-    return code, out.getvalue(), outputs.read_text(encoding="utf-8")
+    stdout, written = out.getvalue(), outputs.read_text(encoding="utf-8")
+    verdict = job_verdict(stdout, written, summary.read_text(encoding="utf-8")) if "conclusion=" in written else None
+    return code, verdict, stdout, written, err.getvalue()
+
+
+def run_cli(tmp, server, event, fake):
+    """(exit code, stdout, outputs) of the guard on a pull_request_target event; fake.current() has its verdict."""
+    code, verdict, out, outputs, _ = run_job(tmp, event, fake, server)
+    fake.jobs.append(verdict)
+    return code, out, outputs
 
 
 def run_scenario(scenario, tmp):
@@ -177,22 +208,21 @@ class Scenarios(unittest.TestCase):
                 code, out, fake, head, outputs = run_scenario(scenario, tmp)
                 expect = scenario["expect"]
                 self.assertEqual(code, expect["exit"], out)
-                [check] = fake.posted
-                self.assertEqual(check["name"], "gate-guard")
-                self.assertEqual(check["head_sha"], head)
+                [check] = fake.jobs
+                self.assertEqual(fake.writes, [])
+                self.assertIn(f"Judged head `{head[:12]}`", check["summary"])
                 self.assertEqual(check["conclusion"], expect["conclusion"])
-                self.assertEqual(check["output"]["title"], expect["title"])
-                self.assertIn(expect["reason"].format(head=head[:7]), check["output"]["summary"])
-                self.assertTrue(check["details_url"].endswith(f"/{REPO}/actions/runs/99"))
+                self.assertEqual(check["title"], expect["title"])
+                self.assertIn(expect["reason"].format(head=head[:7]), check["summary"])
                 self.assertIn(f"conclusion={expect['conclusion']}", outputs)
 
     def test_head_edits_caller_is_judged_by_the_base(self):
-        """The head's caller would post a passing check; the default branch's guard posts a failing one."""
+        """The head's caller would pass the job; the default branch's guard fails it."""
         scenario = json.loads((SCENARIOS / "head-edits-caller.json").read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory() as tmp:
             code, _, fake, _, _ = run_scenario(scenario, tmp)
         self.assertEqual(code, 1)
-        summary = fake.posted[0]["output"]["summary"]
+        summary = fake.jobs[0]["summary"]
         self.assertIn("| gate-config | `.github/workflows/gate-guard-target.yml` | workflow modified |", summary)
         self.assertIn("removed-tests | `tests/test_billing.py`", summary)
         self.assertIn("none of them run", summary)
@@ -228,8 +258,8 @@ class SharedHead(unittest.TestCase):
         state = "closed" if prs[number].get("closed") else "open"
         event = {"action": action, "pull_request": event_pr(number, self.head, base, prs[number]["head_ref"], state)}
         code, _, outputs = run_cli(self.tmp, self.server, event, fake)
-        [check] = fake.posted
-        self.assertEqual(check["head_sha"], self.head)
+        [check] = fake.jobs
+        self.assertIn(f"Judged head `{self.head[:12]}`", check["summary"])
         return code, check, outputs
 
     def test_stacked_pull_request_passes(self):
@@ -240,14 +270,14 @@ class SharedHead(unittest.TestCase):
         """Retargeting fires `edited`, which the callers subscribe to; the deleted test now shows."""
         code, check, _ = self.judge({NUMBER: self.pr("main")}, "edited", NUMBER, "main")
         self.assertEqual((code, check["conclusion"]), (1, "failure"))
-        self.assertIn(f"### Gate guard: #{NUMBER} into `main`", check["output"]["summary"])
-        self.assertIn("removed-tests | `tests/test_billing.py`", check["output"]["summary"])
+        self.assertIn(f"### Gate guard: #{NUMBER} into `main`", check["summary"])
+        self.assertIn("removed-tests | `tests/test_billing.py`", check["summary"])
 
     def test_current_base_wins_over_the_payload(self):
         """A queued event's payload can predate a retarget; the guard judges the base the API reports now."""
         code, check, _ = self.judge({NUMBER: self.pr("main")}, "labeled", NUMBER, "stacked")
         self.assertEqual((code, check["conclusion"]), (1, "failure"))
-        self.assertIn("removed-tests | `tests/test_billing.py`", check["output"]["summary"])
+        self.assertIn("removed-tests | `tests/test_billing.py`", check["summary"])
 
     def test_passing_pull_request_cannot_replace_a_failing_one(self):
         """A second pull request with this head, into the stacked branch, passes alone; the commit's check fails."""
@@ -256,8 +286,8 @@ class SharedHead(unittest.TestCase):
             with self.subTest(event=number):
                 code, check, outputs = self.judge(prs, "opened", number, base)
                 self.assertEqual((code, check["conclusion"]), (1, "failure"))
-                self.assertEqual(check["output"]["title"], f"#{NUMBER} into main: 1 hit, not approved")
-                summary = check["output"]["summary"]
+                self.assertEqual(check["title"], f"#{NUMBER} into main: 1 hit, not approved")
+                summary = check["summary"]
                 self.assertIn(f"2 open pull requests have head `{self.head[:12]}`", summary)
                 self.assertIn(f"Failing: #{NUMBER}.", summary)
                 self.assertIn("### Gate guard: #8 into `stacked`", summary)
@@ -267,8 +297,8 @@ class SharedHead(unittest.TestCase):
         prs = {NUMBER: self.pr("main", **self.APPROVED), 8: self.pr("stacked", head_ref="stacked-copy")}
         code, check, outputs = self.judge(prs, "opened", 8, "stacked")
         self.assertEqual((code, check["conclusion"]), (0, "success"))
-        self.assertEqual(check["output"]["title"], "All 2 pull requests with this head pass")
-        self.assertIn("Failing: none.", check["output"]["summary"])
+        self.assertEqual(check["title"], "All 2 pull requests with this head pass")
+        self.assertIn("Failing: none.", check["summary"])
         # The outputs say whether a label counts on every pull request with this head.
         self.assertIn("gate-change-approved=false", outputs)
 
@@ -277,8 +307,8 @@ class SharedHead(unittest.TestCase):
         prs = {NUMBER: self.pr("main", closed=True), 8: self.pr("stacked", head_ref="stacked-copy")}
         code, check, outputs = self.judge(prs, "closed", NUMBER, "main")
         self.assertEqual((code, check["conclusion"]), (0, "success"))
-        self.assertEqual(check["output"]["title"], "No removed tests, skips, retries or gate-config edits")
-        self.assertNotIn(f"#{NUMBER}", check["output"]["summary"])
+        self.assertEqual(check["title"], "No removed tests, skips, retries or gate-config edits")
+        self.assertNotIn(f"#{NUMBER}", check["summary"])
         self.assertIn("conclusion=success", outputs)
 
     def test_closed_pull_request_the_listing_still_shows_is_left_out(self):
@@ -287,16 +317,16 @@ class SharedHead(unittest.TestCase):
         fake = FakeGitHub(self.head, self.merge_bases, prs)
         event = {"action": "closed", "pull_request": event_pr(NUMBER, self.head, "main", state="closed")}
         code, _, _ = run_cli(self.tmp, self.server, event, fake)
-        [check] = fake.posted
+        [check] = fake.jobs
         self.assertEqual((code, check["conclusion"]), (0, "success"))
-        self.assertNotIn(f"#{NUMBER}", check["output"]["summary"])
+        self.assertNotIn(f"#{NUMBER}", check["summary"])
 
     def test_closing_the_last_pull_request_with_the_head_posts_no_verdict(self):
         code, check, outputs = self.judge({NUMBER: self.pr("main", closed=True)}, "closed", NUMBER, "main")
         self.assertEqual((code, check["conclusion"]), (0, "neutral"))
-        self.assertEqual(check["output"]["title"], "No open pull request has this head")
-        self.assertNotIn(f"#{NUMBER}", check["output"]["summary"])
-        self.assertNotIn("removed-tests", check["output"]["summary"])
+        self.assertEqual(check["title"], "No open pull request has this head")
+        self.assertNotIn(f"#{NUMBER}", check["summary"])
+        self.assertNotIn("removed-tests", check["summary"])
         self.assertIn("conclusion=neutral", outputs)
         self.assertIn("gate-change-approved=false", outputs)
         self.assertIn("findings-accepted=false", outputs)
@@ -324,7 +354,7 @@ class SharedHead(unittest.TestCase):
         code, _, outputs = run_cli(self.tmp, self.server, closed, fake)
         check = fake.current()
         self.assertEqual((code, check["conclusion"]), (1, "failure"))
-        self.assertIn(f"Failing: #{NUMBER}.", check["output"]["summary"])
+        self.assertIn(f"Failing: #{NUMBER}.", check["summary"])
         self.assertIn("conclusion=failure", outputs)
         self.assertIn("gate-change-approved=false", outputs)
 
@@ -340,7 +370,7 @@ class SharedHead(unittest.TestCase):
                 event = {"action": action, "pull_request": event_pr(NUMBER, self.head, "stacked", state=state)}
                 code, _, _ = run_cli(self.tmp, self.server, event, fake)
                 self.assertEqual((code, fake.current()["conclusion"]), (1, "failure"))
-                self.assertIn(f"#{NUMBER} into `main`", fake.current()["output"]["summary"])
+                self.assertIn(f"#{NUMBER} into `main`", fake.current()["summary"])
 
     def test_synchronize_after_reopening_uses_current_head_and_branch(self):
         """An old close judges only siblings still at H; synchronize judges the reopened PR's new head."""
@@ -355,13 +385,13 @@ class SharedHead(unittest.TestCase):
         closed = {"action": "closed", "pull_request": event_pr(NUMBER, old_head, "main", state="closed")}
         code, _, _ = run_cli(self.tmp, self.server, closed, fake)
         self.assertEqual((code, fake.current()["conclusion"]), (0, "success"))
-        self.assertEqual(fake.current()["head_sha"], old_head)
-        self.assertNotIn(f"#{NUMBER}", fake.current()["output"]["summary"])
+        self.assertIn(f"Judged head `{old_head[:12]}`", fake.current()["summary"])
+        self.assertNotIn(f"#{NUMBER}", fake.current()["summary"])
         fake.head = self.head
         synchronized = {"action": "synchronize", "pull_request": event_pr(NUMBER, self.head, "main")}
         code, _, outputs = run_cli(self.tmp, self.server, synchronized, fake)
         self.assertEqual((code, fake.current()["conclusion"]), (1, "failure"))
-        self.assertEqual(fake.current()["head_sha"], self.head)
+        self.assertIn(f"Judged head `{self.head[:12]}`", fake.current()["summary"])
         self.assertIn("conclusion=failure", outputs)
 
     def test_stale_open_payload_cannot_restore_a_currently_closed_pull_request(self):
@@ -377,7 +407,7 @@ class SharedHead(unittest.TestCase):
                8: self.pr("stacked", head_ref="stacked-copy")}
         code, check, _ = self.judge(prs, "edited", 8, "stacked")
         self.assertEqual((code, check["conclusion"]), (0, "success"))
-        self.assertNotIn(f"#{NUMBER}", check["output"]["summary"])
+        self.assertNotIn(f"#{NUMBER}", check["summary"])
 
     def test_unresolved_current_state_fails_closed_even_with_an_approved_sibling(self):
         for number in (NUMBER, 8):
@@ -396,7 +426,7 @@ class SharedHead(unittest.TestCase):
                     code, _, outputs = run_cli(self.tmp, self.server, event, fake)
                 self.assertEqual((code, fake.current()["conclusion"]), (2, "failure"))
                 self.assertIn(f"could not read pull request #{number}'s current state",
-                              fake.current()["output"]["summary"])
+                              fake.current()["summary"])
                 self.assertIn("gate-change-approved=false", outputs)
                 self.assertIn("findings-accepted=false", outputs)
 
@@ -404,7 +434,7 @@ class SharedHead(unittest.TestCase):
 class OversizedReport(unittest.TestCase):
     """The review's scenario: C1 deletes a test and adds 300 skipped test modules with long non-ASCII names; C2
     changes code on top. Into the stacked branch at C1 the head passes. Retargeted to main, the failure report runs
-    to about 50,000 characters but twice that in UTF-8 bytes, over the Checks API's 65,535-byte limit."""
+    to about 50,000 characters but twice that in UTF-8 bytes, over the 65,535 bytes a Checks API post could carry."""
     BILLING = SharedHead.BILLING
     SKIPPED = "import pytest\n\n\n@pytest.mark.skip\ndef test_later():\n    pass\n"
 
@@ -419,42 +449,40 @@ class OversizedReport(unittest.TestCase):
             dict(skipped, **{"src/billing.py": "def charge(amount):\n    return round(amount, 2)\n"}))
         self.merge_bases = {"main": c0, "stacked": c1}
 
-    def retarget(self, refuse=lambda _: False):
+    def retarget(self):
         """(exit code of the retarget's job, fake API) after a pass into the stacked branch, then a retarget."""
         fake = FakeGitHub(self.head, self.merge_bases, {NUMBER: dict(SharedHead.NO_LABELS, base="stacked",
                                                                      head_ref=HEAD_REF)})
         code, _, _ = run_cli(self.tmp, self.server, {"action": "opened",
                                                      "pull_request": event_pr(NUMBER, self.head, "stacked")}, fake)
         self.assertEqual((code, fake.current()["conclusion"]), (0, "success"))
-        fake.prs[NUMBER]["base"], fake.refuse = "main", refuse
+        fake.prs[NUMBER]["base"] = "main"
         code, _, _ = run_cli(self.tmp, self.server, {"action": "edited",
                                                      "pull_request": event_pr(NUMBER, self.head, "main")}, fake)
-        self.assertEqual(len(fake.posted), 2)
+        self.assertEqual(len(fake.jobs), 2)
         return code, fake
 
-    def test_report_is_cut_to_fit_in_bytes(self):
+    def test_whole_report_reaches_the_job_summary(self):
         code, fake = self.retarget()
         check = fake.current()
-        summary = check["output"]["summary"]
-        self.assertEqual((code, check["status"], check["conclusion"]), (1, "completed", "failure"))
-        self.assertEqual(check["output"]["title"], "301 hits, not approved")
-        # Rows sort by path, so the deleted test's row is past the cut; the title still counts it.
+        summary = check["summary"]
+        self.assertEqual((code, check["conclusion"]), (1, "failure"))
+        self.assertEqual(check["title"], "301 hits, not approved")
+        self.assertIn("| removed-tests | `tests/test_billing.py` |", summary)
+        self.assertGreater(len(summary.encode("utf-8")), 65535)
+        self.assertFalse(summary.endswith(gate_guard.TRUNCATED))
+
+    def test_report_is_cut_to_fit_the_job_summary_in_bytes(self):
+        with mock.patch.object(gate_guard, "MAX_SUMMARY_BYTES", 65000):
+            code, fake = self.retarget()
+        check = fake.current()
+        summary = check["summary"]
+        self.assertEqual((code, check["conclusion"]), (1, "failure"))
+        # Rows sort by path, so the deleted test's row is past the cut; the verdict still counts it.
+        self.assertEqual(check["title"], "301 hits, not approved")
         self.assertIn(f"| skip-marker | `tests/test_0_{'界' * 70}.py:4` |", summary)
         self.assertTrue(summary.endswith(gate_guard.TRUNCATED))
-        self.assertLessEqual(len(summary.encode("utf-8")), gate_guard.MAX_CHECK_BYTES)
-
-    def test_rejected_report_falls_back_to_a_bare_failure(self):
-        code, fake = self.retarget(refuse=lambda body: "annotations" in body["output"])
-        check = fake.current()
-        self.assertEqual((code, check["status"], check["conclusion"]), (2, "completed", "failure"))
-        self.assertEqual(check["output"]["title"], "Could not post the report")
-
-    def test_no_update_lands_and_the_check_stays_in_progress(self):
-        """Even when GitHub takes no update at all, the earlier success is no longer the commit's result."""
-        code, fake = self.retarget(refuse=lambda _: True)
-        check = fake.current()
-        self.assertEqual((code, check["status"]), (2, "in_progress"))
-        self.assertNotIn("conclusion", check)
+        self.assertLessEqual(len(summary.encode("utf-8")), 65000)
 
 
 class FitBytes(unittest.TestCase):
@@ -519,9 +547,8 @@ class HeadPushedAt(unittest.TestCase):
 class TargetFailures(unittest.TestCase):
     @staticmethod
     def github():
-        """A mock API whose check-run create answers with an id; the verdict arrives as an update."""
+        """A mock API that answers reads; the guard makes no writes."""
         fake = mock.Mock()
-        fake.post.return_value = {"id": 5}
         fake.get.return_value = {"merge_base_commit": {"sha": "e" * 40}}
         fake.get.side_effect = lambda path: (
             dict(TargetFailures.EVENT["pull_request"], state="open")
@@ -530,21 +557,17 @@ class TargetFailures(unittest.TestCase):
 
     @staticmethod
     def run_target(fake, event):
+        """(exit code, job verdict or None, stderr) of the guard against fake."""
         with tempfile.TemporaryDirectory() as tmp:
-            path = pathlib.Path(tmp, "event.json")
-            path.write_text(json.dumps(event), encoding="utf-8")
-            env = clean_env({"GITHUB_EVENT_PATH": str(path), "GITHUB_REPOSITORY": REPO})
-            with mock.patch.dict(os.environ, env, clear=True), mock.patch("sys.stdout", io.StringIO()), \
-                    mock.patch("sys.stderr", io.StringIO()) as err:
-                code = gate_guard.run_target(gate_guard.parse_args(["--pull-request-target"]), fake)
-        return code, err.getvalue()
+            code, verdict, _, _, err = run_job(tmp, event, fake)
+        return code, verdict, err
 
     EVENT = {"pull_request": {"number": NUMBER, "head": {"sha": "d" * 40, "ref": HEAD_REF, "repo": None},
                               "base": {"ref": "main"}}}
 
     def test_needs_a_pull_request_event(self):
-        code, err = self.run_target(mock.Mock(), {})
-        self.assertEqual(code, 2)
+        code, verdict, err = self.run_target(mock.Mock(), {})
+        self.assertEqual((code, verdict), (2, None))
         self.assertIn("needs a pull_request_target event", err)
 
     def test_unreadable_diff_posts_a_failure(self):
@@ -558,20 +581,19 @@ class TargetFailures(unittest.TestCase):
 
         fake.get.side_effect = read
         fake.pages.return_value = []
-        code, _ = self.run_target(fake, self.EVENT)
+        code, body, _ = self.run_target(fake, self.EVENT)
         self.assertEqual(code, 2)
-        body = fake.patch.call_args[0][1]
-        self.assertEqual((body["conclusion"], body["output"]["title"]), ("failure", "Could not judge this pull request"))
-        self.assertIn("could not read the pull request's diff", body["output"]["summary"])
+        self.assertEqual((body["conclusion"], body["title"]), ("failure", "Could not judge this pull request"))
+        self.assertIn("could not read the pull request's diff", body["summary"])
 
     def test_unreadable_labels_post_a_failure(self):
         fake = self.github()
         fake.get.return_value = {"merge_base_commit": {"sha": "e" * 40}}
         fake.pages.side_effect = gate_guard.urllib.error.URLError("rate limited")
         with mock.patch.object(gate_guard, "fetch_diff", return_value=""):
-            code, _ = self.run_target(fake, self.EVENT)
+            code, body, _ = self.run_target(fake, self.EVENT)
         self.assertEqual(code, 2)
-        self.assertIn("could not read the pull request's labels", fake.patch.call_args[0][1]["output"]["summary"])
+        self.assertIn("could not read the pull request's labels", body["summary"])
 
     def test_deleted_fork_cannot_date_the_label(self):
         fake = self.github()
@@ -581,34 +603,18 @@ class TargetFailures(unittest.TestCase):
             [{"id": 1, "event": "labeled", "label": {"name": "findings-accepted"}, "actor": {"login": "dflippojr"},
               "created_at": "2026-10-16T13:00:00Z"}])
         with mock.patch.object(gate_guard, "fetch_diff", return_value=""):
-            code, _ = self.run_target(fake, self.EVENT)
+            code, body, _ = self.run_target(fake, self.EVENT)
         self.assertEqual(code, 1)
-        self.assertIn("GitHub has no record of when", fake.patch.call_args[0][1]["output"]["summary"])
+        self.assertIn("GitHub has no record of when", body["summary"])
 
-    def test_check_run_post_failure_exits_2(self):
+    def test_nothing_is_posted(self):
+        """The job's own result is the verdict; the guard writes nothing through the API."""
         fake = self.github()
-        fake.get.return_value = {"merge_base_commit": {"sha": "e" * 40}}
         fake.pages.return_value = []
-        fake.post.side_effect = gate_guard.urllib.error.URLError("forbidden")
         with mock.patch.object(gate_guard, "fetch_diff", return_value=""):
-            code, err = self.run_target(fake, self.EVENT)
-        self.assertEqual(code, 2)
-        self.assertIn("could not post the gate-guard check run", err)
-
-    def test_dry_run_posts_nothing(self):
-        fake = self.github()
-        fake.get.return_value = {"merge_base_commit": {"sha": "e" * 40}}
-        fake.pages.return_value = []
-        with tempfile.TemporaryDirectory() as tmp:
-            path = pathlib.Path(tmp, "event.json")
-            path.write_text(json.dumps(self.EVENT), encoding="utf-8")
-            env = clean_env({"GITHUB_EVENT_PATH": str(path), "GITHUB_REPOSITORY": REPO})
-            with mock.patch.dict(os.environ, env, clear=True), mock.patch("sys.stdout", io.StringIO()), \
-                    mock.patch.object(gate_guard, "fetch_diff", return_value=""):
-                code = gate_guard.run_target(gate_guard.parse_args(["--pull-request-target", "--dry-run"]), fake)
-        self.assertEqual(code, 0)
-        fake.post.assert_not_called()
-        fake.patch.assert_not_called()
+            code, body, _ = self.run_target(fake, self.EVENT)
+        self.assertEqual((code, body["conclusion"]), (0, "success"))
+        self.assertEqual({c[0] for c in fake.method_calls}, {"get", "pages"})
 
     def test_unlisted_open_pull_requests_fail_closed(self):
         """Without the whole list of pull requests with this head, one that fails could go unseen."""
@@ -622,12 +628,11 @@ class TargetFailures(unittest.TestCase):
 
         fake.pages.side_effect = pages
         with mock.patch.object(gate_guard, "fetch_diff", return_value=""):
-            code, _ = self.run_target(fake, self.EVENT)
+            code, body, _ = self.run_target(fake, self.EVENT)
         self.assertEqual(code, 2)
-        body = fake.patch.call_args[0][1]
         self.assertEqual(body["conclusion"], "failure")
         self.assertIn("could not list the open pull requests with this head (too many pages)",
-                      body["output"]["summary"])
+                      body["summary"])
 
     def test_closed_event_with_an_unlisted_head_fails_closed(self):
         """With the closed pull request left out and no list, nothing would be judged; that can't pass."""
@@ -636,13 +641,12 @@ class TargetFailures(unittest.TestCase):
         event = {"action": "closed", "pull_request": dict(self.EVENT["pull_request"], state="closed")}
         fake.get.side_effect = None
         fake.get.return_value = event["pull_request"]
-        code, _ = self.run_target(fake, event)
+        code, body, _ = self.run_target(fake, event)
         self.assertEqual(code, 2)
-        body = fake.patch.call_args[0][1]
-        self.assertEqual((body["conclusion"], body["output"]["title"]),
+        self.assertEqual((body["conclusion"], body["title"]),
                          ("failure", "Could not list the open pull requests with this head"))
         self.assertIn("could not list the open pull requests with this head (<urlopen error rate limited>)",
-                      body["output"]["summary"])
+                      body["summary"])
 
     def test_malformed_current_pull_request_fails_closed(self):
         valid = dict(self.EVENT["pull_request"], state="open")
@@ -654,17 +658,22 @@ class TargetFailures(unittest.TestCase):
                 fake.pages.return_value = []
                 fake.get.side_effect = None
                 fake.get.return_value = response
-                code, _ = self.run_target(fake, self.EVENT)
+                code, body, _ = self.run_target(fake, self.EVENT)
                 self.assertEqual(code, 2)
-                body = fake.patch.call_args[0][1]
                 self.assertEqual(body["conclusion"], "failure")
-                self.assertIn(f"could not read pull request #{NUMBER}'s current state", body["output"]["summary"])
+                self.assertIn(f"could not read pull request #{NUMBER}'s current state", body["summary"])
 
-    def test_annotations_only_for_lines(self):
-        hits = [gate_guard.Hit("retry", "a.ts", 3, "raised"), gate_guard.Hit("removed-tests", "b.py", None, "gone")]
-        self.assertEqual(gate_guard.check_annotations(hits, approved=False), [
-            {"path": "a.ts", "start_line": 3, "end_line": 3, "annotation_level": "failure",
-             "title": "gate-guard retry", "message": "raised"}])
+    def test_verdict_comes_first_then_one_annotation_per_hit(self):
+        hits = [gate_guard.Hit("retry", "a.ts", 3, "raised"), gate_guard.Hit("removed-tests", "b,c.py", None, "gone")]
+        judgment = gate_guard.Judgment(NUMBER, "main", hits, None, set(), {}, False, False)
+        self.assertEqual(gate_guard.verdict_commands([judgment, judgment], "failure", "2 hits, not approved", None), [
+            f"{VERDICT}hits=4; failure; 2 hits, not approved",
+            "::error file=a.ts,line=3,title=gate-guard retry::raised",
+            "::error file=b%2Cc.py,title=gate-guard removed-tests::gone"])
+
+    def test_an_error_gives_no_verdict(self):
+        self.assertEqual(gate_guard.verdict_commands([], "failure", "Could not list: x", "offline\n::x"),
+                         ["::error title=Could not list%3A x::offline%0A::x"])
 
 
 class CutOffLabelHistory(unittest.TestCase):
@@ -684,8 +693,6 @@ class CutOffLabelHistory(unittest.TestCase):
 
         def request(url, _token, method="GET", _body=None):
             parts = urllib.parse.urlsplit(url)
-            if method == "POST":
-                return {"id": 1}, None
             if parts.path == f"/repos/{REPO}/pulls/{NUMBER}":
                 return event_pr(NUMBER, head, "main"), None
             if "/compare/" in parts.path:
@@ -707,29 +714,27 @@ class CutOffLabelHistory(unittest.TestCase):
         with mock.patch.object(gate_guard, "api_request", side_effect=request), \
                 mock.patch.object(gate_guard, "MAX_API_PAGES", max_pages), \
                 mock.patch.object(gate_guard, "fetch_diff", return_value=""):
-            code, _ = TargetFailures.run_target(github, event)
-        return code, github, requested
+            code, verdict, _ = TargetFailures.run_target(github, event)
+        return code, verdict, requested
 
     def test_cut_off_history_fails_closed(self):
         for label in gate_guard.OWNER_LABELS:
-            with self.subTest(label=label), mock.patch.object(gate_guard.GitHub, "patch") as patch:
-                code, _, requested = self.run_with_pages(label, gate_guard.MAX_API_PAGES)
+            with self.subTest(label=label):
+                code, body, requested = self.run_with_pages(label, gate_guard.MAX_API_PAGES)
                 self.assertEqual(code, 2)
                 self.assertEqual(max(requested), gate_guard.MAX_API_PAGES)
-                body = patch.call_args[0][1]
                 self.assertEqual(body["conclusion"], "failure")
-                self.assertIn("could not read the pull request's labels", body["output"]["summary"])
-                self.assertIn(f"has more than {gate_guard.MAX_API_PAGES} pages", body["output"]["summary"])
+                self.assertIn("could not read the pull request's labels", body["summary"])
+                self.assertIn(f"has more than {gate_guard.MAX_API_PAGES} pages", body["summary"])
 
     def test_whole_history_finds_the_worker_reapplication(self):
         """The control: read to the end, the newest event is the worker's, so the label doesn't count."""
         for label in gate_guard.OWNER_LABELS:
-            with self.subTest(label=label), mock.patch.object(gate_guard.GitHub, "patch") as patch:
-                code, _, _ = self.run_with_pages(label, gate_guard.MAX_API_PAGES + 1)
+            with self.subTest(label=label):
+                code, body, _ = self.run_with_pages(label, gate_guard.MAX_API_PAGES + 1)
                 # The diff is empty, so only a findings-accepted label that doesn't count fails the check.
                 self.assertEqual(code, 1 if label == gate_guard.FINDINGS_LABEL else 0)
-                self.assertIn(f"`{label}` was applied by @worker[bot], not the owner",
-                              patch.call_args[0][1]["output"]["summary"])
+                self.assertIn(f"`{label}` was applied by @worker[bot], not the owner", body["summary"])
 
 
 class FetchDiff(unittest.TestCase):
@@ -755,36 +760,6 @@ class FetchDiff(unittest.TestCase):
         self.assertTrue(env["GIT_CONFIG_VALUE_2"].startswith("AUTHORIZATION: basic "))
 
 
-class NoChecksWrite(FakeGitHub):
-    """The API as a token without checks: write sees it: every Checks API write is refused."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.writes = []
-
-    def post(self, path, body):
-        self.writes.append(path)
-        raise reject(403, {"message": "Resource not accessible by integration"})
-
-    patch = post
-
-
-VERDICT = "::notice title=gate-guard verdict::"
-
-
-def commands(stdout):
-    """The workflow commands the runner would act on: lines starting with ::, outside a stop-commands block."""
-    out, resume = [], None
-    for line in stdout.splitlines():
-        if resume:
-            resume = None if line == resume else resume
-        elif line.startswith("::stop-commands::"):
-            resume = f"::{line[len('::stop-commands::'):]}::"
-        elif line.startswith("::"):
-            out.append(line)
-    return out
-
-
 class JobResult(unittest.TestCase):
     """The verdict is the judging job's own result, not a check run posted through the Checks API.
 
@@ -797,7 +772,7 @@ class JobResult(unittest.TestCase):
     def judge(self, scenario, tmp):
         diff = (FIXTURES / f"{scenario['diff']}.diff").read_text(encoding="utf-8")
         server, (base, head) = make_remote(tmp, *_trees(diff))
-        fake = NoChecksWrite(head, {"main": base}, {NUMBER: dict(scenario, base="main", head_ref=HEAD_REF)})
+        fake = FakeGitHub(head, {"main": base}, {NUMBER: dict(scenario, base="main", head_ref=HEAD_REF)})
         path = pathlib.Path(tmp, "event.json")
         path.write_text(json.dumps({"pull_request": event_pr(NUMBER, head, "main")}), encoding="utf-8")
         env = clean_env({"GITHUB_EVENT_PATH": str(path), "GITHUB_REPOSITORY": REPO, "GITHUB_REPOSITORY_OWNER": OWNER,
@@ -878,8 +853,7 @@ class WorkflowSafety(unittest.TestCase):
                 self.assertEqual(text.count(HEAD_GROUP), 1)
                 self.assertNotRegex(text.replace(HEAD_GROUP, ""), r"head\.(sha|ref)")
                 block = re.search(r"(?m)^permissions:\n((?:  .*\n)+)", text).group(1)
-                self.assertEqual(block.split(), ["contents:", "read", "issues:", "read", "pull-requests:", "read",
-                                                 "checks:", "write"])
+                self.assertEqual(block.split(), ["contents:", "read", "issues:", "read", "pull-requests:", "read"])
 
     def test_callers_rejudge_every_change_to_base_head_or_labels(self):
         """edited covers a retarget: the same head against a new base can expose new hits. closed re-judges
@@ -902,10 +876,7 @@ class WorkflowSafety(unittest.TestCase):
         self.assertRegex(text, r"(?m)^  judge:\n    name: gate-guard\n")
         for path in (WORKFLOWS / "gate-guard-base.yml", ROOT / "templates" / "gate-guard-target-caller.yml"):
             with self.subTest(caller=path.name):
-                text = self.text(path)
-                block = re.search(r"(?m)^permissions:\n((?:  .*\n)+)", text).group(1)
-                self.assertEqual(block.split(), ["contents:", "read", "issues:", "read", "pull-requests:", "read"])
-                self.assertRegex(text, r"(?m)^jobs:\n  gate-guard-target:\n    uses: ")
+                self.assertRegex(self.text(path), r"(?m)^jobs:\n  gate-guard-target:\n    uses: ")
         self.assertEqual(gate_guard.REQUIRED_CHECK, "gate-guard-target / gate-guard")
 
     def test_reusable_workflow_edit_is_a_gate_change(self):

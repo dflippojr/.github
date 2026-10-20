@@ -117,84 +117,42 @@ def test_readme_examples_enforce_the_four_repository_requirements():
         assert not lint.lint(pr(GOOD + "\n" + evidence), [path], False, False, rules)
 
 
-def check(summary, **fields):
-    return dict(id=1, name="gate-guard", status="completed", conclusion="success", output={"summary": summary}, **fields)
-
-
-@pytest.mark.parametrize("conclusion", ["success", "failure"])
-def test_gate_findings_count_even_when_approved(conclusion):
-    api = mock.Mock()
-    item = check("| Rule | Location | Detail |\n| --- | --- | --- |\n| gate-config | x | workflow added |")
-    item["conclusion"] = conclusion
-    api.pages.return_value = [item]
-    assert lint.gate_has_findings(api, "o/r", SHA)
-    assert SHA in api.pages.call_args.args[0]
-
-
-def test_latest_gate_check_is_used_not_stale_findings():
-    api = mock.Mock()
-    old = check("| retry | file | raised |")
-    latest = check("No removed tests, skip markers, retries or gate-config edits.")
-    latest["id"] = 2
-    api.pages.return_value = [latest, old]
-    assert not lint.gate_has_findings(api, "o/r", SHA)
-    api.pages.return_value = []
-    with pytest.raises(ValueError, match="gate-guard.*missing"):
-        lint.gate_has_findings(api, "o/r", SHA)
-
-
-@pytest.mark.parametrize("item", [check("unknown report"), dict(check(""), status="in_progress")])
-def test_pending_or_unrecognized_gate_does_not_pass(item):
-    api = mock.Mock()
-    api.pages.return_value = [item]
-    with pytest.raises(ValueError):
-        lint.gate_has_findings(api, "o/r", SHA)
-
-
-@pytest.mark.parametrize("status", ["queued", "in_progress"])
-def test_latest_pending_gate_cannot_reuse_an_older_clean_verdict(status):
-    api = mock.Mock()
-    api.pages.return_value = [
-        check("No removed tests, skip markers, retries or gate-config edits."),
-        dict(check(""), id=2, status=status),
-    ]
-    with pytest.raises(ValueError, match="pending"):
-        lint.gate_has_findings(api, "o/r", SHA)
-
-
 JOB_CHECK = "gate-guard-target / gate-guard"
 RUNNER_NOTICE = {"title": "", "annotation_level": "notice", "path": ".github", "message": "The runner image will move."}
+CLEAN = "hits=0; success; No removed tests, skips, retries or gate-config edits"
+FINDINGS = "hits=1; success; 1 hit, approved by the owner"
 
 
-def job_check(*messages, check_id=5, **fields):
-    """The guard job's check run and its annotations: GitHub's own notice, then one verdict per message."""
+def check(*messages, check_id=1, **fields):
+    """The guard job's check run, with the annotations a read of it returns under `notes`: GitHub's own notice,
+    then one gate-guard verdict notice per message. A job's check run has no output text."""
     notes = [RUNNER_NOTICE] + [{"title": "gate-guard verdict", "annotation_level": "notice", "path": ".github",
                                 "message": m} for m in messages]
-    return dict(id=check_id, name=JOB_CHECK, status="completed", conclusion="success",
-                output={"title": None, "summary": None, "annotations_count": len(notes)}, **fields), notes
+    return dict(dict(id=check_id, name=JOB_CHECK, status="completed", conclusion="success",
+                     output={"title": None, "summary": None, "annotations_count": len(notes)}, notes=notes), **fields)
 
 
-def job_api(*checks):
+def annotations(path, listing):
+    """The annotations of the check run `path` names, from the check runs last listed."""
+    assert path.startswith("/repos/o/r/check-runs/") and path.endswith("/annotations"), path
+    return next(c["notes"] for c in listing if c["id"] == int(path.split("/")[5]))
+
+
+def listing_api(*checks):
     api = mock.Mock()
-    notes = {item["id"]: annotations for item, annotations in checks}
-
-    def pages(path, key=None):
-        if path.startswith("/repos/o/r/check-runs/"):
-            return notes[int(path.split("/")[5])]
-        return [item for item, _ in checks]
-
-    api.pages.side_effect = pages
+    api.pages.side_effect = lambda path, key=None: (
+        list(checks) if key == "check_runs" else annotations(path, checks))
     return api
 
 
 @pytest.mark.parametrize("message, findings", [
     ("hits=2; success; 2 hits, approved by the owner", True),
     ("hits=1; failure; 1 hit, not approved", True),
-    ("hits=0; success; No removed tests, skips, retries or gate-config edits", False),
+    (CLEAN, False),
 ])
 def test_gate_verdict_is_read_from_the_guard_jobs_annotation(message, findings):
-    """The guard reports through its own job's check, which has no output text: the verdict is an annotation."""
-    api = job_api(job_check(message))
+    """Findings count even on an owner-approved, passing check; the verdict is the job's annotation."""
+    api = listing_api(check(message, check_id=5))
     assert lint.gate_has_findings(api, "o/r", SHA) is findings
     listing = api.pages.call_args_list[0].args[0]
     assert listing.startswith(f"/repos/o/r/commits/{SHA}/check-runs?")
@@ -205,13 +163,38 @@ def test_gate_verdict_is_read_from_the_guard_jobs_annotation(message, findings):
 @pytest.mark.parametrize("messages", [(), ("hits=0; success; x", "hits=0; success; y"), ("hits=zero; success",)])
 def test_missing_doubled_or_malformed_verdict_annotation_does_not_pass(messages):
     with pytest.raises(ValueError, match="recognized"):
-        lint.gate_has_findings(job_api(job_check(*messages)), "o/r", SHA)
+        lint.gate_has_findings(listing_api(check(*messages)), "o/r", SHA)
+
+
+def test_verdict_must_be_a_notice_from_the_guard_check():
+    item = check(CLEAN)
+    item["notes"][1] = dict(item["notes"][1], annotation_level="warning")
+    with pytest.raises(ValueError, match="recognized"):
+        lint.gate_has_findings(listing_api(item), "o/r", SHA)
+    with pytest.raises(ValueError, match="missing"):
+        lint.gate_has_findings(listing_api(check(CLEAN, name="gate-guard")), "o/r", SHA)
 
 
 def test_newest_guard_job_decides():
-    api = job_api(job_check("hits=1; failure; 1 hit, not approved"),
-                  job_check("hits=0; success; No removed tests", check_id=9))
+    api = listing_api(check(FINDINGS), check(CLEAN, check_id=9))
     assert not lint.gate_has_findings(api, "o/r", SHA)
+    api = listing_api(check(CLEAN), check(FINDINGS, check_id=9))
+    assert lint.gate_has_findings(api, "o/r", SHA)
+    with pytest.raises(ValueError, match=f"{JOB_CHECK}.*missing"):
+        lint.gate_has_findings(listing_api(), "o/r", SHA)
+
+
+@pytest.mark.parametrize("item", [check("unknown report"), check(status="in_progress")])
+def test_pending_or_unrecognized_gate_does_not_pass(item):
+    with pytest.raises(ValueError):
+        lint.gate_has_findings(listing_api(item), "o/r", SHA)
+
+
+@pytest.mark.parametrize("status", ["queued", "in_progress"])
+def test_latest_pending_gate_cannot_reuse_an_older_clean_verdict(status):
+    api = listing_api(check(CLEAN), check(check_id=2, status=status))
+    with pytest.raises(ValueError, match="pending"):
+        lint.gate_has_findings(api, "o/r", SHA)
 
 
 class FakeAPI:
@@ -239,11 +222,10 @@ class FakeAPI:
         self.requests.append(path)
         if path == "/repos/o/r/pulls/7/files":
             return self.files
+        if key != "check_runs":
+            return annotations(path, [check(CLEAN)])
         assert path.startswith(f"/repos/o/r/commits/{SHA}/check-runs?"), path
-        return [check("No removed tests, skip markers, retries or gate-config edits.")]
-
-
-CLEAN = "No removed tests, skip markers, retries or gate-config edits."
+        return [check(CLEAN)]
 
 
 def sequence(*reports):
@@ -253,17 +235,20 @@ def sequence(*reports):
 
     def pages(path, key=None):
         nonlocal last
+        if key != "check_runs":
+            return annotations(path, last)
         last = next(reads, last)
         return last
 
     api.pages.side_effect = pages
+    api.listings = lambda: sum(1 for c in api.pages.call_args_list if c.args[1:] == ("check_runs",))
     return api
 
 
 def test_gate_check_created_late_is_waited_for(sleeps):
-    api = sequence([], [dict(check(""), status="in_progress")], [check("| gate-config | workflow.yml | added |")])
+    api = sequence([], [check(status="in_progress")], [check(FINDINGS)])
     assert lint.gate_has_findings(api, "o/r", SHA)
-    assert api.pages.call_count == 3 and len(sleeps) == 2
+    assert api.listings() == 3 and len(sleeps) == 2
 
 
 def test_gate_check_created_late_and_clean_passes(sleeps):
@@ -273,20 +258,20 @@ def test_gate_check_created_late_and_clean_passes(sleeps):
 
 
 def test_gate_check_pending_then_completed_passes(sleeps):
-    api = sequence([dict(check(""), status="queued")], [check(CLEAN)])
+    api = sequence([check(status="queued")], [check(CLEAN)])
     assert not lint.gate_has_findings(api, "o/r", SHA)
 
 
 @pytest.mark.parametrize("reports, message", [
     ([[]], "missing"),
-    ([[dict(check(""), status="in_progress")]], "pending"),
+    ([[check(status="in_progress")]], "pending"),
 ])
 def test_gate_wait_is_bounded_and_then_fails_closed(sleeps, reports, message):
     api = sequence(*reports)
     with pytest.raises(ValueError, match=message):
         lint.gate_has_findings(api, "o/r", SHA)
     assert 1 <= len(sleeps) and sum(sleeps) <= 180
-    assert api.pages.call_count == len(sleeps) + 1
+    assert api.listings() == len(sleeps) + 1
 
 
 def test_unrecognized_completed_gate_report_is_not_waited_for(sleeps):
@@ -300,10 +285,17 @@ def test_missing_then_approved_findings_never_pass_without_gate_explanation(slee
     api = FakeAPI()
     api.pull["body"] = GOOD.split("### Gate changes")[0]
     original = api.pages
-    reports = iter([[], [dict(check(""), status="in_progress")], [check("| gate-config | workflow.yml | added |")]])
+    reports = iter([[], [check(status="in_progress")], [check(FINDINGS)]])
+    last = []
 
     def ordered_checks(path, key=None):
-        return next(reports) if key == "check_runs" else original(path, key)
+        nonlocal last
+        if key == "check_runs":
+            last = next(reports)
+            return last
+        if path.startswith("/repos/o/r/check-runs/"):
+            return annotations(path, last)
+        return original(path, key)
 
     api.pages = ordered_checks
     assert lint.inspect_pr(api, "o/r", 7) == [
