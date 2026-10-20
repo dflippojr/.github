@@ -288,6 +288,123 @@ The audit includes all `repos` entries, even disabled/held ones, records each he
 and visibility, and reports fetch errors explicitly. Violations do not abort the
 inventory. See `docs/workflow-lint-audit.md` for the initial audit and limitations.
 
+## PR body lint
+
+`.github/workflows/pr-body-lint.yml` supplies an Actions job named **pr-body**.
+Copy `templates/pr-body-lint-caller.yml` to the calling repository's default
+branch and replace both `<full-sha>` placeholders with the same full commit
+SHA of this repository's `main`. Require the resulting `pr-body / pr-body`
+job in the caller's ruleset. Wiring individual repositories is separate work.
+
+The caller uses `pull_request_target` on opened, edited, synchronize,
+reopened and labeled events, plus unlabeled and assignee changes. The lint
+fetches the current body, labels, assignees, linked issues, changed filenames
+and head's gate-guard report through the GitHub API. It requires:
+
+- `## Proof` (also accepts `## Proof table`) containing a Markdown table with
+  at least one non-empty data row; a blank template row does not count.
+- `### Not verified` and `Closes #N`, `Fixes #N` or `Resolves #N` (case
+  insensitive). Cross-repository references such as `Fixes owner/repo#12`
+  also work; the token must be able to read the linked issue.
+- Assignee `dflippojr`.
+- A non-empty `### Gate changes` explanation other than `None` when the
+  latest head check named `gate-guard` reports findings, including when that
+  check passed with owner approval. The lint waits up to three minutes for the
+  guard's check to appear and complete, because both start on the same event.
+  A check still missing or pending after that, or an unreadable report, fails
+  closed with a rerun instruction; it never counts as passing.
+  Known limits: until the guard posts its new in-progress check for a re-judge
+  of the same head (for example after the base branch changes), the lint reads
+  the previous completed check on that head; the owner's later `labeled` event
+  reruns it against the new report. The lint runs on a GitHub-hosted runner,
+  so the wait never holds the runner the guard needs.
+  **`gate-guard-target.yml` is required**: only its check run is named exactly
+  `gate-guard`. The `pull_request` flavour (`gate-guard.yml`) reports
+  `gate-guard / gate-guard` and writes no check output, and a repository with no
+  guard has no such check, so in both cases `pr-body` stays red until
+  `gate-guard-target.yml` is installed. Require the guard independently; this
+  check does not approve gate edits.
+- A changed test path when any linked issue has label `bug`. A `bug` label on
+  the PR itself does not substitute for the linked issue's label. Renames count
+  both old and new filenames, and deleted tests count as touched paths; the
+  gate guard separately checks removals.
+
+Comments and fenced examples do not satisfy these rules. Dependabot's exact
+login `dependabot[bot]` is exempt from the Proof table and closing-reference
+requirements. Not verified, assignee, gate explanations, linked-bug test paths
+and custom proof requirements still apply.
+
+### Per-repository proof rules
+
+An optional `.github/pr-proof-rules.yml` is read from the caller's **default
+branch**, never the PR head or its chosen base. It contains `test_paths`
+(a replacement list of test globs) and `rules` (a mapping from changed-file
+globs to lists of required body regexes). Every regex for every matched glob
+must match visible body text. Regexes use Python syntax with case-insensitive
+and multiline matching. Invalid rules and incomplete API results fail closed.
+
+The default test globs are `tests/**`, `test/**`, `**/*_test.*`,
+`**/*.test.*` and `**/test_*`. Globs match repository-relative paths using
+Python `fnmatch`; `*` can include path separators, and a leading `**/` also
+matches files at the repository root.
+
+Examples for the four repositories in issue #20 (adjust the file globs to
+the repository's actual paths before adopting):
+
+```yaml
+# disc-golf-league: give changed money/standings logic a named invariant.
+rules:
+  '**/money/**': ['Invariant: .+']
+  '**/*standings*': ['Invariant: .+']
+```
+
+```yaml
+# fhir-crd-router: validator changes cite the specification.
+rules:
+  '**/*validator*': ['Spec: https://[^\s]+']
+```
+
+```yaml
+# open-payer-sandbox: list changed goldens in the body.
+rules:
+  '**/goldens/**': ['Changed goldens: .+']
+```
+
+```yaml
+# task-start-copilot: command changes carry an eval summary.
+test_paths: ['tests/**', 'evals/**']
+rules:
+  'commands/**': ['Eval summary: .+']
+```
+
+### Security and verification
+
+Like the default-branch gate guard, the caller and reusable workflow must be
+trusted default-branch definitions pinned to the same full script SHA.
+The only checkout is this repository's lint script at that pin, with persisted
+credentials disabled. It never checks out or runs PR code, reads PR dependency
+files, uses PR rules, or interpolates PR fields into shell commands. PyYAML
+is installed at a fixed version; rules use `safe_load`. No secrets are needed
+beyond the default `GITHUB_TOKEN`, restricted to `contents: read`,
+`issues: read`, `pull-requests: read`, and `checks: read`. The last permission
+reads gate-guard checks in private repositories; no check-write permission is
+needed because Actions reports the job result. A fork cannot supply its own
+judge. As with gate guard, a compromised owner identity or a separate workflow
+spoofing a check name remains outside this protection.
+
+`lint-ref` is required. There is no `runs-on` input: the job only reads the
+GitHub API, so it always runs on `ubuntu-latest`, private repositories
+included, and never holds the single tower runner that the gate guard needs.
+
+Run the fixtures and API/security tests locally with
+`python -m pytest -q tests/test_pr_body_lint.py`. For a live, read-only check
+of a scratch PR, set `GITHUB_TOKEN` to a token with those read permissions and
+run `python scripts/pr_body_lint.py --repo owner/repo --pr N`. Exit codes are
+0 (pass), 1 (body violations), and 2 (could not verify). Short error messages
+go to stdout and, in Actions, the step summary. Test both an incomplete and a
+complete scratch body. The reusable `pull_request_target` caller itself takes
+effect only after its trusted definition is on the default branch.
+
 ## CI and analysis
 
 Install the CI dependencies and run the full test suite:
