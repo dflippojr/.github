@@ -87,6 +87,46 @@ class RuleDetails(unittest.TestCase):
         self.assertIn("removesItem", self.hits("flag-fewer-tests-java")[0].detail)
         self.assertIn("overflows", self.hits("flag-fewer-tests-rust")[0].detail)
 
+    def test_unity_run_test_removal_names_the_test(self):
+        [hit] = self.hits("flag-fewer-tests-cpp")
+        self.assertEqual(hit.path, "firmware/test/test_controls/test_main.cpp")
+        self.assertEqual(hit.detail, "1 fewer test in this file; removed test_button_press")
+
+    def test_deleted_unity_test_file_names_its_tests(self):
+        [hit] = self.hits("flag-deleted-test-cpp")
+        self.assertEqual(hit.detail, "test file deleted, 2 tests removed: test_clamp_low, test_clamp_high")
+
+    def test_unity_test_and_registration_count_once(self):
+        diff = """diff --git a/test/test_a/test_main.cpp b/test/test_a/test_main.cpp
+--- a/test/test_a/test_main.cpp
++++ b/test/test_a/test_main.cpp
+@@ -1,7 +1,2 @@
+-static void test_a(void) {}
+-void test_b() {}
+-void test_c(int);
+ int main() {
+-  RUN_TEST(test_a);
+-  RUN_TEST(test_b);
+ }
+"""
+        [hit] = analyze_text(diff)
+        self.assertEqual(hit.detail, "2 fewer tests in this file; removed test_a, test_b")
+
+    def test_c_sources_outside_a_test_directory_are_not_tests(self):
+        diff = """diff --git a/src/main.cpp b/src/main.cpp
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1,2 +1,1 @@
+-void test_probe(void) {}
+ int x;
+"""
+        self.assertEqual(analyze_text(diff), [])
+
+    def test_platformio_values_are_judged_on_added_lines(self):
+        details = sorted(h.detail for h in self.hits("flag-skip-platformio-values"))
+        self.assertEqual(details, ["PlatformIO test_ignore/test_filter: test_controls",
+                                   "PlatformIO test_ignore/test_filter: test_filter = test_logic"])
+
     def test_environment_guard_skip_is_not_a_hit(self):
         details = " ".join(h.detail for h in self.hits("flag-skip-python"))
         self.assertIn("flaky", details)
@@ -150,6 +190,14 @@ class Classification(unittest.TestCase):
             self.assertTrue(gate_guard.is_test_file(path), path)
         for path in ["src/app.py", "src/cart.ts", "calc/calc.go", "src/main/java/Cart.java", "README.md"]:
             self.assertFalse(gate_guard.is_test_file(path), path)
+
+    def test_c_and_cpp_test_modules(self):
+        for path in ["firmware/test/test_controls/test_main.cpp", "test/test_a/main.c", "tests/unit/a.cc",
+                     "lib/x/test/b.cxx"]:
+            self.assertTrue(gate_guard.is_test_module(path), path)
+        for path in ["firmware/src/main.cpp", "firmware/test/test_controls/helpers.h", "src/test.cpp",
+                     "firmware/platformio.ini"]:
+            self.assertFalse(gate_guard.is_test_module(path), path)
 
     def test_config_files(self):
         for path in ["pytest.ini", "package.json", "playwright.config.ts", ".eslintrc.js", "requirements-dev.txt",
@@ -331,7 +379,8 @@ class GitEndToEnd(unittest.TestCase):
 
     def test_fixtures_through_git(self):
         for name in ["flag-deleted-test-files", "flag-gate-coverage-python", "flag-skip-js",
-                     "pass-rename-test-file", "pass-split-test-file"]:
+                     "pass-rename-test-file", "pass-split-test-file", "flag-deleted-test-cpp",
+                     "flag-fewer-tests-cpp", "flag-skip-platformio", "pass-rename-test-file-cpp"]:
             with self.subTest(fixture=name), tempfile.TemporaryDirectory() as tmp:
                 self.root = tmp
                 self.git("init", "-q")

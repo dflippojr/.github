@@ -200,6 +200,7 @@ DOC_EXTS = {".md", ".markdown", ".rst", ".txt", ".adoc", ".diff", ".patch"}
 PY_EXTS = {".py"}
 JS_EXTS = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"}
 JVM_EXTS = {".java", ".kt", ".groovy", ".scala"}
+C_EXTS = {".c", ".cc", ".cpp", ".cxx"}
 CODE_EXTS = PY_EXTS | JS_EXTS | JVM_EXTS | {
     ".rs", ".go", ".cs", ".rb", ".php", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp",
     ".vue", ".svelte", ".sh", ".ps1"}
@@ -235,7 +236,7 @@ def is_test_module(path):
         return name.endswith("_test.go")
     if ext in JVM_EXTS:
         return bool(re.search(r"(tests?|it|spec)\.[^.]+$", name))
-    if ext == ".rs":
+    if ext == ".rs" or ext in C_EXTS:
         return _in_test_dir(path)
     return False
 
@@ -315,6 +316,9 @@ JVM_MARK = re.compile(
 JVM_NAME = re.compile(r"\b(?:void|fun)\s+(`[^`]+`|\w+)\s*\(")
 RS_MARK = re.compile(r"^\s*#\[(?:[\w:]+::)?test\b")
 RS_NAME = re.compile(r"\bfn\s+(\w+)")
+# Unity registers a test with RUN_TEST(name) and defines it as void test_name(void).
+UNITY_RUN = re.compile(r"^\s*RUN_TEST\s*\(\s*(\w+)")
+UNITY_DEF = re.compile(r"^\s*(?:static\s+)?(?:inline\s+)?void\s+(test_\w*)\s*\(\s*(?:void)?\s*\)(?!\s*;)")
 
 
 def _line_defs(fd, regex, group):
@@ -324,6 +328,16 @@ def _line_defs(fd, regex, group):
         if m:
             (removed if l.kind == "-" else added).append((m.group(group), l.old or l.new))
     return removed, added
+
+
+def _unity_defs(fd):
+    """Unity tests by name: a test's registration and its definition count once."""
+    sides = ({}, {})
+    for regex in (UNITY_RUN, UNITY_DEF):
+        for found, seen in zip(_line_defs(fd, regex, 1), sides):
+            for name, line in found:
+                seen.setdefault(name, line)
+    return [list(seen.items()) for seen in sides]
 
 
 def _marker_defs(fd, marker, name_re):
@@ -366,6 +380,8 @@ def test_defs(fd):
         return _marker_defs(fd, JVM_MARK, JVM_NAME)
     if ext == ".rs":
         return _marker_defs(fd, RS_MARK, RS_NAME)
+    if ext in C_EXTS and any(is_test_module(p) for p in fd.paths):
+        return _unity_defs(fd)
     return [], []
 
 
@@ -427,6 +443,10 @@ def _js_tests(path):
     return _ext(path) in JS_EXTS and is_test_file(path)
 
 
+# PlatformIO reads these from any env, and an env that extends another inherits them.
+PIO_TEST_KEY = re.compile(r"^\s*test_(?:ignore|filter)\s*[=:]")
+PIO_LABEL = "PlatformIO test_ignore/test_filter"
+
 SKIP_RULES = [
     ("pytest skip/xfail", _py_tests, re.compile(r"\bmark\.(?:skip|skipif|xfail)\b")),
     ("unittest skip", _py_tests, re.compile(
@@ -439,6 +459,7 @@ SKIP_RULES = [
     ("pytest deselect/ignore", is_config, re.compile(
         r"--deselect\b|--ignore(?:-glob)?[= ]|(?:^|\s)-[km]\s+['\"]?not\b")),
     ("test ignore pattern", is_config, re.compile(r"\btestPathIgnorePatterns\b|\btestIgnore\b")),
+    (PIO_LABEL, lambda p: _ext(p) == ".ini", PIO_TEST_KEY),
 ]
 # Skips called from inside a test count only when unconditional, or when the
 # condition is about CI: an environment guard such as "node isn't installed"
@@ -482,16 +503,44 @@ def _matching_lines(files, rules, imperative=False):
     return out
 
 
-def _new_lines(files, rules, imperative_rules=()):
+def _ini_value_lines(files):
+    """Changed value lines that continue a test_ignore/test_filter key which is itself unchanged.
+
+    A multi-line ini value is indented under its key; a key line that was
+    changed is reported by its own rule, so its values are not counted again.
+    """
+    out = []
+    for fd in files:
+        if _ext(fd.path) != ".ini":
+            continue
+        # side -> whether the open key line was unchanged context, or None
+        key = {"-": None, "+": None}
+        for l in fd.lines:
+            stripped = l.text.strip()
+            if not stripped or stripped.startswith(("#", ";")):
+                continue
+            for side in ("-", "+"):
+                if l.kind not in (" ", side):
+                    continue
+                if PIO_TEST_KEY.match(l.text):
+                    key[side] = l.kind == " "
+                elif not l.text[:1].isspace():
+                    key[side] = None
+                elif key[side] and l.kind == side:
+                    out.append((PIO_LABEL, fd.path, l))
+    return out
+
+
+def _new_lines(files, rules, imperative_rules=(), extra=()):
     """Added matches that are not a moved copy of a removed match anywhere in the diff."""
-    found = _matching_lines(files, rules) + _matching_lines(files, imperative_rules, imperative=True)
+    found = _matching_lines(files, rules) + _matching_lines(files, imperative_rules, imperative=True) + list(extra)
     removed = [f for f in found if f[2].kind == "-"]
     added = [f for f in found if f[2].kind == "+"]
     return _cancel_pairs(removed, added, key=lambda f: f[2].text.strip())
 
 
 def skip_hits(files):
-    _, added = _new_lines(files, SKIP_RULES, IMPERATIVE_SKIP_RULES)
+    _, added = _new_lines(files, SKIP_RULES, IMPERATIVE_SKIP_RULES, _ini_value_lines(files))
     return [Hit("skip-marker", path, l.new, f"{label}: {_snippet(l.text)}") for label, path, l in added]
 
 
