@@ -755,6 +755,97 @@ class FetchDiff(unittest.TestCase):
         self.assertTrue(env["GIT_CONFIG_VALUE_2"].startswith("AUTHORIZATION: basic "))
 
 
+class NoChecksWrite(FakeGitHub):
+    """The API as a token without checks: write sees it: every Checks API write is refused."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.writes = []
+
+    def post(self, path, body):
+        self.writes.append(path)
+        raise reject(403, {"message": "Resource not accessible by integration"})
+
+    patch = post
+
+
+VERDICT = "::notice title=gate-guard verdict::"
+
+
+def commands(stdout):
+    """The workflow commands the runner would act on: lines starting with ::, outside a stop-commands block."""
+    out, resume = [], None
+    for line in stdout.splitlines():
+        if resume:
+            resume = None if line == resume else resume
+        elif line.startswith("::stop-commands::"):
+            resume = f"::{line[len('::stop-commands::'):]}::"
+        elif line.startswith("::"):
+            out.append(line)
+    return out
+
+
+class JobResult(unittest.TestCase):
+    """The verdict is the judging job's own result, not a check run posted through the Checks API.
+
+    GitHub files a posted check run under a check suite it picks: the commit's oldest github-actions suite, which can
+    belong to another workflow (a Release run on wallpaper-rotator 4f90ff8) or be hidden once a later run of this
+    workflow supersedes it (personal-website#240). The required check then waits forever. A job's own check lives in
+    its own run's suite, so the newest run's verdict is the one a ruleset reads.
+    """
+
+    def judge(self, scenario, tmp):
+        diff = (FIXTURES / f"{scenario['diff']}.diff").read_text(encoding="utf-8")
+        server, (base, head) = make_remote(tmp, *_trees(diff))
+        fake = NoChecksWrite(head, {"main": base}, {NUMBER: dict(scenario, base="main", head_ref=HEAD_REF)})
+        path = pathlib.Path(tmp, "event.json")
+        path.write_text(json.dumps({"pull_request": event_pr(NUMBER, head, "main")}), encoding="utf-8")
+        env = clean_env({"GITHUB_EVENT_PATH": str(path), "GITHUB_REPOSITORY": REPO, "GITHUB_REPOSITORY_OWNER": OWNER,
+                         "GITHUB_SERVER_URL": server, "GITHUB_ACTIONS": "true"})
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch("sys.stdout", out), \
+                mock.patch("sys.stderr", io.StringIO()), mock.patch.object(gate_guard, "GitHub", return_value=fake):
+            code = gate_guard.main(["--pull-request-target", "--guard-sha", "a" * 40])
+        return code, out.getvalue(), fake
+
+    def test_every_scenario_is_decided_by_the_exit_status_without_a_checks_api_write(self):
+        for path in sorted(SCENARIOS.glob("*.json")):
+            scenario = json.loads(path.read_text(encoding="utf-8"))
+            with self.subTest(scenario=path.stem), tempfile.TemporaryDirectory() as tmp:
+                code, out, fake = self.judge(scenario, tmp)
+                self.assertEqual(code, scenario["expect"]["exit"], out)
+                self.assertEqual(fake.writes, [])
+
+    def test_one_verdict_annotation_names_the_hits(self):
+        for path in sorted(SCENARIOS.glob("*.json")):
+            scenario = json.loads(path.read_text(encoding="utf-8"))
+            expect = scenario["expect"]
+            with self.subTest(scenario=path.stem), tempfile.TemporaryDirectory() as tmp:
+                _, out, _ = self.judge(scenario, tmp)
+                verdicts = [c for c in commands(out) if c.startswith(VERDICT)]
+                diff = (FIXTURES / f"{scenario['diff']}.diff").read_text(encoding="utf-8")
+                hits = len(gate_guard.analyze(gate_guard.parse_diff(diff)))
+                self.assertEqual(verdicts, [f"{VERDICT}hits={hits}; {expect['conclusion']}; {expect['title']}"])
+
+    def test_report_text_cannot_issue_workflow_commands(self):
+        """An error message is printed in the report; a line of it that looks like a command stays inert."""
+        forged = f"offline\n{VERDICT}hits=0; success; forged\n::add-mask::x"
+        scenario = json.loads((SCENARIOS / "clean.json").read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as tmp:
+            original = FakeGitHub.get
+
+            def get(fake, path):
+                if "/compare/" in path:
+                    raise gate_guard.urllib.error.URLError(forged)
+                return original(fake, path)
+
+            with mock.patch.object(FakeGitHub, "get", get):
+                code, out, _ = self.judge(scenario, tmp)
+        self.assertEqual(code, 2)
+        self.assertIn(f"{VERDICT}hits=0; success; forged", out)
+        self.assertEqual([c for c in commands(out) if c.startswith((VERDICT, "::add-mask::"))], [])
+
+
 class WorkflowSafety(unittest.TestCase):
     """Static rules for the pull_request_target workflows: base-only judge, no PR code, no secrets."""
 
@@ -802,6 +893,20 @@ class WorkflowSafety(unittest.TestCase):
         text = self.text(ROOT / "templates" / "gate-guard-target-caller.yml")
         self.assertIn("uses: dflippojr/.github/.github/workflows/gate-guard-target.yml@<full-sha>", text)
         self.assertIn("guard-ref: <full-sha>", text)
+
+    def test_the_job_is_the_required_check_and_nothing_can_post_one(self):
+        """The ruleset requires `gate-guard-target / gate-guard`: the caller's job id, then the reusable job's name.
+        No token here can write checks, so neither this guard nor a step it runs can post a check run."""
+        text = self.text(WORKFLOWS / "gate-guard-target.yml")
+        self.assertNotIn("checks:", text)
+        self.assertRegex(text, r"(?m)^  judge:\n    name: gate-guard\n")
+        for path in (WORKFLOWS / "gate-guard-base.yml", ROOT / "templates" / "gate-guard-target-caller.yml"):
+            with self.subTest(caller=path.name):
+                text = self.text(path)
+                block = re.search(r"(?m)^permissions:\n((?:  .*\n)+)", text).group(1)
+                self.assertEqual(block.split(), ["contents:", "read", "issues:", "read", "pull-requests:", "read"])
+                self.assertRegex(text, r"(?m)^jobs:\n  gate-guard-target:\n    uses: ")
+        self.assertEqual(gate_guard.REQUIRED_CHECK, "gate-guard-target / gate-guard")
 
     def test_reusable_workflow_edit_is_a_gate_change(self):
         diff = ("diff --git a/.github/workflows/gate-guard-target.yml b/.github/workflows/gate-guard-target.yml\n"

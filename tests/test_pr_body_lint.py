@@ -162,6 +162,58 @@ def test_latest_pending_gate_cannot_reuse_an_older_clean_verdict(status):
         lint.gate_has_findings(api, "o/r", SHA)
 
 
+JOB_CHECK = "gate-guard-target / gate-guard"
+RUNNER_NOTICE = {"title": "", "annotation_level": "notice", "path": ".github", "message": "The runner image will move."}
+
+
+def job_check(*messages, check_id=5, **fields):
+    """The guard job's check run and its annotations: GitHub's own notice, then one verdict per message."""
+    notes = [RUNNER_NOTICE] + [{"title": "gate-guard verdict", "annotation_level": "notice", "path": ".github",
+                                "message": m} for m in messages]
+    return dict(id=check_id, name=JOB_CHECK, status="completed", conclusion="success",
+                output={"title": None, "summary": None, "annotations_count": len(notes)}, **fields), notes
+
+
+def job_api(*checks):
+    api = mock.Mock()
+    notes = {item["id"]: annotations for item, annotations in checks}
+
+    def pages(path, key=None):
+        if path.startswith("/repos/o/r/check-runs/"):
+            return notes[int(path.split("/")[5])]
+        return [item for item, _ in checks]
+
+    api.pages.side_effect = pages
+    return api
+
+
+@pytest.mark.parametrize("message, findings", [
+    ("hits=2; success; 2 hits, approved by the owner", True),
+    ("hits=1; failure; 1 hit, not approved", True),
+    ("hits=0; success; No removed tests, skips, retries or gate-config edits", False),
+])
+def test_gate_verdict_is_read_from_the_guard_jobs_annotation(message, findings):
+    """The guard reports through its own job's check, which has no output text: the verdict is an annotation."""
+    api = job_api(job_check(message))
+    assert lint.gate_has_findings(api, "o/r", SHA) is findings
+    listing = api.pages.call_args_list[0].args[0]
+    assert listing.startswith(f"/repos/o/r/commits/{SHA}/check-runs?")
+    assert "check_name=gate-guard-target%20%2F%20gate-guard" in listing
+    assert api.pages.call_args_list[1].args[0] == "/repos/o/r/check-runs/5/annotations"
+
+
+@pytest.mark.parametrize("messages", [(), ("hits=0; success; x", "hits=0; success; y"), ("hits=zero; success",)])
+def test_missing_doubled_or_malformed_verdict_annotation_does_not_pass(messages):
+    with pytest.raises(ValueError, match="recognized"):
+        lint.gate_has_findings(job_api(job_check(*messages)), "o/r", SHA)
+
+
+def test_newest_guard_job_decides():
+    api = job_api(job_check("hits=1; failure; 1 hit, not approved"),
+                  job_check("hits=0; success; No removed tests", check_id=9))
+    assert not lint.gate_has_findings(api, "o/r", SHA)
+
+
 class FakeAPI:
     def __init__(self, *, issue_bug=False, config=None, files=None):
         self.pull = pr()
