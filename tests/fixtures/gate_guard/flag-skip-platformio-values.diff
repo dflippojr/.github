@@ -1,12 +1,12 @@
-# gate-guard fixture: a test is appended to a multi-line test_ignore and test_filter is added
+# gate-guard fixture: a test is appended to a multi-line test_ignore
 # expect: skip-marker
-# hits: 2
+# hits: 1
 
 diff --git a/firmware/platformio.ini b/firmware/platformio.ini
 index 96834b5..b136a1e 100644
 --- a/firmware/platformio.ini
 +++ b/firmware/platformio.ini
-@@ -1,21 +1,23 @@
+@@ -1,21 +1,22 @@
  [platformio]
  default_envs = esp32
  
@@ -28,5 +28,4 @@ index 96834b5..b136a1e 100644
  
  [env:native-coverage]
  extends = env:native
-+test_filter = test_logic
  build_flags = ${env:native.build_flags} --coverage

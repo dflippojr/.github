@@ -331,13 +331,18 @@ def _line_defs(fd, regex, group):
 
 
 def _unity_defs(fd):
-    """Unity tests by name: a test's registration and its definition count once."""
-    sides = ({}, {})
-    for regex in (UNITY_RUN, UNITY_DEF):
-        for found, seen in zip(_line_defs(fd, regex, 1), sides):
-            for name, line in found:
-                seen.setdefault(name, line)
-    return [list(seen.items()) for seen in sides]
+    """Unity registrations and definitions on changed lines: (name, line, kind), kept apart.
+
+    The kind keeps an edit to a definition from cancelling the removal of its
+    registration; removed_test_hits counts a test's two kinds once, by name.
+    """
+    removed, added = [], []
+    for l in fd.changed():
+        for kind, regex in (("run", UNITY_RUN), ("def", UNITY_DEF)):
+            m = regex.match(l.text)
+            if m:
+                (removed if l.kind == "-" else added).append((m.group(1), l.old or l.new, kind))
+    return removed, added
 
 
 def _marker_defs(fd, marker, name_re):
@@ -386,8 +391,26 @@ def test_defs(fd):
 
 
 def _names(defs, limit=5):
-    names = [n if n is not None else f"test at line {line}" for n, line in defs]
+    names = [d[0] if d[0] is not None else f"test at line {d[1]}" for d in defs]
     return ", ".join(names[:limit]) + (f" and {len(names) - limit} more" if len(names) > limit else "")
+
+
+def _def_key(d):
+    """Identity of a definition: its name, and for Unity whether it is a registration or a definition."""
+    return (d[0], *d[2:])
+
+
+def _by_name(defs):
+    """Unity items counted once per name, a test's registration and definition together."""
+    seen = set()
+    out = []
+    for d in defs:
+        if len(d) == 3:
+            if d[0] in seen:
+                continue
+            seen.add(d[0])
+        out.append(d)
+    return out
 
 
 def removed_test_hits(files):
@@ -396,28 +419,28 @@ def removed_test_hits(files):
     for fd in files:
         removed, added = test_defs(fd)
         # A test removed and re-added in the same file was edited, not removed.
-        left[id(fd)] = list(_cancel_pairs(removed, added, key=lambda d: d[0]))
+        left[id(fd)] = list(_cancel_pairs(removed, added, key=_def_key))
     # A test removed from one file and added to another was moved.
     pool = collections.defaultdict(list)
     for fd in files:
         for d in left[id(fd)][1]:
             if d[0] is not None:
-                pool[d[0]].append((id(fd), d))
+                pool[_def_key(d)].append((id(fd), d))
     for fd in files:
         removed = left[id(fd)][0]
         kept = []
         for d in removed:
-            match = next((i for i, (owner, _) in enumerate(pool.get(d[0], [])) if owner != id(fd)), None)
+            match = next((i for i, (owner, _) in enumerate(pool.get(_def_key(d), [])) if owner != id(fd)), None)
             if match is None:
                 kept.append(d)
                 continue
-            owner, added = pool[d[0]].pop(match)
+            owner, added = pool[_def_key(d)].pop(match)
             left[owner][1].remove(added)
         left[id(fd)][0] = kept
 
     hits = []
     for fd in files:
-        removed, added = left[id(fd)]
+        removed, added = map(_by_name, left[id(fd)])
         decrease = len(removed) - len(added)
         plural = "s" if decrease != 1 else ""
         if fd.status == "deleted" and (decrease > 0 or (not test_defs(fd)[0] and is_test_module(fd.path))):
@@ -444,8 +467,11 @@ def _js_tests(path):
 
 
 # PlatformIO reads these from any env, and an env that extends another inherits them.
-PIO_TEST_KEY = re.compile(r"^\s*test_(?:ignore|filter)\s*[=:]")
-PIO_LABEL = "PlatformIO test_ignore/test_filter"
+# test_ignore lists tests that do not run, so adding to it is a skip. test_filter
+# lists the only tests that run, so removing from it is.
+PIO_IGNORE_KEY = re.compile(r"^\s*test_ignore\s*[=:]")
+PIO_FILTER_KEY = re.compile(r"^\s*test_filter\s*[=:]")
+PIO_LABEL = "PlatformIO test_ignore"
 
 SKIP_RULES = [
     ("pytest skip/xfail", _py_tests, re.compile(r"\bmark\.(?:skip|skipif|xfail)\b")),
@@ -459,7 +485,7 @@ SKIP_RULES = [
     ("pytest deselect/ignore", is_config, re.compile(
         r"--deselect\b|--ignore(?:-glob)?[= ]|(?:^|\s)-[km]\s+['\"]?not\b")),
     ("test ignore pattern", is_config, re.compile(r"\btestPathIgnorePatterns\b|\btestIgnore\b")),
-    (PIO_LABEL, lambda p: _ext(p) == ".ini", PIO_TEST_KEY),
+    (PIO_LABEL, lambda p: _ext(p) == ".ini", PIO_IGNORE_KEY),
 ]
 # Skips called from inside a test count only when unconditional, or when the
 # condition is about CI: an environment guard such as "node isn't installed"
@@ -504,7 +530,7 @@ def _matching_lines(files, rules, imperative=False):
 
 
 def _ini_value_lines(files):
-    """Changed value lines that continue a test_ignore/test_filter key which is itself unchanged.
+    """Changed value lines that continue a test_ignore key which is itself unchanged.
 
     A multi-line ini value is indented under its key; a key line that was
     changed is reported by its own rule, so its values are not counted again.
@@ -522,13 +548,59 @@ def _ini_value_lines(files):
             for side in ("-", "+"):
                 if l.kind not in (" ", side):
                     continue
-                if PIO_TEST_KEY.match(l.text):
+                if PIO_IGNORE_KEY.match(l.text):
                     key[side] = l.kind == " "
                 elif not l.text[:1].isspace():
                     key[side] = None
                 elif key[side] and l.kind == side:
                     out.append((PIO_LABEL, fd.path, l))
     return out
+
+
+def _filter_entries(value):
+    """The entries of a test_filter value; PlatformIO separates them by commas or whitespace."""
+    return [e for e in re.split(r"[,\s]+", re.sub(r"\s[#;].*$", "", value.strip())) if e]
+
+
+def _filter_hits(files):
+    """Entries a PlatformIO test_filter lost: a filter that shrinks stops running those tests.
+
+    Entries are compared per option and env, old side against new, so a
+    reformatted filter or one that grew is not a hit, and a continuation line
+    stays with the option it belongs to. Dropping the whole key runs everything.
+    """
+    hits = []
+    for fd in files:
+        if _ext(fd.path) != ".ini":
+            continue
+        section = {"-": "", "+": ""}
+        key = {"-": None, "+": None}
+        entries = {"-": {}, "+": {}}
+        for l in fd.lines:
+            m = SECTION_RE.match(l.text)
+            stripped = l.text.strip()
+            for side in ("-", "+"):
+                if l.kind not in (" ", side):
+                    continue
+                if m:
+                    section[side] = m.group(1).lower()
+                    key[side] = None
+                elif not stripped or stripped.startswith(("#", ";")):
+                    continue
+                elif PIO_FILTER_KEY.match(l.text):
+                    key[side] = section[side]
+                    entries[side].setdefault(key[side], [])
+                    entries[side][key[side]] += _filter_entries(re.split(r"[=:]", l.text, 1)[1])
+                elif not l.text[:1].isspace():
+                    key[side] = None
+                elif key[side] is not None:
+                    entries[side][key[side]] += _filter_entries(l.text)
+        for env, old in entries["-"].items():
+            if env not in entries["+"]:
+                continue
+            for entry in dict.fromkeys(e for e in old if e not in entries["+"][env]):
+                hits.append(Hit("skip-marker", fd.path, None, f"PlatformIO test_filter entry removed: {entry}"))
+    return hits
 
 
 def _new_lines(files, rules, imperative_rules=(), extra=()):
@@ -541,7 +613,7 @@ def _new_lines(files, rules, imperative_rules=(), extra=()):
 
 def skip_hits(files):
     _, added = _new_lines(files, SKIP_RULES, IMPERATIVE_SKIP_RULES, _ini_value_lines(files))
-    return [Hit("skip-marker", path, l.new, f"{label}: {_snippet(l.text)}") for label, path, l in added]
+    return [Hit("skip-marker", path, l.new, f"{label}: {_snippet(l.text)}") for label, path, l in added]         + _filter_hits(files)
 
 
 # -------------------------------------------------------------------- retries

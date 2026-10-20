@@ -1,0 +1,31 @@
+# gate-guard fixture: an entry is deleted from a multi-line test_filter, so that test stops running
+# expect: skip-marker
+# hits: 1
+
+diff --git a/firmware/platformio.ini b/firmware/platformio.ini
+index 96834b5..2f6c1d0 100644
+--- a/firmware/platformio.ini
++++ b/firmware/platformio.ini
+@@ -1,22 +1,21 @@
+ [platformio]
+ default_envs = esp32
+ 
+ [env]
+ framework = arduino
+ lib_deps = throwtheswitch/Unity@^2.6.0
+ 
+ [env:esp32]
+ platform = espressif32
+ board = esp32dev
+ 
+ [env:native]
+ platform = native
+ test_framework = unity
+ test_filter =
+     test_logic
+-    test_controls
+ build_flags = -std=gnu++17
+ 
+ [env:native-coverage]
+ extends = env:native
+ build_flags = ${env:native.build_flags} --coverage

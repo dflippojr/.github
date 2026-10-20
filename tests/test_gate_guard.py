@@ -124,8 +124,31 @@ class RuleDetails(unittest.TestCase):
 
     def test_platformio_values_are_judged_on_added_lines(self):
         details = sorted(h.detail for h in self.hits("flag-skip-platformio-values"))
-        self.assertEqual(details, ["PlatformIO test_ignore/test_filter: test_controls",
-                                   "PlatformIO test_ignore/test_filter: test_filter = test_logic"])
+        self.assertEqual(details, ["PlatformIO test_ignore: test_controls"])
+
+    def test_platformio_filter_is_judged_on_removed_entries(self):
+        [hit] = self.hits("flag-skip-platformio-filter-narrowed")
+        self.assertEqual(hit.detail, "PlatformIO test_filter entry removed: test_controls")
+        self.assertEqual(self.hits("pass-platformio-filter-widened"), [])
+
+    def test_platformio_filter_continuation_stays_with_its_option(self):
+        diff = """diff --git a/platformio.ini b/platformio.ini
+--- a/platformio.ini
++++ b/platformio.ini
+@@ -1,7 +1,6 @@
+ [env:native]
+ test_ignore =
+     test_slow
+-    test_old
+ test_filter =
+     test_logic
+ [env:other]
+"""
+        self.assertEqual(analyze_text(diff), [])
+
+    def test_unity_registration_removal_survives_a_definition_edit(self):
+        [hit] = self.hits("flag-fewer-tests-cpp-reformatted")
+        self.assertEqual(hit.detail, "1 fewer test in this file; removed test_button_press")
 
     def test_environment_guard_skip_is_not_a_hit(self):
         details = " ".join(h.detail for h in self.hits("flag-skip-python"))
