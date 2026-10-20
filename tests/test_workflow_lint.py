@@ -320,7 +320,7 @@ INI = '[pytest]\naddopts = '
     ('step-env-cleared', {WORKFLOW: workflow(env=['PYTEST_ADDOPTS: -n auto'], step_env=['PYTEST_ADDOPTS: ""'])}, []),
     ('command-line-override-allows', {WORKFLOW: workflow(env=['PYTEST_ADDOPTS: -n auto'], run='python -m pytest -n 2')}, []),
     ('command-line-override-cannot-raise', {WORKFLOW: workflow(env=['PYTEST_ADDOPTS: -n 2'], run='python -m pytest -n 8')}, CAP),
-    ('step-env-dynamic', {WORKFLOW: workflow(step_env=['PYTEST_ADDOPTS: "${{ vars.PYTEST_OPTS }}"'])}, [('warning', 'dynamic-parallelism')]),
+    ('step-env-dynamic', {WORKFLOW: workflow(step_env=['PYTEST_ADDOPTS: "${{ vars.PYTEST_OPTS }}"'])}, CAP),
     ('step-env-on-action-step', {WORKFLOW: 'on: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: ./.github/actions/test\n        env:\n          PYTEST_ADDOPTS: -n auto\n'}, CAP),
     ('inline-assignment-in-run', {WORKFLOW: workflow(run="PYTEST_ADDOPTS='-n auto' python -m pytest")}, CAP),
     ('inline-assignment-4-allowed', {WORKFLOW: workflow(run="PYTEST_ADDOPTS='-n 4' python -m pytest")}, []),
@@ -328,7 +328,7 @@ INI = '[pytest]\naddopts = '
     ('export-then-pytest', {WORKFLOW: workflow(run='export PYTEST_ADDOPTS="-n auto"\npytest')}, CAP),
     ('export-then-other-runner', {WORKFLOW: workflow(run='export PYTEST_ADDOPTS="-n auto"\nmake test')}, CAP),
     ('github-env-carries-to-next-step', {WORKFLOW: workflow(run='echo "PYTEST_ADDOPTS=-n 16" >> "$GITHUB_ENV"', extra_steps='      - run: python -m pytest\n')}, CAP),
-    ('unset-clears', {WORKFLOW: workflow(env=['PYTEST_ADDOPTS: -n auto'], run='unset PYTEST_ADDOPTS\npytest')}, []),
+    ('unset-is-not-credited', {WORKFLOW: workflow(env=['PYTEST_ADDOPTS: -n auto'], run='unset PYTEST_ADDOPTS\npytest')}, CAP),
     ('powershell-env', {WORKFLOW: workflow(run='$env:PYTEST_ADDOPTS = "-n auto"\npytest')}, CAP),
     ('cmd-set', {WORKFLOW: workflow(run='set PYTEST_ADDOPTS=-n auto\npytest')}, CAP),
     ('cmd-set-crlf', {WORKFLOW: workflow(run='set PYTEST_ADDOPTS=-n 5\r\npytest')}, CAP),
@@ -369,6 +369,7 @@ AUTO = 'export PYTEST_ADDOPTS="-n auto"\n'
     ('export-make-then-override-ci-local', {'ci-local.sh': AUTO + 'make test\npytest -n 2 tests/unit\n'}, CAP),
     ('export-override-then-npm-package-script', {'package.json': json.dumps({'scripts': {'test': 'export PYTEST_ADDOPTS="-n auto"; pytest -n 2 && npm run e2e'}})}, CAP),
     ('step-env-override-then-make-same-step', {WORKFLOW: workflow(step_env=['PYTEST_ADDOPTS: -n auto'], run='pytest -n 2\nmake test')}, CAP),
+    ('export-override-then-unset-then-make', {WORKFLOW: workflow(run=AUTO + 'pytest -n 2\nunset PYTEST_ADDOPTS\nmake test')}, CAP),
     ('github-env-override-then-make', {WORKFLOW: workflow(run='echo "PYTEST_ADDOPTS=-n 16" >> "$GITHUB_ENV"', extra_steps='      - run: pytest -n 2\n      - run: make test\n')}, CAP),
     # An inline assignment belongs to its own command; it does not reach the commands after it.
     ('inline-assignment-does-not-leak', {WORKFLOW: workflow(run="PYTEST_ADDOPTS='-n 8' pytest -n 2\npytest")}, []),
@@ -378,7 +379,6 @@ AUTO = 'export PYTEST_ADDOPTS="-n auto"\n'
     ('export-override-only', {WORKFLOW: workflow(run=AUTO + 'pytest -n 2 tests/unit')}, []),
     ('export-two-overrides', {WORKFLOW: workflow(run=AUTO + 'pytest -n 2 tests/unit\npytest -n 4 tests/slow')}, []),
     ('export-override-then-echo', {WORKFLOW: workflow(run=AUTO + 'pytest -n 2 tests/unit\necho done\ncd ..')}, []),
-    ('export-override-then-unset-then-make', {WORKFLOW: workflow(run=AUTO + 'pytest -n 2\nunset PYTEST_ADDOPTS\nmake test')}, []),
     ('export-four-then-make', {WORKFLOW: workflow(run='export PYTEST_ADDOPTS="-n 4"\nmake test')}, []),
     ('job-env-override-only', {WORKFLOW: workflow(job_env=['PYTEST_ADDOPTS: -n auto'], run='pytest -n 2', extra_steps='      - uses: actions/checkout@v4\n')}, []),
     ('job-env-override-then-echo-step', {WORKFLOW: workflow(job_env=['PYTEST_ADDOPTS: -n auto'], run='pytest -n 2', extra_steps='      - run: echo done\n')}, []),
@@ -434,7 +434,7 @@ CONDITIONAL_STEP = ('on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n{env}
     ('unsafe-write-in-heredoc', env_write("cat >> \"$GITHUB_ENV\" <<'EOF'\nPYTEST_ADDOPTS=-n auto\nEOF", job_env=()), CAP),
     ('unsafe-write-in-conditional-step', {WORKFLOW: CONDITIONAL_STEP.format(env='', value='-n 16')}, CAP),
     ('clear-in-conditional-step-keeps-inherited', {WORKFLOW: CONDITIONAL_STEP.format(env='    env:\n      PYTEST_ADDOPTS: -n auto\n', value='')}, CAP),
-    ('variable-in-written-text', env_write('echo "PYTEST_ADDOPTS=$OPTS" >> "$GITHUB_ENV"', job_env=()), [('warning', 'dynamic-parallelism')]),
+    ('variable-in-written-text', env_write('echo "PYTEST_ADDOPTS=$OPTS" >> "$GITHUB_ENV"', job_env=()), CAP),
     ('safe-value-written', env_write('echo "PYTEST_ADDOPTS=-n 2" >> "$GITHUB_ENV"', job_env=()), []),
     # Text that does not go to the environment file never reaches pytest.
     ('unsafe-value-written-to-github-env-bak', env_write('echo "PYTEST_ADDOPTS=-n 16" >> "${GITHUB_ENV}.bak"', job_env=()), []),
@@ -499,6 +499,58 @@ def shell_write(shell, run, step_env=''):
     ('step-env-clears-the-inherited-value', shell_write('bash', "echo 'NOTE=1' >> \"$GITHUB_ENV\"", '        env:\n          PYTEST_ADDOPTS: ""\n'), []),
 ], ids=lambda value: value if isinstance(value, str) else None)
 def test_github_env_never_lifts_an_inherited_pytest_addopts(name, files, expected):
+    assert policy_rules(files) == expected
+
+
+def printf_write(value):
+    """A step that writes PYTEST_ADDOPTS with printf and a \\n escape, then a bare pytest; no YAML value."""
+    return {WORKFLOW: workflow(run=f"printf 'PYTEST_ADDOPTS={value}\\n' >> \"$GITHUB_ENV\"", extra_steps='      - run: pytest\n')}
+
+
+INHERITED_AUTO = ['PYTEST_ADDOPTS: -n auto']
+
+
+def skipped(lines, job_env=INHERITED_AUTO):
+    """A job that inherits -n auto and changes PYTEST_ADDOPTS only in a branch that never runs, then runs pytest."""
+    return {WORKFLOW: workflow(job_env=job_env, run='if false; then\n' + ''.join(f'  {line}\n' for line in lines) + 'fi\npytest')}
+
+
+@pytest.mark.parametrize('name,files,expected', [
+    # Codex round 5 at 53cb81d, finding 1: printf turns \n into a line break, so the scan cannot read the value exactly.
+    ('printf-escape-auto', printf_write('-n auto'), CAP),
+    ('printf-escape-numeric', printf_write('-n 8'), CAP),
+    ('printf-escape-even-a-safe-count', printf_write('-n 2'), CAP),
+    ('echo-e-escape', {WORKFLOW: workflow(run='echo -e "PYTEST_ADDOPTS=-n 2\\nX=1" >> "$GITHUB_ENV"')}, CAP),
+    # A value that depends on a variable cannot be read exactly either (also step-env-dynamic, variable-in-written-text).
+    ('variable-exported', {WORKFLOW: workflow(run='export PYTEST_ADDOPTS="$OPTS"\npytest')}, CAP),
+    ('unclosed-quote-in-assignment', {WORKFLOW: workflow(run='export PYTEST_ADDOPTS="-n 2\npytest')}, CAP + [('warning', 'unparsed-command')]),
+    ('worker-count-not-a-number', {WORKFLOW: workflow(step_env=['PYTEST_ADDOPTS: -n two'])}, CAP),
+    # Still allowed: a literal value written exactly.
+    ('printf-argument-without-escape', env_write("printf '%s\\n' 'PYTEST_ADDOPTS=-n 2' >> \"$GITHUB_ENV\"", job_env=()), []),
+    ('echo-safe-value', env_write('echo "PYTEST_ADDOPTS=-n 2" >> "$GITHUB_ENV"', job_env=()), []),
+], ids=lambda value: value if isinstance(value, str) else None)
+def test_pytest_addopts_writes_the_scan_cannot_read_exactly_fail(name, files, expected):
+    assert policy_rules(files) == expected
+
+
+@pytest.mark.parametrize('name,files,expected', [
+    # Codex round 5 at 53cb81d, finding 2: bash skips the branch, so pytest still inherits -n auto.
+    ('skipped-unset', skipped(['unset PYTEST_ADDOPTS']), CAP),
+    ('skipped-export-clear', skipped(['export PYTEST_ADDOPTS=""']), CAP),
+    ('skipped-bare-clear', skipped(['PYTEST_ADDOPTS=']), CAP),
+    ('skipped-weaker-export', skipped(['export PYTEST_ADDOPTS="-n 2"']), CAP),
+    ('skipped-powershell-clear', skipped(['$env:PYTEST_ADDOPTS = ""']), CAP),
+    # Owner rule: no clear or weaker value in the script is credited, conditional or not
+    # (also unset-is-not-credited and export-override-then-unset-then-make).
+    ('unconditional-weaker-export', {WORKFLOW: workflow(job_env=INHERITED_AUTO, run='export PYTEST_ADDOPTS="-n 2"\npytest')}, CAP),
+    ('inline-weaker-value', {WORKFLOW: workflow(job_env=INHERITED_AUTO, run='PYTEST_ADDOPTS="-n 2" pytest')}, CAP),
+    ('unset-then-heredoc', {WORKFLOW: workflow(job_env=INHERITED_AUTO, run='unset PYTEST_ADDOPTS\nbash <<EOF\npytest\nEOF')}, CAP),
+    # Still allowed: the command line sets the count, or the step's own env: block replaces the value.
+    ('command-line-count-after-unset', {WORKFLOW: workflow(job_env=INHERITED_AUTO, run='unset PYTEST_ADDOPTS\npytest -n 2')}, []),
+    ('step-env-clear', {WORKFLOW: workflow(job_env=INHERITED_AUTO, step_env=['PYTEST_ADDOPTS: ""'], run='pytest')}, []),
+    ('skipped-branch-with-nothing-inherited', skipped(['export PYTEST_ADDOPTS="-n 2"'], job_env=()), []),
+], ids=lambda value: value if isinstance(value, str) else None)
+def test_no_shell_clear_or_weaker_value_lifts_the_inherited_pytest_addopts(name, files, expected):
     assert policy_rules(files) == expected
 
 

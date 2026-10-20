@@ -252,13 +252,19 @@ package script, a `ci-local` shell or Python/JS launcher (including `export`,
 `env`, `$env:`, `set` and `$GITHUB_ENV`), and `addopts` in `pytest.ini`,
 `.pytest.ini`, `tox.ini`, `setup.cfg`, `pyproject.toml` and `pytest.toml`. A worker
 flag on the same pytest command line replaces the environment value, so it is
-judged instead. A value that depends on an expression or variable warns.
-A `PYTEST_ADDOPTS` value written to `$GITHUB_ENV` is checked in the step that
-writes it, but such a write never clears or weakens the value later steps
-inherit from workflow or job `env`: whether it lands as its own line depends on
-the shell, stream, line breaks and later overwrites, which the YAML does not
-show. To change the inherited value for a step, set `PYTEST_ADDOPTS` in that
-step's own `env:` block.
+judged instead. A `PYTEST_ADDOPTS` value the check cannot read exactly fails
+as a cap error: one that depends on an expression or variable, a quote that
+never closes, a worker count that is not a number, or text written through
+`printf` or `echo -e` with a backslash escape or `%` format.
+No clear or weaker value is credited. A `PYTEST_ADDOPTS` value written to
+`$GITHUB_ENV` is checked in the step that writes it, but never clears or
+weakens the value later steps inherit from workflow or job `env`: whether it
+lands as its own line depends on the shell, stream, line breaks and later
+overwrites, which the YAML does not show. Within a script, `unset` or a new
+assignment, inline or exported, never removes the value already in effect: it
+may sit in a branch that never runs, so every later command is judged on both.
+To change the inherited value for a step, set `PYTEST_ADDOPTS` in that step's
+own `env:` block.
 Only `run` steps and package scripts are commands; comments and dependencies
 are not. This checks the whole head tree so an unchanged unsafe setting remains
 visible when another file changes.

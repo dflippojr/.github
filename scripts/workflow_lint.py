@@ -257,16 +257,21 @@ def worker_finding(filename, label, token, value):
     return None
 
 
+def unreadable_addopts(filename, value):
+    return finding('error', 'parallelism-cap', filename, f'PYTEST_ADDOPTS {value!r}: cannot read the options exactly (use a literal value)')
+
+
 def addopts_findings(filename, value):
-    """Judge a literal PYTEST_ADDOPTS or addopts value, which pytest puts before the command line."""
+    """Judge a PYTEST_ADDOPTS or addopts value, which pytest puts before the command line.
+    A value the scan cannot read exactly fails: its worker count is unknown."""
     try:
         tokens = shlex.split(value)
     except ValueError:
-        return [finding('warning', 'unparsed-command', filename, 'Could not tokenize PYTEST_ADDOPTS; inspect manually')]
-    results = [item for item in (worker_finding(filename, 'PYTEST_ADDOPTS', token, count) for token, count in worker_flags('pytest', tokens)) if item]
-    if not results and re.search(r'\$[\w{(]', value):
-        results.append(finding('warning', 'dynamic-parallelism', filename, 'PYTEST_ADDOPTS: cannot resolve options statically'))
-    return results
+        return [unreadable_addopts(filename, value)]
+    if re.search(r'\$[\w{(]', value):
+        return [unreadable_addopts(filename, value)]
+    return [finding('error', 'parallelism-cap', filename, f'PYTEST_ADDOPTS {token} {count}: maximum is 4 workers (use a fixed count)')
+            for token, count in worker_flags('pytest', tokens) if not (count.isdigit() and int(count) <= 4)]
 
 
 def posix_env(command):
@@ -361,8 +366,9 @@ def env_file_findings(filename, command, bodies):
 
     Such a write never changes what later steps inherit: whether it reaches the file as its own
     line depends on the shell, the stream, line breaks and later overwrites, none of which the
-    YAML shows. Only a step-level env: block changes the value. Any literal value the write may
-    carry is still checked here."""
+    YAML shows. Only a step-level env: block changes the value. Any value the write may carry is
+    still checked here, and one with a backslash or % (printf and echo -e escapes, printf formats,
+    cmd variables) fails, because what reaches the file differs from the text."""
     pipelines = shell_pipelines(command)
     if pipelines is None:
         return []  # tokenizing failed; scan_command already warns
@@ -375,7 +381,8 @@ def env_file_findings(filename, command, bodies):
             ' '.join(plain(word) for word in words if not word.startswith('\0') and not ANY_ENV.fullmatch(word)
                      and not re.fullmatch(REDIRECT, word))])
         for match in re.finditer(r'PYTEST_ADDOPTS=([^\n]*)', text, re.I):
-            results.extend(addopts_findings(filename, match.group(1)))
+            value = match.group(1)
+            results.extend([unreadable_addopts(filename, value)] if re.search(r'[\\%]', value) else addopts_findings(filename, value))
     return results
 
 
@@ -387,19 +394,22 @@ def plain(word):
         return word
 
 
-def scan_command(filename, command, addopts=None):
+def scan_command(filename, command, inherited=()):
     """Check worker caps in one command string, judging each command on its own effective parallelism.
 
-    addopts is the PYTEST_ADDOPTS value already in effect. pytest reads it before
-    the command line, so a worker flag on pytest's own command line replaces it,
-    but only for that command: a later command that may run pytest (make, tox,
-    a script) still sees the value. An inline assignment belongs to its command;
-    `export` and bare assignments persist. Text that only mentions the name, such
-    as `echo PYTEST_ADDOPTS=`, assigns nothing. A value written to $GITHUB_ENV is
-    checked but changes nothing here or in later steps (env_file_findings).
-    Returns (findings, addopts in effect afterwards, whether the value passed in
-    was judged against a command or replaced).
+    inherited holds the PYTEST_ADDOPTS values that may already be in effect. pytest
+    reads the value before the command line, so a worker flag on pytest's own
+    command line replaces it, but only for that command: a later command that may
+    run pytest (make, tox, a script) still sees the value. Nothing in the script
+    clears or weakens a value, since an `unset` or assignment may sit in a branch
+    that never runs: each later command is judged on every value inherited or
+    assigned so far, and an inline assignment adds its value for its own command.
+    Text that only mentions the name, such as `echo PYTEST_ADDOPTS=`, assigns
+    nothing. A value written to $GITHUB_ENV is checked but changes nothing here
+    or in later steps (env_file_findings).
+    Returns (findings, whether every inherited value was judged against a command).
     """
+    inherited = [value for value in inherited if value]
     # Shell, cmd and PowerShell line continuations.
     command, bodies = split_heredocs(posix_env(re.sub(r'(?:\\|`|\^)\r?\n', ' ', command)))
     try:
@@ -408,7 +418,10 @@ def scan_command(filename, command, addopts=None):
         lexer.whitespace_split = True
         tokens = list(lexer)
     except ValueError:
-        return [finding('warning', 'unparsed-command', filename, 'Could not tokenize command; inspect manually')], addopts, True
+        results = [finding('warning', 'unparsed-command', filename, 'Could not tokenize command; inspect manually')]
+        if re.search('PYTEST_ADDOPTS', command, re.I):
+            results.append(unreadable_addopts(filename, command))
+        return results + [item for value in inherited for item in addopts_findings(filename, value)], True
     segments, current, piped = [], [], []
     for token in tokens:
         if token and all(c in ';&|\n' for c in token):
@@ -420,42 +433,34 @@ def scan_command(filename, command, addopts=None):
     segments.append(current)
     piped.append(False)
     results = env_file_findings(filename, command, bodies)
-    inherited, resolved = bool(addopts), not addopts
-    unjudged = False  # a value assigned by this script that no command has seen yet
+    values, seen = list(inherited), set()  # values never leave: a clear or unset is not credited
     for number, segment in enumerate(segments):
         heredocs = [bodies[int(token[1:])] for token in segment if token.startswith('\0')]
         segment = [token for token in segment if not token.startswith('\0')]
         inline, persist, words = command_word(segment)
-        scoped = inline is not None and not persist
-        effective = inline if scoped else addopts
+        effective = values + [inline] if inline and not persist else values
         tools = [(index, 'pytest' if is_pytest(token) else 'playwright') for index, token in enumerate(words) if is_pytest(token) or is_playwright(token)]
-        judged = False
         for position, (index, tool) in enumerate(tools):
             end = tools[position + 1][0] if position + 1 < len(tools) else len(words)
             flags = list(worker_flags(tool, words[index + 1:end]))
             results.extend(item for item in (worker_finding(filename, tool, token, value) for token, value in flags) if item)
-            if tool == 'pytest' and effective:
-                judged = True
+            if tool == 'pytest':
+                seen.update(effective)
                 if not flags:
-                    results.extend(addopts_findings(filename, effective))
+                    results.extend(item for value in effective for item in addopts_findings(filename, value))
         if not tools and words and effective and not neutral_command(words):
-            judged = True
-            results.extend(addopts_findings(filename, effective))
+            seen.update(effective)
+            results.extend(item for value in effective for item in addopts_findings(filename, value))
         # A heredoc body is input for its command, which runs it (if at all) in a child process.
         for body in heredocs:
             results.extend(scan_command(filename, body, effective)[0])
-        if judged and not scoped:
-            resolved, unjudged = resolved or inherited, False
-        # State changes take effect after the command that carries them. A bare string piped
-        # into another command (PowerShell's "PYTEST_ADDOPTS=" | Out-File) is text, not an assignment.
-        assigned = inline if persist and not piped[number] else None
-        if assigned is None and words[:1] == ['unset'] and any(token.upper() == 'PYTEST_ADDOPTS' for token in words[1:]):
-            assigned = ''
-        if assigned is not None:
-            addopts, inherited, resolved, unjudged = assigned, False, True, bool(assigned)
-    if addopts and unjudged:
-        results.extend(addopts_findings(filename, addopts))
-    return results, addopts, resolved
+        # A value assigned by `export` or a bare assignment reaches the commands after this one.
+        # A bare string piped into another command (PowerShell's "PYTEST_ADDOPTS=" | Out-File) is text.
+        if inline and persist and not piped[number]:
+            values.append(inline)
+    # A value assigned here that no command has seen may still reach a child process or later step.
+    results.extend(item for value in values[len(inherited):] if value not in seen for item in addopts_findings(filename, value))
+    return results, all(value in seen for value in inherited)
 
 
 def parallelism_findings(filename, command):
@@ -493,7 +498,7 @@ def workflow_parallelism(filename, document):
             # A command handed to an action through with: (retry, xvfb, ...) runs like a run step.
             commands = [value for value in strings(step.get('with')) if TEST_TOOL.search(value)] if opaque else []
             if isinstance(step.get('run'), str):
-                found, _, resolved = scan_command(filename, step['run'], effective)
+                found, resolved = scan_command(filename, step['run'], [effective])
                 results.extend(found)
                 if not inherits and own is not None and effective and not resolved:
                     results.extend(addopts_findings(filename, own))
@@ -503,7 +508,7 @@ def workflow_parallelism(filename, document):
                 # it inherits counts unless a with: command that names pytest overrode it.
                 covered = False
                 for command in commands:
-                    found, _, resolved = scan_command(filename, command, effective)
+                    found, resolved = scan_command(filename, command, [effective])
                     results.extend(found)
                     covered = covered or resolved
                 if effective and not covered:
