@@ -32,6 +32,9 @@ PYTEST_CONFIG = {'pytest.ini', '.pytest.ini', 'tox.ini', 'setup.cfg', 'pyproject
 ADDOPTS_TOKEN = re.compile(r'PYTEST_ADDOPTS=(.*)\Z', re.I | re.S)
 ADDOPTS_LITERAL = re.compile(r"""PYTEST_ADDOPTS["'`\]]*\s*[:=,)]\s*(["'`])((?:\\.|(?!\1).)*)\1""", re.I | re.S)
 ASSIGNMENT = re.compile(r'[A-Za-z_]\w*=')
+# Characters a shell may still expand or unescape in a value the scan has already unquoted:
+# bash $'...', $"...", $- and other parameters and backquotes; cmd %VAR%, !VAR! and ^.
+SHELL_EXPANSION = re.compile(r'[$`%!^]')
 # The environment file as one raw word, bare or double-quoted: bash's $GITHUB_ENV or
 # ${GITHUB_ENV}, PowerShell's $env:GITHUB_ENV and cmd's %GITHUB_ENV%.
 # A single-quoted '$GITHUB_ENV' is a literal path and $github_env another bash variable.
@@ -274,13 +277,21 @@ def addopts_findings(filename, value):
             for token, count in worker_flags('pytest', tokens) if not (count.isdigit() and int(count) <= 4)]
 
 
+def shell_addopts_findings(filename, value):
+    """Judge a PYTEST_ADDOPTS value that a shell assigns or writes, after the scan removed its quotes.
+    A character the shell may still expand or unescape means the scan did not read what pytest gets."""
+    return [unreadable_addopts(filename, value)] if SHELL_EXPANSION.search(value) else addopts_findings(filename, value)
+
+
 def posix_env(command):
-    """Rewrite cmd.exe and PowerShell PYTEST_ADDOPTS assignments as POSIX NAME='value'."""
+    """Rewrite cmd.exe and PowerShell PYTEST_ADDOPTS assignments as POSIX NAME='value'.
+    A PowerShell right-hand side other than one quoted string is an expression, kept as $(...) so it fails as unreadable."""
     def assignment(value):
         return "PYTEST_ADDOPTS='" + value.strip().replace("'", "'\\''") + "'"
     command = re.sub(r'(?im)^[ \t]*set[ \t]+"?PYTEST_ADDOPTS=([^\r\n"]*)"?[ \t]*\r?$', lambda m: assignment(m.group(1)), command)
-    return re.sub(r'''(?i)\$env:PYTEST_ADDOPTS[ \t]*=[ \t]*(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([^\r\n;]*))''',
-                  lambda m: assignment(next(group for group in m.groups() if group is not None)), command)
+    return re.sub(r'''(?i)\$env:PYTEST_ADDOPTS[ \t]*=[ \t]*(?:(?:"([^"\r\n]*)"|'([^'\r\n]*)')(?=[ \t]*(?:[;#\r\n]|\Z))|([^\r\n;]*))''',
+                  lambda m: assignment(m.group(1) if m.group(1) is not None else m.group(2) if m.group(2) is not None
+                                       else '$(' + m.group(3) + ')'), command)
 
 
 def command_word(segment):
@@ -367,8 +378,9 @@ def env_file_findings(filename, command, bodies):
     Such a write never changes what later steps inherit: whether it reaches the file as its own
     line depends on the shell, the stream, line breaks and later overwrites, none of which the
     YAML shows. Only a step-level env: block changes the value. Any value the write may carry is
-    still checked here, and one with a backslash or % (printf and echo -e escapes, printf formats,
-    cmd variables) fails, because what reaches the file differs from the text."""
+    still checked here, and one with a backslash (printf and echo -e escapes) or a character the
+    shell may expand (printf formats, variables, shell_addopts_findings) fails, because what
+    reaches the file differs from the text."""
     pipelines = shell_pipelines(command)
     if pipelines is None:
         return []  # tokenizing failed; scan_command already warns
@@ -382,7 +394,7 @@ def env_file_findings(filename, command, bodies):
                      and not re.fullmatch(REDIRECT, word))])
         for match in re.finditer(r'PYTEST_ADDOPTS=([^\n]*)', text, re.I):
             value = match.group(1)
-            results.extend([unreadable_addopts(filename, value)] if re.search(r'[\\%]', value) else addopts_findings(filename, value))
+            results.extend([unreadable_addopts(filename, value)] if '\\' in value else shell_addopts_findings(filename, value))
     return results
 
 
@@ -438,6 +450,9 @@ def scan_command(filename, command, inherited=()):
         heredocs = [bodies[int(token[1:])] for token in segment if token.startswith('\0')]
         segment = [token for token in segment if not token.startswith('\0')]
         inline, persist, words = command_word(segment)
+        if inline and SHELL_EXPANSION.search(inline):
+            # The shell may still change it, so no command line can be said to override it.
+            results.append(unreadable_addopts(filename, inline))
         effective = values + [inline] if inline and not persist else values
         tools = [(index, 'pytest' if is_pytest(token) else 'playwright') for index, token in enumerate(words) if is_pytest(token) or is_playwright(token)]
         for position, (index, tool) in enumerate(tools):

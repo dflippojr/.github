@@ -554,6 +554,37 @@ def test_no_shell_clear_or_weaker_value_lifts_the_inherited_pytest_addopts(name,
     assert policy_rules(files) == expected
 
 
+def shell_step(shell, run, runner='ubuntu-latest'):
+    """A job with one step in the given shell and no PYTEST_ADDOPTS in the YAML."""
+    return {WORKFLOW: (f'on: pull_request\njobs:\n  test:\n    runs-on: {runner}\n    steps:\n'
+                       f'      - shell: {shell}\n        run: {json.dumps(run)}\n')}
+
+
+@pytest.mark.parametrize('name,files,expected', [
+    # Codex round 6 at 42730fa: bash decodes $'...' to -n auto; the scan read $-n auto and found no worker flag.
+    ('ansi-c-inline-auto', shell_step('bash', "PYTEST_ADDOPTS=$'-n auto' pytest"), CAP),
+    ('ansi-c-exported-long-flag', shell_step('bash', "export PYTEST_ADDOPTS=$'--numprocesses=8'\npytest"), CAP),
+    ('ansi-c-numeric', shell_step('bash', "PYTEST_ADDOPTS=$'-n 8' pytest"), CAP),
+    ('ansi-c-ci-local', {'ci-local.sh': "PYTEST_ADDOPTS=$'-n auto' pytest\n"}, CAP),
+    ('ansi-c-written-to-github-env', env_write("echo PYTEST_ADDOPTS=$'-n 8' >> \"$GITHUB_ENV\"", job_env=()), CAP),
+    ('locale-quoted', shell_step('bash', 'PYTEST_ADDOPTS=$"-n auto" pytest'), CAP),
+    ('backquote-substitution', shell_step('bash', 'export PYTEST_ADDOPTS="`cat opts`"\npytest'), CAP),
+    # Codex round 6: cmd expands %OPTS% before pytest runs.
+    ('cmd-variable', shell_step('cmd', 'set OPTS=-n auto\nset PYTEST_ADDOPTS=%OPTS%\npytest', 'windows-latest'), CAP),
+    ('cmd-delayed-variable', shell_step('cmd', 'setlocal EnableDelayedExpansion\nset OPTS=-n auto\nset PYTEST_ADDOPTS=!OPTS!\npytest', 'windows-latest'), CAP),
+    ('cmd-caret-escaped-space', shell_step('cmd', 'set PYTEST_ADDOPTS=-n^ 8\npytest', 'windows-latest'), CAP),
+    # PowerShell evaluates an expression on the right-hand side; only a lone quoted string is read exactly.
+    ('powershell-concatenation', shell_step('pwsh', "$env:PYTEST_ADDOPTS = '-n ' + 'auto'\npytest"), CAP),
+    # Still allowed: a literal each shell passes through unchanged.
+    ('bash-single-quoted-literal', shell_step('bash', "PYTEST_ADDOPTS='-n 2' pytest"), []),
+    ('cmd-literal-with-a-path', shell_step('cmd', 'set PYTEST_ADDOPTS=-n 2 --basetemp=C:\\tmp\npytest', 'windows-latest'), []),
+    ('powershell-single-quoted-literal', shell_step('pwsh', "$env:PYTEST_ADDOPTS = '-n 2'\npytest"), []),
+    ('powershell-double-quoted-literal-then-pytest', shell_step('pwsh', '$env:PYTEST_ADDOPTS = "-n 2"; pytest'), []),
+], ids=lambda value: value if isinstance(value, str) else None)
+def test_shell_quoting_and_expansion_the_scan_cannot_decode_fail(name, files, expected):
+    assert policy_rules(files) == expected
+
+
 @pytest.mark.parametrize('command,expected', [
     ('npx playwright test -j 8', CAP), ('npx playwright test -j8', CAP), ('playwright test -j=8', CAP), ('playwright test -j 50%', CAP),
     ('playwright test -j 100%', CAP), ('playwright test -j 5', CAP), ('playwright test --workers 5 -j 2', CAP), ('playwright test -j 2 --workers 8', CAP),
