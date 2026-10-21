@@ -1,0 +1,19 @@
+# gate-guard fixture: a test_ignore added with an upper-case option name, which PlatformIO reads like the lower-case one
+# expect: skip-marker
+# hits: 1
+
+diff --git a/firmware/platformio.ini b/firmware/platformio.ini
+index 4c81e2b..9a7f0d3 100644
+--- a/firmware/platformio.ini
++++ b/firmware/platformio.ini
+@@ -1,9 +1,10 @@
+ [platformio]
+ default_envs = native
+ 
+ [env:native]
+ platform = native
+ test_framework = unity
++TEST_IGNORE = test_controls
+ build_flags = -std=gnu++17
+ lib_deps = throwtheswitch/Unity@^2.6.0
+ 

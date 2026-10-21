@@ -301,6 +301,157 @@ class RuleDetails(unittest.TestCase):
 """
         self.assertEqual(analyze_text(diff), [])
 
+    def test_platformio_empty_override_stops_the_lookup(self):
+        [hit] = self.hits("flag-skip-platformio-ignore-empty-override")
+        self.assertEqual(hit.detail, "PlatformIO env:native now inherits test_ignore: test_controls")
+        diff = self.platformio_diff(""" [filtered]
+ test_ignore = test_controls
+ [unfiltered]
+ test_ignore =
+ [env:a]
+-extends = filtered, unfiltered
++extends = unfiltered, filtered
+""")
+        [hit] = analyze_text(diff)
+        self.assertEqual(hit.detail, "PlatformIO env:a now inherits test_ignore: test_controls")
+
+    def test_platformio_empty_filter_override_stops_the_lookup(self):
+        diff = self.platformio_diff(""" [narrow]
+ test_filter = test_logic
+ [all]
+ test_filter =
+ [env:a]
+-extends = narrow, all
++extends = all, narrow
+""")
+        [hit] = analyze_text(diff)
+        self.assertEqual(hit.detail, "PlatformIO env:a now inherits a test_filter: runs only test_logic")
+
+    def test_platformio_removed_empty_override_exposes_a_default_through_levels(self):
+        for option, detail in [("test_ignore", "PlatformIO env:a now inherits test_ignore: test_controls"),
+                               ("test_filter", "PlatformIO env:a now inherits a test_filter: runs only test_controls")]:
+            with self.subTest(option=option, where="parent"):
+                diff = self.platformio_diff(f""" [env]
+ {option} = test_controls
+ [base]
+-{option} =
++platform = native
+ [mid]
+ extends = base
+ [env:a]
+ extends = mid
+""")
+                self.assertEqual([h.detail for h in analyze_text(diff)], [detail])
+            with self.subTest(option=option, where="env"):
+                diff = self.platformio_diff(f""" [env]
+ {option} = test_controls
+ [env:a]
+ platform = native
+-{option} =
+""")
+                self.assertEqual([h.detail for h in analyze_text(diff)], [detail])
+
+    def test_platformio_empty_override_unchanged_is_not_a_hit(self):
+        diff = self.platformio_diff(""" [env]
+ test_ignore = test_controls
+ [env:a]
+ test_ignore =
+-platform = native
++platform = native2
+""")
+        self.assertEqual(analyze_text(diff), [])
+
+    def test_platformio_interpolated_values_are_resolved(self):
+        [hit] = self.hits("flag-skip-platformio-filter-interpolated")
+        self.assertEqual(hit.detail, "PlatformIO test_filter entry removed: test_controls")
+        [hit] = self.hits("flag-skip-platformio-ignore-interpolated")
+        self.assertEqual(hit.detail, "PlatformIO env:native now inherits test_ignore: test_controls")
+        self.assertEqual(self.hits("pass-platformio-filter-interpolated-widened"), [])
+
+    def test_platformio_this_reference_follows_the_env(self):
+        diff = self.platformio_diff(""" [base]
+ suites = test_logic test_controls
+ test_filter = ${this.suites}
+ [env:a]
+ extends = base
++suites = test_logic
+""")
+        [hit] = analyze_text(diff)
+        self.assertEqual(hit.detail, "PlatformIO test_filter entry removed: test_controls")
+
+    def test_platformio_interpolation_through_an_env_and_extends(self):
+        diff = self.platformio_diff(""" [narrow]
+ suites = test_logic
+ [wide]
+ suites = test_logic test_controls
+ [env:shared]
+-extends = wide
++extends = narrow
+ [env:a]
+ test_ignore = test_soak
+ test_filter = ${env:shared.suites}
+""")
+        [hit] = analyze_text(diff)
+        self.assertEqual(hit.detail, "PlatformIO test_filter entry removed: test_controls")
+
+    def test_platformio_unresolved_reference_is_flagged_when_a_dependency_changes(self):
+        for option in ("test_filter", "test_ignore"):
+            with self.subTest(option=option):
+                diff = self.platformio_diff(f""" [common]
+-extra = test_logic
++extra = test_io
+ [env:a]
+ {option} = ${{common.extra}} ${{elsewhere.suites}}
+""")
+                [hit] = analyze_text(diff)
+                self.assertEqual(hit.detail, f"PlatformIO env:a {option} uses a value the guard cannot resolve: "
+                                             "${elsewhere.suites}")
+                unchanged = self.platformio_diff(f""" [env:a]
+-platform = native
++platform = native2
+ {option} = ${{common.extra}} ${{elsewhere.suites}}
+""")
+                self.assertEqual(analyze_text(unchanged), [])
+
+    def test_platformio_option_names_ignore_case(self):
+        [hit] = self.hits("flag-skip-platformio-uppercase")
+        self.assertEqual(hit.detail, "PlatformIO test_ignore: TEST_IGNORE = test_controls")
+        diff = self.platformio_diff(""" [env:a]
+ platform = native
++Test_Filter = test_logic
+""")
+        [hit] = analyze_text(diff)
+        self.assertEqual(hit.detail, "PlatformIO test_filter added to env:a: runs only test_logic")
+        diff = self.platformio_diff(""" [unfiltered]
+ platform = native
+ [filtered]
+ Test_Ignore = test_controls
+ [env:a]
+-EXTENDS = unfiltered
++EXTENDS = filtered
+""")
+        [hit] = analyze_text(diff)
+        self.assertEqual(hit.detail, "PlatformIO env:a now inherits test_ignore: test_controls")
+        diff = self.platformio_diff(""" [env:a]
+ TEST_IGNORE =
+     test_slow
++    test_controls
+""")
+        [hit] = analyze_text(diff)
+        self.assertEqual(hit.detail, "PlatformIO test_ignore: test_controls")
+
+    def test_platformio_section_names_keep_their_case(self):
+        diff = self.platformio_diff(""" [base]
+ platform = native
+ [Base]
+ test_ignore = test_controls
+ [env:a]
+-extends = base
++extends = Base
+""")
+        [hit] = analyze_text(diff)
+        self.assertEqual(hit.detail, "PlatformIO env:a now inherits test_ignore: test_controls")
+
     def test_unity_registration_removal_survives_a_definition_edit(self):
         [hit] = self.hits("flag-fewer-tests-cpp-reformatted")
         self.assertEqual(hit.detail, "1 fewer test in this file; removed test_button_press")

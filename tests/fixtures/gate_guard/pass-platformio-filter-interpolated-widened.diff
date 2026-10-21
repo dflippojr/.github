@@ -1,0 +1,23 @@
+# gate-guard fixture: the option a test_filter references gains an entry, so the env runs more tests
+# expect: 
+# hits: 0
+
+diff --git a/firmware/platformio.ini b/firmware/platformio.ini
+index 7d2a4e9..2c5e8a0 100644
+--- a/firmware/platformio.ini
++++ b/firmware/platformio.ini
+@@ -1,14 +1,14 @@
+ [platformio]
+ default_envs = native
+ 
+ [selection]
+-suites = test_logic
++suites = test_logic, test_controls
+ 
+ [env:native]
+ platform = native
+ test_framework = unity
+ test_filter = ${selection.suites}
+ build_flags = -std=gnu++17
+ lib_deps = throwtheswitch/Unity@^2.6.0
+ 
