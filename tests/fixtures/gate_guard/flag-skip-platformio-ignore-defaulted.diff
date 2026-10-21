@@ -1,0 +1,17 @@
+# gate-guard fixture: test_ignore references build_dir, which the file leaves to PlatformIO's default, and the default's input workspace_dir changes
+# expect: skip-marker
+# hits: 1
+
+diff --git a/firmware/platformio.ini b/firmware/platformio.ini
+index 6e0f3a1..a2c95d8 100644
+--- a/firmware/platformio.ini
++++ b/firmware/platformio.ini
+@@ -1,7 +1,7 @@
+ [platformio]
+-workspace_dir = /tmp/other
++workspace_dir = /tmp/logic
+ 
+ [env:native]
+ platform = native
+ test_framework = unity
+ test_ignore = *${platformio.build_dir}/test_controls

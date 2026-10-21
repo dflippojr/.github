@@ -1,0 +1,31 @@
+# gate-guard fixture: a Unity RUN_TEST registration written across three lines is deleted while its definition and another test stay
+# expect: removed-tests
+# hits: 1
+
+diff --git a/firmware/test/test_controls/test_main.cpp b/firmware/test/test_controls/test_main.cpp
+index 7d2e4b0..a82cabd 100644
+--- a/firmware/test/test_controls/test_main.cpp
++++ b/firmware/test/test_controls/test_main.cpp
+@@ -1,22 +1,19 @@
+ #include <unity.h>
+ #include "controls.h"
+ 
+ void setUp(void) {}
+ void tearDown(void) {}
+ 
+ void test_button_press(void) {
+     TEST_ASSERT_EQUAL(1, button_state(1));
+ }
+ 
+ void test_button_release(void) {
+     TEST_ASSERT_EQUAL(0, button_state(0));
+ }
+ 
+ int main(int argc, char **argv) {
+     UNITY_BEGIN();
+-    RUN_TEST(
+-        test_button_press
+-    );
+     RUN_TEST(test_button_release);
+     return UNITY_END();
+ }

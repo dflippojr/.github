@@ -1,0 +1,21 @@
+# gate-guard fixture: [platformio] inherits extra_configs through extends, so a change to an option the included file may read is flagged
+# expect: skip-marker
+# hits: 1
+
+diff --git a/firmware/platformio.ini b/firmware/platformio.ini
+index 3b91c2e..d40a7f5 100644
+--- a/firmware/platformio.ini
++++ b/firmware/platformio.ini
+@@ -1,11 +1,11 @@
+ [platformio]
+ extends = includes
+ 
+ [includes]
+ extra_configs = test.ini
+ 
+ [selection]
+-suites = test_logic, test_controls
++suites = test_logic
+ 
+ [env:native]
+ platform = native

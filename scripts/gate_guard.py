@@ -34,6 +34,7 @@ one notice annotation states the verdict for pr_body_lint.py.
 """
 import argparse
 import base64
+import bisect
 import collections
 import configparser
 import datetime
@@ -74,6 +75,9 @@ class FileDiff:
         self.new_path = new_path
         self.status = "modified"
         self.lines = []
+        # (old start, new start) of each hunk, and whether git called the file binary.
+        self.hunks = []
+        self.binary = False
 
     @property
     def path(self):
@@ -181,10 +185,13 @@ def parse_diff(text):
             cur.new_path = _strip_prefix(line[4:], "b/")
             if cur.new_path is None:
                 cur.status = "deleted"
+        elif line.startswith(("Binary files ", "GIT binary patch")):
+            cur.binary = True
         else:
             m = HUNK_RE.match(line)
             if m:
                 old_no, new_no = int(m.group(1)), int(m.group(3))
+                cur.hunks.append((old_no, new_no))
                 old_left = int(m.group(2)) if m.group(2) is not None else 1
                 new_left = int(m.group(4)) if m.group(4) is not None else 1
     for fd in files:
@@ -318,8 +325,26 @@ JVM_NAME = re.compile(r"\b(?:void|fun)\s+(`[^`]+`|\w+)\s*\(")
 RS_MARK = re.compile(r"^\s*#\[(?:[\w:]+::)?test\b")
 RS_NAME = re.compile(r"\bfn\s+(\w+)")
 # Unity registers a test with RUN_TEST(name) and defines it as void test_name(void).
-UNITY_RUN = re.compile(r"^\s*RUN_TEST\s*\(\s*(\w+)")
-UNITY_DEF = re.compile(r"^\s*(?:static\s+)?(?:inline\s+)?void\s+(test_\w*)\s*\(\s*(?:void)?\s*\)(?!\s*;)")
+# Both are read from the whole file, once comments and literals are blanked, so
+# a call may span lines and a line may hold several.
+UNITY_RUN = re.compile(r"\bRUN_TEST\s*\(\s*(\w+)")
+UNITY_RUN_TOKEN = re.compile(r"\bRUN_TEST\b")
+UNITY_DEF = re.compile(r"\bvoid\s+(test_\w*)\s*\(\s*(?:void\s*)?\)(?!\s*;)")
+# Registrations the guard does not count: Unity's fixture and parameter
+# macros, and GoogleTest, doctest and Catch2 tests.
+UNITY_OTHER = re.compile(
+    r"\b(RUN_TEST_CASE|RUN_TEST_GROUP|RUN_PARAM_TEST|TEST_GROUP_RUNNER|UnityDefaultTestRun|IGNORE_TEST|TEST|TEST_F"
+    r"|TEST_P|TYPED_TEST|TYPED_TEST_P|TEST_CASE|TEST_CASE_METHOD|TEST_RANGE|TEST_MATRIX|SCENARIO|SUBCASE|SECTION)\b"
+    r"\s*(\((?:[^()]|\([^()]*\))*\))?")
+# A comment, or a raw, string or character literal. A quote after a word
+# character is a digit separator, not a literal.
+C_LEXEME = re.compile(
+    r"//[^\n]*|/\*.*?(?:\*/|\Z)"
+    r"|(?<!\w)(?:u8|[uUL])?R\"([^()\\\s]{0,16})\(.*?(?:\)\1\"|\Z)"
+    r"|(?:(?<!\w)(?:u8|[uUL]))?\"(?:\\.|[^\"\\\n])*\"?"
+    r"|(?<!\w)(?:u8|[uUL])?'(?:\\.|[^'\\\n])*'", re.S)
+C_DIRECTIVE = re.compile(r"^[ \t]*#[ \t]*([A-Za-z_]\w*)(.*)$")
+UnityScan = collections.namedtuple("UnityScan", "items defines includes others")
 
 
 def _line_defs(fd, regex, group):
@@ -331,19 +356,110 @@ def _line_defs(fd, regex, group):
     return removed, added
 
 
+def _c_code(text):
+    """(text without comments, text without comments or literals), lines spliced as the C preprocessor splices them."""
+    text = text.replace("\\\n", "")
+    code, blank = [], []
+    pos = 0
+    for m in C_LEXEME.finditer(text):
+        lines = "\n" * m.group(0).count("\n")
+        comment = m.group(0).startswith(("//", "/*"))
+        code += [text[pos:m.start()], " " + lines if comment else m.group(0)]
+        blank += [text[pos:m.start()], " " + lines if comment else '""' + lines]
+        pos = m.end()
+    return "".join(code + [text[pos:]]), "".join(blank + [text[pos:]])
+
+
+def _unity_scan(text):
+    """One side of a Unity test file, read whole.
+
+    items are (name, line, kind, branch) for each RUN_TEST registration ("run")
+    and test definition ("def"); branch is the #if branches around it, so a
+    test that moves into another branch, or whose branch changes, is not the
+    same test. defines and includes are those directive lines, and others the
+    registrations the guard does not count, a RUN_TEST it cannot read among them.
+    """
+    code, blank = _c_code(text)
+    branches, stack = [], []
+    defines, includes = [], []
+    for line in code.split("\n"):
+        m = C_DIRECTIVE.match(line)
+        if m:
+            name, directive = m.group(1), " ".join(("#" + m.group(1) + m.group(2)).split())
+            if name in ("if", "ifdef", "ifndef"):
+                stack.append((directive,))
+            elif name in ("elif", "elifdef", "elifndef", "else") and stack:
+                stack[-1] = (stack[-1][0], directive)
+            elif name == "endif" and stack:
+                stack.pop()
+            elif name in ("define", "undef"):
+                defines.append(directive)
+            elif name in ("include", "include_next", "import"):
+                includes.append(directive)
+        branches.append(tuple(stack))
+    starts = [0] + [i + 1 for i, c in enumerate(blank) if c == "\n"]
+    items = []
+    for kind, regex in (("run", UNITY_RUN), ("def", UNITY_DEF)):
+        for m in regex.finditer(blank):
+            line = bisect.bisect_right(starts, m.start())
+            items.append((m.group(1), line, kind, branches[line - 1]))
+    others = [(m.group(1), " ".join((m.group(2) or "").split()) or None) for m in UNITY_OTHER.finditer(code)]
+    others += [("RUN_TEST", None)] * (len(UNITY_RUN_TOKEN.findall(blank)) - len(UNITY_RUN.findall(blank)))
+    return UnityScan(sorted(items, key=lambda d: d[1]), defines, includes, others)
+
+
+def _whole_sides(fd):
+    """(old text, new text) of fd, or None when the diff does not show the whole file.
+
+    git_diff asks for full context, so a changed file is one hunk from line 1.
+    A file with no hunk is empty, or renamed or re-moded without a change.
+    """
+    if fd.binary or len(fd.hunks) > 1 or any(start > 1 for hunk in fd.hunks for start in hunk):
+        return None
+    return _side_text(fd, "-"), _side_text(fd, "+")
+
+
 def _unity_defs(fd):
-    """Unity registrations and definitions on changed lines: (name, line, kind), kept apart.
+    """Unity registrations and definitions one side of the whole file has more of than the other.
 
     The kind keeps an edit to a definition from cancelling the removal of its
     registration; removed_test_hits counts a test's two kinds once, by name.
     """
-    removed, added = [], []
-    for l in fd.changed():
-        for kind, regex in (("run", UNITY_RUN), ("def", UNITY_DEF)):
-            m = regex.match(l.text)
-            if m:
-                (removed if l.kind == "-" else added).append((m.group(1), l.old or l.new, kind))
-    return removed, added
+    sides = _whole_sides(fd)
+    if sides is None:
+        return [], []
+    old, new = (_unity_scan(text).items for text in sides)
+    return _cancel_pairs(old, new, key=_def_key)
+
+
+def _unity_problem(fd):
+    """Why the guard cannot count a changed Unity test file's tests, or None.
+
+    It fails closed on what it does not model: a file the diff does not show
+    whole, a macro that uses RUN_TEST, a changed #define or #undef, a removed
+    #include, and a removed registration it does not count.
+    """
+    if fd.status == "deleted":
+        # Already a hit as a deleted test file.
+        return None
+    sides = _whole_sides(fd)
+    if sides is None:
+        return "is not shown whole in the diff, so the guard cannot count its tests"
+    if sides[0] == sides[1]:
+        return None
+    old, new = (_unity_scan(text) for text in sides)
+    if any(UNITY_RUN_TOKEN.search(d) for d in old.defines + new.defines):
+        return "defines or undefines a macro that uses RUN_TEST, which the guard does not expand"
+    if fd.status == "added":
+        return None
+    if collections.Counter(old.defines) != collections.Counter(new.defines):
+        return "changes a #define or #undef, which the guard does not expand"
+    if collections.Counter(old.includes) - collections.Counter(new.includes):
+        return "removes an #include, which may hold tests the guard does not read"
+    lost = collections.Counter(old.others) - collections.Counter(new.others)
+    if lost:
+        return f"loses a test registration the guard does not count: {', '.join(sorted({n for n, _ in lost}))}"
+    return None
 
 
 def _marker_defs(fd, marker, name_re):
@@ -393,11 +509,14 @@ def test_defs(fd):
 
 def _names(defs, limit=5):
     names = [d[0] if d[0] is not None else f"test at line {d[1]}" for d in defs]
+    # A Unity item inside #if branches says which.
+    names = [n + (f" (under {'; '.join(', '.join(b) for b in d[3])})" if len(d) > 3 and d[3] else "")
+             for n, d in zip(names, defs)]
     return ", ".join(names[:limit]) + (f" and {len(names) - limit} more" if len(names) > limit else "")
 
 
 def _def_key(d):
-    """Identity of a definition: its name, and for Unity whether it is a registration or a definition."""
+    """Identity of a definition: its name, and for Unity whether it is a registration or a definition, and its #if branch."""
     return (d[0], *d[2:])
 
 
@@ -406,21 +525,27 @@ def _by_name(defs):
     seen = set()
     out = []
     for d in defs:
-        if len(d) == 3:
-            if d[0] in seen:
+        if len(d) > 2:
+            if (d[0], d[3]) in seen:
                 continue
-            seen.add(d[0])
+            seen.add((d[0], d[3]))
         out.append(d)
     return out
 
 
 def _decrease(removed, added):
     """How many fewer tests a file has. Unity registrations and definitions are
-    counted apart, so a new test that is never registered does not offset a
-    registration that was removed, and a test removed whole counts once."""
-    if not any(len(d) == 3 for d in removed + added):
+    counted apart, and each #if branch apart, so a new test that is never
+    registered, or one in another branch, does not offset a registration that
+    was removed, and a test removed whole counts once."""
+    if not any(len(d) > 2 for d in removed + added):
         return len(removed) - len(added)
-    return max(sum(d[2] == kind for d in removed) - sum(d[2] == kind for d in added) for kind in ("run", "def"))
+
+    def fewer(kind):
+        lost = collections.Counter(d[3] for d in removed if d[2] == kind)
+        lost.subtract(d[3] for d in added if d[2] == kind)
+        return sum(n for n in lost.values() if n > 0)
+    return max(fewer("run"), fewer("def"))
 
 
 def removed_test_hits(files):
@@ -463,6 +588,9 @@ def removed_test_hits(files):
             if added:
                 detail += f"; added {_names(added)}"
             hits.append(Hit("removed-tests", fd.path, None, detail))
+        problem = _ext(fd.path) in C_EXTS and any(is_test_module(p) for p in fd.paths) and _unity_problem(fd)
+        if problem:
+            hits.append(Hit("removed-tests", fd.path, None, f"Unity test file {problem}"))
     return hits
 
 
@@ -634,6 +762,10 @@ class PioUnresolved(Exception):
 
 PIO_WALK_LIMIT = 1000
 PIO_LIST_OPTIONS = ("test_filter", "test_ignore", "extends")
+# Traced for a reference to an option the file does not set, or one PlatformIO
+# would stop on: PlatformIO raises, or fills in a default that may read any
+# other option (build_dir's reads workspace_dir), so equal traces prove nothing.
+PIO_DEFAULTED = "defaulted"
 
 
 def _env_scope(section):
@@ -719,8 +851,10 @@ class PioConfig:
         """An option's value: a list for an env's test_filter, test_ignore or extends, else a string.
 
         trace collects ((section, option), (where found, value as written)) for
-        the option and each value it references, or None for a reference that
-        cannot be resolved, so the two sides can be compared.
+        the option and each value it references, None for a reference to a
+        value from outside the file or to a typed option, or PIO_DEFAULTED for
+        a reference to an option the file does not set, so the two sides can be
+        compared.
         """
         if (section, option) in stack:
             raise PioUnresolved(f"${{{section}.{option}}}")
@@ -753,10 +887,15 @@ class PioConfig:
                 if option == "__env__" and section.startswith("env:"):
                     return section[4:]
                 ref_section = section
+            mark = len(trace)
             try:
                 value = self.get(ref_section, option, trace, stack)
             except PioUnresolved:
-                trace.append(((ref_section, option), None))
+                trace.append(((ref_section, option), PIO_DEFAULTED))
+                return m.group(0)
+            if trace[mark][1] == (None, None):
+                # An env's test_filter, test_ignore or extends that nothing sets.
+                trace.append(((ref_section, option), PIO_DEFAULTED))
                 return m.group(0)
             if _typed_option(ref_section, option):
                 trace.append(((ref_section, option), None))
@@ -775,7 +914,7 @@ class PioConfig:
         try:
             value = self.get(section, option, trace)
         except (PioUnresolved, configparser.Error):
-            return [], trace + [((section, option), None)]
+            return [], trace + [((section, option), PIO_DEFAULTED)]
         return (value if isinstance(value, list) else _pio_values(value)), trace
 
     def snapshot(self):
@@ -786,11 +925,17 @@ def _words(entries):
     return [w for e in entries for w in _option_entries(e)]
 
 
-def _unresolved(old_trace, new_trace):
-    """The references either side cannot resolve, when a value they depend on changed."""
-    if old_trace == new_trace:
+def _unresolved(old_trace, new_trace, changed):
+    """The references either side cannot resolve, when a value they depend on may have changed.
+
+    Equal traces show that what an unresolved value reads in the file did not
+    change, except for an option the file does not set, whose default may
+    read any option: then any change to the file (changed) counts.
+    """
+    both = old_trace + new_trace
+    if old_trace == new_trace and not (changed and any(found == PIO_DEFAULTED for _, found in both)):
         return []
-    refs = [f"${{{s}.{o}}}" if s else f"${{{o}}}" for (s, o), found in old_trace + new_trace if found is None]
+    refs = [f"${{{s}.{o}}}" if s else f"${{{o}}}" for (s, o), found in both if found in (None, PIO_DEFAULTED)]
     return list(dict.fromkeys(refs))
 
 
@@ -856,8 +1001,11 @@ def _pio_file_details(fd, flagged):
             return [f"PlatformIO {fd.path} cannot be read: {_snippet(error)}"]
         return []
     details = []
+    # PlatformIO reads [platformio]'s extra_configs through its extends, and
+    # [DEFAULT] reaches it, so extra_configs set in any section counts.
     if main and old.snapshot() != new.snapshot() and any(
-            c.has_section("platformio") and c.parser.has_option("platformio", "extra_configs") for c in (old, new)):
+            "extra_configs" in c.parser.defaults() or any(c.parser.has_option(s, "extra_configs") for s in c.sections())
+            for c in (old, new)):
         details.append(f"PlatformIO {fd.path} loads extra_configs the guard cannot read, "
                        "so it cannot tell what this change runs")
     reported = _flagged_entries(fd, flagged.get(fd.path, ()), new)
@@ -890,7 +1038,7 @@ def _pio_like(*configs):
 def _option_details(name, option, old, new, reported):
     """What a section's effective test_filter or test_ignore change takes away."""
     (before, old_trace), (after, new_trace) = old.test_option(name, option), new.test_option(name, option)
-    unresolved = _unresolved(old_trace, new_trace)
+    unresolved = _unresolved(old_trace, new_trace, old.snapshot() != new.snapshot())
     if unresolved:
         return [f"PlatformIO {name} {option} uses a value the guard cannot resolve: {', '.join(unresolved[:5])}"]
     if option == "test_filter" and not name.startswith("env:"):
@@ -925,10 +1073,11 @@ def _inherited_hits(files, flagged):
     (`flagged`: {path: [Line]}). Where the guard cannot see what an env reads,
     it flags the change: a reference it cannot resolve (an environment or
     built-in variable, or an option PlatformIO types) once anything the value
-    depends on changed, a changed extends that names a section the file lacks,
-    a file it cannot parse, any change to a platformio.ini that loads
-    extra_configs, and any change to another ini file that reads as
-    PlatformIO's, which may be one of those.
+    depends on changed, a reference to an option the file does not set once
+    anything in the file changed, a changed extends that names a section the
+    file lacks, a file it cannot parse, any change to a platformio.ini that
+    sets extra_configs in any section, and any change to another ini file
+    that reads as PlatformIO's, which may be one of those.
     """
     hits = []
     for fd in files:

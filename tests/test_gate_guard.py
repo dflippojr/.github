@@ -413,12 +413,14 @@ class RuleDetails(unittest.TestCase):
                 [hit] = analyze_text(diff)
                 self.assertEqual(hit.detail, f"PlatformIO env:a {option} uses a value the guard cannot resolve: "
                                              "${elsewhere.suites}")
+                # A missing section is an absent option, which fails closed on any change to the file.
                 unchanged = self.platformio_diff(f""" [env:a]
 -platform = native
 +platform = native2
  {option} = ${{common.extra}} ${{elsewhere.suites}}
 """)
-                self.assertEqual(analyze_text(unchanged), [])
+                [hit] = analyze_text(unchanged)
+                self.assertIn("${elsewhere.suites}", hit.detail)
 
     def test_platformio_option_names_ignore_case(self):
         [hit] = self.hits("flag-skip-platformio-uppercase")
@@ -527,6 +529,46 @@ class RuleDetails(unittest.TestCase):
                                      "so it cannot tell what this change runs")
         [hit] = self.hits("flag-skip-platformio-extra-config-env")
         self.assertEqual(hit.detail, "PlatformIO test_filter added to env:native: runs only test_logic")
+
+    def test_platformio_extra_configs_in_any_section_fail_closed(self):
+        detail = ("PlatformIO firmware/platformio.ini loads extra_configs the guard cannot read, "
+                  "so it cannot tell what this change runs")
+        [hit] = self.hits("flag-skip-platformio-extra-configs-inherited")
+        self.assertEqual(hit.detail, detail)
+        # [DEFAULT] reaches [platformio], and a section [platformio] may extend sets it too.
+        for section in ("DEFAULT", "includes"):
+            with self.subTest(section=section):
+                diff = self.platformio_diff(f""" [{section}]
+ extra_configs = test.ini
+ [selection]
+-suites = test_logic, test_controls
++suites = test_logic
+ [env:native]
+ platform = native
+""")
+                [hit] = analyze_text(diff)
+                self.assertEqual(hit.detail, detail.replace("firmware/", ""))
+
+    def test_platformio_reference_to_a_defaulted_option_fails_closed(self):
+        [hit] = self.hits("flag-skip-platformio-ignore-defaulted")
+        self.assertEqual(hit.detail, "PlatformIO env:native test_ignore uses a value the guard cannot resolve: "
+                                     "${platformio.build_dir}")
+        # An option the file does not set, typed or not, may take its value from any option in the file.
+        for reference in ("${env:native.test_framework}", "${common.suites}", "${env:native.test_filter}"):
+            with self.subTest(reference=reference):
+                diff = self.platformio_diff(f""" [common]
+-extra = test_logic
++extra = test_io
+ [env:native]
+ test_ignore = {reference}
+""")
+                [hit] = analyze_text(diff)
+                self.assertIn(reference.replace("${", "").replace("}", ""), hit.detail)
+        # With the file unchanged elsewhere, a test_ignore that is itself unchanged is not judged again.
+        self.assertEqual(analyze_text(self.platformio_diff(""" [env:native]
+ test_ignore = *${platformio.build_dir}/test_controls
++; a comment
+""")), [])
 
     def test_platformio_file_the_guard_cannot_parse_is_flagged(self):
         diff = self.platformio_diff(""" [env:a]
@@ -639,6 +681,166 @@ class RuleDetails(unittest.TestCase):
         [hit] = self.hits("flag-fewer-tests-cpp-unregistered")
         self.assertEqual(hit.detail, "1 fewer test in this file; removed test_button_press; "
                                      "added test_button_release")
+
+    def test_unity_registrations_are_read_across_lines_and_comments(self):
+        [hit] = self.hits("flag-fewer-tests-cpp-multiline")
+        self.assertEqual(hit.detail, "1 fewer test in this file; removed test_button_press")
+        main = "test/test_a/test_main.cpp"
+        for body in (""" void test_a(void) {}
+ void test_b(void) {}
+ int main() {
+-  RUN_TEST(test_a); RUN_TEST(test_b);
++  RUN_TEST(test_a);
+ }
+""", """ void test_a(void) {}
+ void test_b(void) {}
+ int main() {
+   RUN_TEST(test_a);
++  /*
+   RUN_TEST(test_b);
++  */
+ }
+""", """ void test_a(void) {}
+ void test_b(void) {}
+ int main() {
+   RUN_TEST(test_a);
+-  RUN_TEST(test_b);
++  puts("RUN_TEST(test_b);");
+ }
+""", """ void test_a(void) {}
+ void test_b(void) {}
+ int main() {
+   RUN_TEST(test_a);
+-  RUN_TEST(test_b);
++  // RUN_TEST(test_b);
+ }
+""", """ void test_a(void) {}
+ void test_b(void) {}
+ int main() {
+   RUN_TEST(test_a);
+-  RUN_TE\\
+-ST(test_b);
+ }
+"""):
+            with self.subTest(body=body):
+                [hit] = analyze_text(self.platformio_diff(body, main))
+                self.assertEqual(hit.detail, "1 fewer test in this file; removed test_b")
+        # A registration reflowed across lines, or a definition split from its name, is the same test.
+        self.assertEqual(analyze_text(self.platformio_diff(""" void test_a(void) {}
+-void test_b(void) {}
++void
++test_b(void) {}
+ int main() {
+-  RUN_TEST(test_a); RUN_TEST(test_b);
++  RUN_TEST(test_a);
++  RUN_TEST(
++      test_b);
+ }
+""", main)), [])
+
+    def test_unity_file_the_diff_does_not_show_whole_fails_closed(self):
+        diff = """diff --git a/test/test_a/test_main.cpp b/test/test_a/test_main.cpp
+--- a/test/test_a/test_main.cpp
++++ b/test/test_a/test_main.cpp
+@@ -10,2 +10,2 @@
+-  RUN_TEST(test_a);
++  RUN_TEST(test_a );
+   RUN_TEST(test_b);
+"""
+        [hit] = analyze_text(diff)
+        self.assertEqual(hit.detail, "Unity test file is not shown whole in the diff, so the guard cannot count its tests")
+
+    def test_unity_preprocessor_and_other_frameworks_fail_closed(self):
+        main = "test/test_a/test_main.cpp"
+        unmodelled = {
+            "a #define or #undef changes": """ void test_a(void) {}
++#define RUN_TEST(name)
+ int main() {
+   RUN_TEST(test_a);
+ }
+""",
+            "a macro that calls RUN_TEST": """ #define RUN(name) RUN_TEST(name)
+ void test_a(void) {}
+ void test_b(void) {}
+ int main() {
+   RUN(test_a);
+-  RUN(test_b);
+ }
+""",
+            "an #include is removed": """-#include "more_tests.inc"
+ void test_a(void) {}
+ int main() {
+   RUN_TEST(test_a);
+ }
+""",
+            "a GoogleTest test is removed": """ #include <gtest/gtest.h>
+ TEST(Controls, Press) {}
+-TEST(Controls, Release) {}
+""",
+            "a RUN_TEST the guard cannot read is removed": """ void test_a(void) {}
+ int main() {
+-  RUN_TEST((test_a));
+ }
+""",
+        }
+        for name, body in unmodelled.items():
+            with self.subTest(name):
+                hits = analyze_text(self.platformio_diff(body, main))
+                self.assertTrue(any(h.rule == "removed-tests" and h.detail.startswith("Unity test file ")
+                                    for h in hits), hits)
+        # A registration that moves into an #if branch, or whose branch changes, no longer counts as the same one.
+        for body, detail in ((""" void test_a(void) {}
+ int main() {
++#if 0
+   RUN_TEST(test_a);
++#endif
+ }
+""", "removed test_a; added test_a (under #if 0)"), (""" void test_a(void) {}
+ int main() {
+-#ifdef ARDUINO
++#ifdef NEVER_DEFINED
+   RUN_TEST(test_a);
+ #endif
+ }
+""", "removed test_a (under #ifdef ARDUINO); added test_a (under #ifdef NEVER_DEFINED)")):
+            with self.subTest(body=body):
+                [hit] = analyze_text(self.platformio_diff(body, main))
+                self.assertEqual(hit.detail, "1 fewer test in this file; " + detail)
+        # New tests in a new #ifdef block, and an added #include, take nothing away.
+        self.assertEqual(analyze_text(self.platformio_diff(""" #include <unity.h>
++#include "extra.h"
+ void test_a(void) {}
++#ifdef ARDUINO
++void test_b(void) {}
++#endif
+ int main() {
+   RUN_TEST(test_a);
++#ifdef ARDUINO
++  RUN_TEST(test_b);
++#endif
+ }
+""", main)), [])
+
+    def test_unity_move_into_a_branch_of_another_file_is_a_removal(self):
+        diff = self.platformio_diff(""" void test_a(void) {}
+-void test_b(void) {}
+ int main() {
+   RUN_TEST(test_a);
+-  RUN_TEST(test_b);
+ }
+""", "test/test_a/test_main.cpp") + self.platformio_diff(""" void test_c(void) {}
++#if 0
++void test_b(void) {}
++#endif
+ int main() {
+   RUN_TEST(test_c);
++#if 0
++  RUN_TEST(test_b);
++#endif
+ }
+""", "test/test_c/test_main.cpp")
+        [hit] = analyze_text(diff)
+        self.assertEqual(hit.path, "test/test_a/test_main.cpp")
 
     def test_environment_guard_skip_is_not_a_hit(self):
         details = " ".join(h.detail for h in self.hits("flag-skip-python"))
