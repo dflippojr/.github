@@ -1,0 +1,12 @@
+# gate-guard fixture: an ini file that an unchanged platformio.ini loads through extra_configs gives every env a test_filter in [env]
+# expect: skip-marker
+# hits: 1
+
+diff --git a/firmware/test.ini b/firmware/test.ini
+index 7d3a9e0..2b8f6c1 100644
+--- a/firmware/test.ini
++++ b/firmware/test.ini
+@@ -1,2 +1,3 @@
+ [env]
+ test_framework = unity
++test_filter = test_logic

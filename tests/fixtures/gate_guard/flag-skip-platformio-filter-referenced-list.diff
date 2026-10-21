@@ -1,0 +1,18 @@
+# gate-guard fixture: a test_filter references lib_ignore, which PlatformIO reads as a list and joins with newlines, so an added entry merges into the last one
+# expect: skip-marker
+# hits: 1
+
+diff --git a/firmware/platformio.ini b/firmware/platformio.ini
+index 5c1e8a3..9f2d4b7 100644
+--- a/firmware/platformio.ini
++++ b/firmware/platformio.ini
+@@ -1,8 +1,8 @@
+ [platformio]
+ default_envs = native
+ 
+ [env:native]
+ platform = native
+ test_framework = unity
+ lib_ignore = test_logic, test_controls
+-test_filter = ${this.lib_ignore}
++test_filter = ${this.lib_ignore}, test_soak

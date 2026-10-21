@@ -402,7 +402,7 @@ def _def_key(d):
 
 
 def _by_name(defs):
-    """Unity items counted once per name, a test's registration and definition together."""
+    """Unity items named once, a test's registration and definition together."""
     seen = set()
     out = []
     for d in defs:
@@ -412,6 +412,15 @@ def _by_name(defs):
             seen.add(d[0])
         out.append(d)
     return out
+
+
+def _decrease(removed, added):
+    """How many fewer tests a file has. Unity registrations and definitions are
+    counted apart, so a new test that is never registered does not offset a
+    registration that was removed, and a test removed whole counts once."""
+    if not any(len(d) == 3 for d in removed + added):
+        return len(removed) - len(added)
+    return max(sum(d[2] == kind for d in removed) - sum(d[2] == kind for d in added) for kind in ("run", "def"))
 
 
 def removed_test_hits(files):
@@ -441,8 +450,8 @@ def removed_test_hits(files):
 
     hits = []
     for fd in files:
+        decrease = _decrease(*left[id(fd)])
         removed, added = map(_by_name, left[id(fd)])
-        decrease = len(removed) - len(added)
         plural = "s" if decrease != 1 else ""
         if fd.status == "deleted" and (decrease > 0 or (not test_defs(fd)[0] and is_test_module(fd.path))):
             detail = "test file deleted"
@@ -473,8 +482,34 @@ def _js_tests(path):
 # case, as ConfigParser lowers them; section names keep theirs.
 PIO_IGNORE_KEY = re.compile(r"^\s*test_ignore\s*[=:]", re.I)
 # ${section.option}; ${this.option} is the section being read, and a reference
-# with no section or to sysenv comes from outside the file.
-PIO_REFERENCE = re.compile(r"\$\{(?:([^.}()]+)\.)?([^}]+)\}")
+# with no section or to sysenv comes from outside the file. PlatformIO's VARTPL_RE, as written.
+PIO_REFERENCE = re.compile(r"\$\{(?:([^\.\}\()]+)\.)?([^\}]+)\}")
+# Built-in variables PlatformIO fills from the machine; any other ${NAME} is an
+# SCons variable it leaves as written.
+PIO_BUILTIN_VARS = ("PROJECT_DIR", "PROJECT_HASH", "UNIX_TIME")
+# The options PlatformIO 6.2.0 defines (platformio/project/options.py), with
+# their old names. PlatformIO reads these with a type, a default or an
+# environment variable, which the guard models only for test_filter,
+# test_ignore and extends; a reference to any other one is unresolved.
+PIO_TYPED_OPTIONS = {
+    "platformio": frozenset(
+        "boards_dir build_cache_dir build_dir cache_dir core_dir data_dir default_envs description env_default"
+        " extra_configs globallib_dir home_dir include_dir lib_dir libdeps_dir monitor_dir name packages_dir"
+        " platforms_dir shared_dir src_dir test_dir workspace_dir".split()),
+    "env": frozenset(
+        "board board_build.f_cpu board_build.f_flash board_build.flash_mode board_build.mcu board_f_cpu"
+        " board_f_flash board_flash_mode board_mcu build_flags build_src_filter build_src_flags build_type"
+        " build_unflags check_flags check_patterns check_severity check_skip_packages check_src_filters"
+        " check_tool debug_build_flags debug_extra_cmds debug_init_break debug_init_cmds debug_load_cmd"
+        " debug_load_cmds debug_load_mode debug_port debug_server debug_server_ready_pattern debug_speed"
+        " debug_svd_path debug_test debug_tool extra_script extra_scripts framework lib_archive"
+        " lib_compat_mode lib_deps lib_extra_dirs lib_force lib_ignore lib_install lib_ldf_mode lib_use"
+        " monitor_baud monitor_dtr monitor_echo monitor_encoding monitor_eol monitor_filters monitor_parity"
+        " monitor_port monitor_raw monitor_rts monitor_speed platform platform_packages src_build_flags"
+        " src_filter targets test_build_project_src test_build_src test_framework test_port test_speed"
+        " test_testing_command upload_command upload_flags upload_port upload_protocol upload_resetmethod"
+        " upload_speed".split()),
+}
 PIO_LABEL = "PlatformIO test_ignore"
 
 SKIP_RULES = [
@@ -605,6 +640,18 @@ def _env_scope(section):
     return section.split(":", 1)[0] == "env"
 
 
+def _typed_option(section, option):
+    """Whether PlatformIO reads this option with metadata the guard does not model.
+
+    PlatformIO matches metadata by the option name as written in the
+    reference, so ${env:a.LIB_IGNORE} is a plain string to it, as here.
+    """
+    scope = section.split(":", 1)[0]
+    if scope == "env" and option in PIO_LIST_OPTIONS:
+        return False
+    return option in PIO_TYPED_OPTIONS.get(scope, ())
+
+
 class PioConfig:
     """One side of a PlatformIO ini file, read the way platformio.project.config.ProjectConfig reads it.
 
@@ -688,11 +735,19 @@ class PioConfig:
         return value
 
     def expand(self, section, text, trace, stack=()):
-        """text with each ${section.option} the file defines replaced by its value, recursively."""
+        """text with each ${section.option} the file defines replaced by its value, recursively.
+
+        A value from outside the file (a built-in or environment variable) or
+        from an option PlatformIO types is left as written and traced as
+        unresolved, after tracing what it reads in the file.
+        """
         def reference(m):
             ref_section, option = m.group(1), m.group(2)
+            if ref_section is None and option not in PIO_BUILTIN_VARS:
+                # An SCons variable, which PlatformIO leaves as written.
+                return m.group(0)
             if ref_section is None or ref_section == "sysenv":
-                # A built-in, SCons or environment variable, which comes from outside the file.
+                trace.append(((ref_section, option), None))
                 return m.group(0)
             if ref_section == "this":
                 if option == "__env__" and section.startswith("env:"):
@@ -703,7 +758,13 @@ class PioConfig:
             except PioUnresolved:
                 trace.append(((ref_section, option), None))
                 return m.group(0)
+            if _typed_option(ref_section, option):
+                trace.append(((ref_section, option), None))
+                return m.group(0)
             return "\n".join(value) if isinstance(value, list) else str(value)
+        if "$PROJECT_HASH" in text:
+            # PlatformIO's legacy spelling of ${PROJECT_HASH}.
+            trace.append(((None, "PROJECT_HASH"), None))
         if "${" not in text or "}" not in text:
             return text
         return PIO_REFERENCE.sub(reference, text)
@@ -729,7 +790,7 @@ def _unresolved(old_trace, new_trace):
     """The references either side cannot resolve, when a value they depend on changed."""
     if old_trace == new_trace:
         return []
-    refs = [f"${{{s}.{o}}}" for (s, o), found in old_trace + new_trace if found is None]
+    refs = [f"${{{s}.{o}}}" if s else f"${{{o}}}" for (s, o), found in old_trace + new_trace if found is None]
     return list(dict.fromkeys(refs))
 
 
@@ -811,7 +872,19 @@ def _pio_file_details(fd, flagged):
     for section in old.sections():
         if new.has_section(section) and old.has(section, "test_filter") and new.has(section, "test_filter"):
             details += _option_details(section, "test_filter", old, new, reported)
+    # Another ini file reaches envs the diff does not show: its [env] and
+    # [DEFAULT] are their defaults, and any of its values may be referenced.
+    if not main and not details and old.snapshot() != new.snapshot() and _pio_like(old, new):
+        details.append(f"PlatformIO {fd.path} may be loaded through extra_configs by a platformio.ini the diff "
+                       "does not show, so the guard cannot tell what this change runs")
     return details
+
+
+def _pio_like(*configs):
+    """Whether an ini file reads as PlatformIO's: an env or platformio section, or a test_filter or test_ignore."""
+    return any(_env_scope(s) or s == "platformio" or any(c.parser.has_option(s, o) for o in ("test_filter", "test_ignore"))
+               for c in configs for s in c.sections()) or any(
+        o in c.parser.defaults() for c in configs for o in ("test_filter", "test_ignore"))
 
 
 def _option_details(name, option, old, new, reported):
@@ -850,10 +923,12 @@ def _inherited_hits(files, flagged):
     is an exclusion list, so each entry an env's effective test_ignore gained
     is a hit, unless an added test_ignore line in the file already reports it
     (`flagged`: {path: [Line]}). Where the guard cannot see what an env reads,
-    it flags the change: a reference it cannot resolve once anything the value
+    it flags the change: a reference it cannot resolve (an environment or
+    built-in variable, or an option PlatformIO types) once anything the value
     depends on changed, a changed extends that names a section the file lacks,
     a file it cannot parse, any change to a platformio.ini that loads
-    extra_configs, and a new env in another ini file, which may be one of those.
+    extra_configs, and any change to another ini file that reads as
+    PlatformIO's, which may be one of those.
     """
     hits = []
     for fd in files:

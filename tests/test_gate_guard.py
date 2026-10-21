@@ -142,11 +142,11 @@ class RuleDetails(unittest.TestCase):
     def test_platformio_filter_key_removed_runs_everything(self):
         self.assertEqual(self.hits("pass-platformio-filter-removed"), [])
 
-    def platformio_diff(self, body):
+    def platformio_diff(self, body, path="platformio.ini"):
         lines = body.strip("\n").split("\n")
         old = sum(1 for l in lines if l[0] in " -")
         new = sum(1 for l in lines if l[0] in " +")
-        header = "diff --git a/platformio.ini b/platformio.ini\n--- a/platformio.ini\n+++ b/platformio.ini\n"
+        header = f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
         return header + f"@@ -1,{old} +1,{new} @@\n" + "\n".join(lines) + "\n"
 
     def test_platformio_filter_added_to_a_default_reaches_each_env_without_one(self):
@@ -536,9 +536,109 @@ class RuleDetails(unittest.TestCase):
         [hit] = analyze_text(diff)
         self.assertTrue(hit.detail.startswith("PlatformIO platformio.ini cannot be read: "), hit.detail)
 
+    def test_platformio_included_file_change_fails_closed(self):
+        loaded = ("PlatformIO test.ini may be loaded through extra_configs by a platformio.ini the diff does not "
+                  "show, so the guard cannot tell what this change runs")
+        [hit] = self.hits("flag-skip-platformio-extra-config-default")
+        self.assertEqual(hit.detail, loaded.replace("test.ini", "firmware/test.ini"))
+        for body in (""" [DEFAULT]
++test_filter = test_logic
+ [env]
+ test_framework = unity
+""", """ [env]
+ test_framework = unity
++test_ignore = test_controls
+""", """ [env:native]
+-test_filter =
+ platform = native
+""", """ [env:native]
+-extends = unfiltered
++extends = filtered
+""", """ [suites]
+-list = test_logic, test_controls
++list = test_logic
+ [env]
+ test_framework = unity
+"""):
+            with self.subTest(body=body):
+                # An added test_ignore line is also reported on its own.
+                self.assertIn(loaded, [h.detail for h in analyze_text(self.platformio_diff(body, "test.ini"))])
+        # An env the included file adds or changes is still named where the guard can tell.
+        [hit] = self.hits("flag-skip-platformio-extra-config-env")
+        self.assertEqual(hit.detail, "PlatformIO test_filter added to env:native: runs only test_logic")
+        # Comments, and ini files of other tools, are not PlatformIO changes.
+        self.assertEqual(analyze_text(self.platformio_diff(""" [env]
++; a comment
+ test_framework = unity
+""", "test.ini")), [])
+        self.assertEqual(analyze_text(self.platformio_diff(""" [tox]
+-envlist = py311, py312
++envlist = py312
+""", "tox.ini")), [])
+
+    def test_platformio_reference_to_a_typed_option_fails_closed(self):
+        [hit] = self.hits("flag-skip-platformio-filter-referenced-list")
+        self.assertEqual(hit.detail, "PlatformIO env:native test_filter uses a value the guard cannot resolve: "
+                                     "${env:native.lib_ignore}")
+        # A typed option PlatformIO renamed is read under its old name too.
+        diff = self.platformio_diff(""" [env:native]
+ src_filter = +<*>
+-test_filter = ${this.src_filter}
++test_filter = ${this.src_filter}, test_soak
+""")
+        [hit] = analyze_text(diff)
+        self.assertEqual(hit.detail, "PlatformIO env:native test_filter uses a value the guard cannot resolve: "
+                                     "${env:native.src_filter}")
+        # An option PlatformIO does not define, or one in a custom section, is a plain string it reads as written.
+        diff = self.platformio_diff(""" [common]
+ lib_ignore = test_logic, test_controls
+ [env:native]
+ custom_suites = test_logic, test_controls
+-test_filter = ${common.lib_ignore}, ${this.custom_suites}
++test_filter = ${common.lib_ignore}, ${this.custom_suites}, test_soak
+""")
+        self.assertEqual(analyze_text(diff), [])
+
+    def test_platformio_external_values_fail_closed(self):
+        [hit] = self.hits("flag-skip-platformio-filter-sysenv")
+        self.assertEqual(hit.detail, "PlatformIO env:native test_filter uses a value the guard cannot resolve: "
+                                     "${sysenv.TEST_SUITES}")
+        for value in ("${PROJECT_DIR}", "${UNIX_TIME}", "${PROJECT_HASH}", "$PROJECT_HASH"):
+            with self.subTest(value=value):
+                diff = self.platformio_diff(f""" [env:native]
+-test_filter = {value}
++test_filter = {value}, test_soak
+""")
+                [hit] = analyze_text(diff)
+                self.assertTrue(hit.detail.startswith("PlatformIO env:native test_filter uses a value the guard "
+                                                      "cannot resolve: "), hit.detail)
+        # An unchanged filter that reads the environment is not a hit.
+        self.assertEqual(analyze_text(self.platformio_diff(""" [env:native]
+-platform = native
++platform = native2
+ test_filter = ${sysenv.TEST_SUITES}
+""")), [])
+
+    def test_platformio_reference_grammar_matches_platformio(self):
+        # PlatformIO's VARTPL_RE keeps "(" and ")" out of a section name, so it leaves
+        # ${selection).suites} as written, as an SCons variable, and never reads suites.
+        diff = self.platformio_diff(""" [selection)]
+-suites = test_logic, test_controls
++suites = test_logic
+ [env:native]
+ test_filter = ${selection).suites}
+""")
+        self.assertEqual(analyze_text(diff), [])
+        self.assertEqual(gate_guard.PIO_REFERENCE.pattern, r"\$\{(?:([^\.\}\()]+)\.)?([^\}]+)\}")
+
     def test_unity_registration_removal_survives_a_definition_edit(self):
         [hit] = self.hits("flag-fewer-tests-cpp-reformatted")
         self.assertEqual(hit.detail, "1 fewer test in this file; removed test_button_press")
+
+    def test_unity_unregistered_definition_does_not_offset_a_removed_registration(self):
+        [hit] = self.hits("flag-fewer-tests-cpp-unregistered")
+        self.assertEqual(hit.detail, "1 fewer test in this file; removed test_button_press; "
+                                     "added test_button_release")
 
     def test_environment_guard_skip_is_not_a_hit(self):
         details = " ".join(h.detail for h in self.hits("flag-skip-python"))
