@@ -226,6 +226,66 @@ class RuleDetails(unittest.TestCase):
         [hit] = analyze_text(diff)
         self.assertEqual(hit.detail, "PlatformIO env:a extends a section the diff does not show: missing")
 
+    def test_platformio_later_parent_wins_a_conflicting_filter(self):
+        [hit] = self.hits("flag-skip-platformio-filter-extends-order")
+        self.assertEqual(hit.detail, "PlatformIO test_filter entry removed: test_controls")
+        diff = self.platformio_diff(""" [wide]
+ test_filter = test_logic test_controls
+ [narrow]
+ test_filter = test_logic
+ [env:a]
+-extends = wide, narrow
++extends = narrow, wide
+""")
+        self.assertEqual(analyze_text(diff), [])
+
+    def test_platformio_ignore_gained_through_extends_is_a_hit(self):
+        [hit] = self.hits("flag-skip-platformio-ignore-extends")
+        self.assertEqual(hit.detail, "PlatformIO env:native now inherits test_ignore: test_controls")
+
+    def test_platformio_removed_override_exposes_an_inherited_ignore(self):
+        diff = self.platformio_diff(""" [base]
+ test_ignore = test_controls
+ [env:a]
+ extends = base
+-test_ignore = test_slow
+""")
+        [hit] = analyze_text(diff)
+        self.assertEqual(hit.detail, "PlatformIO env:a now inherits test_ignore: test_controls")
+
+    def test_platformio_added_ignore_is_reported_once_for_its_children(self):
+        diff = self.platformio_diff(""" [env:a]
+ platform = native
++test_ignore = test_controls
+ [env:b]
+ extends = env:a
+""")
+        [hit] = analyze_text(diff)
+        self.assertEqual(hit.detail, "PlatformIO test_ignore: test_ignore = test_controls")
+
+    def test_platformio_ignore_moved_to_a_parent_is_not_a_hit(self):
+        diff = self.platformio_diff(""" [base]
+ platform = native
++test_ignore = test_controls
+ [env:a]
+ extends = base
+-test_ignore = test_controls
+""")
+        self.assertEqual(analyze_text(diff), [])
+
+    def test_platformio_ignore_moved_to_a_parent_still_reaches_new_children(self):
+        diff = self.platformio_diff(""" [base]
+ platform = native
++test_ignore = test_controls
+ [env:a]
+ extends = base
+-test_ignore = test_controls
+ [env:b]
+ extends = base
+""")
+        [hit] = analyze_text(diff)
+        self.assertEqual(hit.detail, "PlatformIO env:b now inherits test_ignore: test_controls")
+
     def test_platformio_filter_continuation_stays_with_its_option(self):
         diff = """diff --git a/platformio.ini b/platformio.ini
 --- a/platformio.ini

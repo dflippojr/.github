@@ -1,0 +1,29 @@
+# gate-guard fixture: an env swaps the order of two parents with different test_filters; the later parent wins, so it runs fewer tests
+# expect: skip-marker
+# hits: 1
+
+diff --git a/firmware/platformio.ini b/firmware/platformio.ini
+index 7c1e2a4..b9d03f5 100644
+--- a/firmware/platformio.ini
++++ b/firmware/platformio.ini
+@@ -1,19 +1,19 @@
+ [platformio]
+ default_envs = native
+ 
+ [env]
+ framework = arduino
+ lib_deps = throwtheswitch/Unity@^2.6.0
+ 
+ [wide]
+ test_filter = test_logic, test_controls
+ 
+ [narrow]
+ test_filter = test_logic
+ 
+ [env:native]
+ platform = native
+ test_framework = unity
+-extends = narrow, wide
++extends = wide, narrow
+ build_flags = -std=gnu++17
+ 

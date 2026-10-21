@@ -470,8 +470,7 @@ def _js_tests(path):
 # test_ignore lists tests that do not run, so adding to it is a skip. test_filter
 # lists the only tests that run, so removing from it is.
 PIO_IGNORE_KEY = re.compile(r"^\s*test_ignore\s*[=:]")
-PIO_FILTER_KEY = re.compile(r"^\s*test_filter\s*[=:]")
-PIO_EXTENDS_KEY = re.compile(r"^\s*extends\s*[=:]")
+PIO_OPTION_KEY = re.compile(r"^\s*(test_filter|test_ignore|extends)\s*[=:]")
 PIO_LABEL = "PlatformIO test_ignore"
 
 SKIP_RULES = [
@@ -558,13 +557,13 @@ def _ini_value_lines(files):
     return out
 
 
-def _filter_entries(value):
-    """The entries of a test_filter value; PlatformIO separates them by commas or whitespace."""
+def _option_entries(value):
+    """The entries of a test_filter, test_ignore or extends value; PlatformIO separates them by commas or whitespace."""
     return [e for e in re.split(r"[,\s]+", re.sub(r"\s[#;].*$", "", value.strip())) if e]
 
 
 def _ini_options(fd):
-    """Each side's test_filter and extends options, by section: {side: {section: {option: [entries]}}}.
+    """Each side's test_filter, test_ignore and extends options, by section: {side: {section: {option: [entries]}}}.
 
     The diff carries the whole file (git_diff asks for full context), so both
     sides can be rebuilt from it. A continuation line stays with its option.
@@ -574,6 +573,7 @@ def _ini_options(fd):
     key = {"-": None, "+": None}
     for l in fd.lines:
         m = SECTION_RE.match(l.text)
+        option = PIO_OPTION_KEY.match(l.text)
         stripped = l.text.strip()
         for side in ("-", "+"):
             if l.kind not in (" ", side):
@@ -584,45 +584,51 @@ def _ini_options(fd):
                 sides[side].setdefault(section[side], {})
             elif not stripped or stripped.startswith(("#", ";")):
                 continue
-            elif PIO_FILTER_KEY.match(l.text) or PIO_EXTENDS_KEY.match(l.text):
-                option = "test_filter" if PIO_FILTER_KEY.match(l.text) else "extends"
-                key[side] = sides[side].setdefault(section[side], {}).setdefault(option, [])
-                key[side] += _filter_entries(re.split(r"[=:]", l.text, 1)[1])
+            elif option:
+                key[side] = sides[side].setdefault(section[side], {}).setdefault(option.group(1), [])
+                key[side] += _option_entries(l.text[option.end():])
             elif not l.text[:1].isspace():
                 key[side] = None
             elif key[side] is not None:
-                key[side] += _filter_entries(l.text)
+                key[side] += _option_entries(l.text)
     return sides
 
 
-def _effective_filter(sections, name, seen=()):
-    """The test_filter entries a section runs with: its own, else those of the sections it extends."""
+def _effective(sections, name, option, seen=()):
+    """A section's entries for an option: its own, else the first found among the
+    sections it extends, the last listed first, which is how PlatformIO resolves them."""
     options = sections.get(name, {})
-    if "test_filter" in options:
-        return options["test_filter"] or None
-    found = []
-    for parent in options.get("extends", []):
+    if option in options:
+        return options[option] or None
+    for parent in reversed(options.get("extends", [])):
         if parent.lower() not in seen + (name,):
-            found += _effective_filter(sections, parent.lower(), seen + (name,)) or []
-    return list(dict.fromkeys(found)) or None
+            found = _effective(sections, parent.lower(), option, seen + (name,))
+            if found:
+                return found
+    return None
 
 
-def _env_filter(sections, name):
-    """An env's effective filter; [env] and then [platformio] supply defaults to an env with none."""
-    return _effective_filter(sections, name) or _effective_filter(sections, "env")         or _effective_filter(sections, "platformio")
+def _env_value(sections, name, option):
+    """An env's effective option; [env] and then [platformio] supply defaults to an env with none."""
+    return (_effective(sections, name, option) or _effective(sections, "env", option)
+            or _effective(sections, "platformio", option))
 
 
-def _filter_hits(files):
-    """Where a PlatformIO test_filter narrows: a filter is an inclusion list, so fewer entries run fewer tests.
+def _inherited_hits(files, flagged):
+    """Where an existing PlatformIO env runs fewer tests through its effective test_filter or test_ignore.
 
-    Hit when an env that ran every test now runs a subset, whether the key was
-    added to it, to [env] or [platformio], or to a section it extends, or the
-    env now extends a section that has one; and for each entry an env's
-    effective filter lost. A reformatted or widened filter, a whole key
-    dropped, and a new env are not hits. An env's filter comes from its own key,
-    else the union of the sections it extends, else [env], then [platformio]. If
-    a changed `extends` names a section the diff does not show while the file
-    has a test_filter, the guard cannot see what the env inherits and flags it.
+    A filter is an inclusion list, so fewer entries run fewer tests. Hit when an
+    env that ran every test now runs a subset, whether the key was added to it,
+    to [env] or [platformio], or to a section it extends, or the env now extends
+    a section that has one; and for each entry an env's effective filter lost.
+    A reformatted or widened filter, a whole key dropped, and a new env are not
+    hits. An ignore is an exclusion list, so each entry an env's effective
+    test_ignore gained is a hit, unless an added test_ignore line in the file
+    already reports it (`flagged`: {path: entries}). An env's value comes from
+    its own key, else from the sections it extends with the last listed
+    winning, else [env], then [platformio]. If a changed `extends` names a
+    section the diff does not show while the file has either key, the guard
+    cannot see what the env inherits and flags it.
     """
     hits = []
     for fd in files:
@@ -634,16 +640,22 @@ def _filter_hits(files):
         for name in new:
             if not name.startswith("env:") or name not in old:
                 continue
-            before, after = _env_filter(old, name), _env_filter(new, name)
+            before, after = _env_value(old, name, "test_filter"), _env_value(new, name, "test_filter")
             if before and after:
                 details += [f"PlatformIO test_filter entry removed: {e}" for e in before if e not in after]
             elif after:
                 runs = f"runs only {', '.join(after[:5])}"
                 details.append(f"PlatformIO test_filter added to {name}: {runs}" if "test_filter" in new[name]
                                else f"PlatformIO {name} now inherits a test_filter: {runs}")
+            ignored = _env_value(old, name, "test_ignore") or []
+            gained = [e for e in _env_value(new, name, "test_ignore") or []
+                      if e not in ignored and e not in flagged.get(fd.path, ())]
+            if gained:
+                details.append(f"PlatformIO {name} now inherits test_ignore: {', '.join(gained[:5])}")
             parents = new[name].get("extends", [])
             unseen = [p for p in parents if p.lower() not in new]
-            if unseen and parents != old[name].get("extends", []) and any("test_filter" in o for o in new.values()):
+            if unseen and parents != old[name].get("extends", []) and any(
+                    "test_filter" in o or "test_ignore" in o for o in new.values()):
                 details.append(f"PlatformIO {name} extends a section the diff does not show: {', '.join(unseen)}")
         # A section that lost an entry is also reported where it is edited, even if no env uses it.
         for section, options in old.items():
@@ -664,7 +676,14 @@ def _new_lines(files, rules, imperative_rules=(), extra=()):
 
 def skip_hits(files):
     _, added = _new_lines(files, SKIP_RULES, IMPERATIVE_SKIP_RULES, _ini_value_lines(files))
-    return [Hit("skip-marker", path, l.new, f"{label}: {_snippet(l.text)}") for label, path, l in added]         + _filter_hits(files)
+    # The test_ignore entries an added line already reports, so inheriting them is not reported again.
+    flagged = {}
+    for label, path, l in added:
+        if label == PIO_LABEL:
+            key = PIO_IGNORE_KEY.match(l.text)
+            flagged.setdefault(path, set()).update(_option_entries(l.text[key.end():] if key else l.text))
+    return ([Hit("skip-marker", path, l.new, f"{label}: {_snippet(l.text)}") for label, path, l in added]
+            + _inherited_hits(files, flagged))
 
 
 # -------------------------------------------------------------------- retries
