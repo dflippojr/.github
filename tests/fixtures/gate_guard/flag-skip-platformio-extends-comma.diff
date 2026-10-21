@@ -1,0 +1,23 @@
+# gate-guard fixture: an env's extends gains the space after its comma, so PlatformIO now finds the narrow parent instead of a section named 'base,narrow'
+# expect: skip-marker
+# hits: 1
+
+diff --git a/firmware/platformio.ini b/firmware/platformio.ini
+index 0b6c3e8..a2f9d57 100644
+--- a/firmware/platformio.ini
++++ b/firmware/platformio.ini
+@@ -1,13 +1,13 @@
+ [platformio]
+ default_envs = native
+ 
+ [base]
+ platform = native
+ 
+ [narrow]
+ test_filter = test_logic
+ 
+ [env:native]
+-extends = base,narrow
++extends = base, narrow
+ test_framework = unity
+ build_flags = -std=gnu++17

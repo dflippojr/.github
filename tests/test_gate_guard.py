@@ -150,9 +150,7 @@ class RuleDetails(unittest.TestCase):
         return header + f"@@ -1,{old} +1,{new} @@\n" + "\n".join(lines) + "\n"
 
     def test_platformio_filter_added_to_a_default_reaches_each_env_without_one(self):
-        for section in ("env", "platformio"):
-            with self.subTest(section=section):
-                diff = self.platformio_diff(f""" [{section}]
+        diff = self.platformio_diff(""" [env]
 +test_filter = test_logic
  [env:a]
  platform = native
@@ -160,8 +158,17 @@ class RuleDetails(unittest.TestCase):
  platform = native
  test_filter = test_logic test_io
 """)
-                details = [h.detail for h in analyze_text(diff)]
-                self.assertEqual(details, ["PlatformIO env:a now inherits a test_filter: runs only test_logic"])
+        details = [h.detail for h in analyze_text(diff)]
+        self.assertEqual(details, ["PlatformIO env:a now inherits a test_filter: runs only test_logic"])
+
+    def test_platformio_filter_in_the_platformio_section_is_not_read_by_envs(self):
+        # PlatformIO's envs fall back to [env] only; test_filter is not a [platformio] option.
+        diff = self.platformio_diff(""" [platformio]
++test_filter = test_logic
+ [env:a]
+ platform = native
+""")
+        self.assertEqual(analyze_text(diff), [])
 
     def test_platformio_filter_added_to_an_extended_section_reaches_its_children(self):
         diff = self.platformio_diff(""" [base]
@@ -230,7 +237,7 @@ class RuleDetails(unittest.TestCase):
         [hit] = self.hits("flag-skip-platformio-filter-extends-order")
         self.assertEqual(hit.detail, "PlatformIO test_filter entry removed: test_controls")
         diff = self.platformio_diff(""" [wide]
- test_filter = test_logic test_controls
+ test_filter = test_logic, test_controls
  [narrow]
  test_filter = test_logic
  [env:a]
@@ -451,6 +458,83 @@ class RuleDetails(unittest.TestCase):
 """)
         [hit] = analyze_text(diff)
         self.assertEqual(hit.detail, "PlatformIO env:a now inherits test_ignore: test_controls")
+
+    def test_platformio_reference_follows_a_custom_section_extends(self):
+        [hit] = self.hits("flag-skip-platformio-filter-interpolated-inherited")
+        self.assertEqual(hit.detail, "PlatformIO test_filter entry removed: test_controls")
+        [hit] = self.hits("flag-skip-platformio-ignore-interpolated-inherited")
+        self.assertEqual(hit.detail, "PlatformIO env:native now inherits test_ignore: test_controls")
+        diff = self.platformio_diff(""" [wide]
+ suites = test_logic, test_controls
+ [narrow]
+ suites = test_logic
+ [selection]
+-extends = wide
++extends = narrow
+ [env:a]
+ test_filter = ${selection.suites}
+""")
+        [hit] = analyze_text(diff)
+        self.assertEqual(hit.detail, "PlatformIO test_filter entry removed: test_controls")
+        diff = self.platformio_diff(""" [few]
+ skipped = test_soak
+ [more]
+ skipped = test_soak, test_controls
+ [selection]
+-extends = few
++extends = more
+ [env:a]
+ test_ignore = ${selection.skipped}
+""")
+        [hit] = analyze_text(diff)
+        self.assertEqual(hit.detail, "PlatformIO env:a now inherits test_ignore: test_controls")
+
+    def test_platformio_cleared_filter_runs_every_test(self):
+        self.assertEqual(self.hits("pass-platformio-filter-cleared"), [])
+        self.assertEqual(self.hits("pass-platformio-filter-interpolated-cleared"), [])
+        diff = self.platformio_diff(""" [common]
+-test_filter = test_logic
++test_filter =
+ [env:a]
+ extends = common
+""")
+        self.assertEqual(analyze_text(diff), [])
+
+    def test_platformio_reads_configparser_defaults_and_percent_references(self):
+        [hit] = self.hits("flag-skip-platformio-filter-default-section")
+        self.assertEqual(hit.detail, "PlatformIO env:native now inherits a test_filter: runs only test_logic")
+        [hit] = self.hits("flag-skip-platformio-filter-percent")
+        self.assertEqual(hit.detail, "PlatformIO test_filter entry removed: test_controls")
+
+    def test_platformio_entries_split_as_platformio_splits_them(self):
+        [hit] = self.hits("flag-skip-platformio-filter-comma")
+        self.assertEqual(hit.detail, "PlatformIO test_filter, split on newlines or ', ' as PlatformIO splits it, "
+                                     "lost: test_logic, test_controls")
+        [hit] = self.hits("flag-skip-platformio-extends-comma")
+        self.assertEqual(hit.detail, "PlatformIO env:native now inherits a test_filter: runs only test_logic")
+        diff = self.platformio_diff(""" [s]
+-skipped = test_soak test_controls
++skipped = test_soak, test_controls
+ [env:a]
+ test_ignore = ${s.skipped}
+""")
+        [hit] = analyze_text(diff)
+        self.assertEqual(hit.detail, "PlatformIO env:a now inherits test_ignore: test_soak, test_controls")
+
+    def test_platformio_extra_configs_are_flagged_conservatively(self):
+        [hit] = self.hits("flag-skip-platformio-extra-configs")
+        self.assertEqual(hit.detail, "PlatformIO firmware/platformio.ini loads extra_configs the guard cannot read, "
+                                     "so it cannot tell what this change runs")
+        [hit] = self.hits("flag-skip-platformio-extra-config-env")
+        self.assertEqual(hit.detail, "PlatformIO test_filter added to env:native: runs only test_logic")
+
+    def test_platformio_file_the_guard_cannot_parse_is_flagged(self):
+        diff = self.platformio_diff(""" [env:a]
+ test_filter = test_logic, test_controls
++test_filter = test_logic
+""")
+        [hit] = analyze_text(diff)
+        self.assertTrue(hit.detail.startswith("PlatformIO platformio.ini cannot be read: "), hit.detail)
 
     def test_unity_registration_removal_survives_a_definition_edit(self):
         [hit] = self.hits("flag-fewer-tests-cpp-reformatted")

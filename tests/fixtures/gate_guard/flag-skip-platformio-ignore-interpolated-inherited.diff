@@ -1,0 +1,24 @@
+# gate-guard fixture: a test_ignore references a custom section's option inherited from its parent, and the parent gains an entry
+# expect: skip-marker
+# hits: 1
+
+diff --git a/firmware/platformio.ini b/firmware/platformio.ini
+index 6b2c9d1..0f7e3a5 100644
+--- a/firmware/platformio.ini
++++ b/firmware/platformio.ini
+@@ -1,14 +1,14 @@
+ [platformio]
+ default_envs = native
+ 
+ [base]
+-skipped = test_soak
++skipped = test_soak, test_controls
+ 
+ [selection]
+ extends = base
+ 
+ [env:native]
+ platform = native
+ test_framework = unity
+ test_ignore = ${selection.skipped}
+ build_flags = -std=gnu++17

@@ -1,0 +1,19 @@
+# gate-guard fixture: a test_filter takes its entries from a %(option)s ConfigParser reference in its section, which loses one
+# expect: skip-marker
+# hits: 1
+
+diff --git a/firmware/platformio.ini b/firmware/platformio.ini
+index c3d7e1a..18f6b04 100644
+--- a/firmware/platformio.ini
++++ b/firmware/platformio.ini
+@@ -1,9 +1,9 @@
+ [platformio]
+ default_envs = native
+ 
+ [env:native]
+ platform = native
+ test_framework = unity
+-suites = test_logic, test_controls
++suites = test_logic
+ test_filter = %(suites)s
+ build_flags = -std=gnu++17

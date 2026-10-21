@@ -1,0 +1,12 @@
+# gate-guard fixture: an ini file other than platformio.ini, such as one loaded through extra_configs, gives an env a test_filter
+# expect: skip-marker
+# hits: 1
+
+diff --git a/firmware/test.ini b/firmware/test.ini
+new file mode 100644
+index 0000000..4b8e2d1
+--- /dev/null
++++ b/firmware/test.ini
+@@ -0,0 +1,2 @@
++[env:native]
++test_filter = test_logic

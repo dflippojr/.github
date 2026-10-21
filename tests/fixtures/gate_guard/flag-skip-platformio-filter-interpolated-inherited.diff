@@ -1,0 +1,24 @@
+# gate-guard fixture: a test_filter references a custom section's option that it inherits through extends, and the parent loses an entry
+# expect: skip-marker
+# hits: 1
+
+diff --git a/firmware/platformio.ini b/firmware/platformio.ini
+index 3e1f0a2..8c4d7b9 100644
+--- a/firmware/platformio.ini
++++ b/firmware/platformio.ini
+@@ -1,14 +1,14 @@
+ [platformio]
+ default_envs = native
+ 
+ [base]
+-suites = test_logic, test_controls
++suites = test_logic
+ 
+ [selection]
+ extends = base
+ 
+ [env:native]
+ platform = native
+ test_framework = unity
+ test_filter = ${selection.suites}
+ build_flags = -std=gnu++17
