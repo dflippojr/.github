@@ -590,7 +590,7 @@ class TargetFailures(unittest.TestCase):
         fake = self.github()
         fake.get.return_value = {"merge_base_commit": {"sha": "e" * 40}}
         fake.pages.side_effect = gate_guard.urllib.error.URLError("rate limited")
-        with mock.patch.object(gate_guard, "fetch_diff", return_value=""):
+        with mock.patch.object(gate_guard, "fetch_diff", return_value=("", None)):
             code, body, _ = self.run_target(fake, self.EVENT)
         self.assertEqual(code, 2)
         self.assertIn("could not read the pull request's labels", body["summary"])
@@ -602,7 +602,7 @@ class TargetFailures(unittest.TestCase):
             [{"name": "findings-accepted"}] if path.endswith("/labels") else
             [{"id": 1, "event": "labeled", "label": {"name": "findings-accepted"}, "actor": {"login": "dflippojr"},
               "created_at": "2026-10-16T13:00:00Z"}])
-        with mock.patch.object(gate_guard, "fetch_diff", return_value=""):
+        with mock.patch.object(gate_guard, "fetch_diff", return_value=("", None)):
             code, body, _ = self.run_target(fake, self.EVENT)
         self.assertEqual(code, 1)
         self.assertIn("GitHub has no record of when", body["summary"])
@@ -611,7 +611,7 @@ class TargetFailures(unittest.TestCase):
         """The job's own result is the verdict; the guard writes nothing through the API."""
         fake = self.github()
         fake.pages.return_value = []
-        with mock.patch.object(gate_guard, "fetch_diff", return_value=""):
+        with mock.patch.object(gate_guard, "fetch_diff", return_value=("", None)):
             code, body, _ = self.run_target(fake, self.EVENT)
         self.assertEqual((code, body["conclusion"]), (0, "success"))
         self.assertEqual({c[0] for c in fake.method_calls}, {"get", "pages"})
@@ -627,7 +627,7 @@ class TargetFailures(unittest.TestCase):
             return []
 
         fake.pages.side_effect = pages
-        with mock.patch.object(gate_guard, "fetch_diff", return_value=""):
+        with mock.patch.object(gate_guard, "fetch_diff", return_value=("", None)):
             code, body, _ = self.run_target(fake, self.EVENT)
         self.assertEqual(code, 2)
         self.assertEqual(body["conclusion"], "failure")
@@ -713,7 +713,7 @@ class CutOffLabelHistory(unittest.TestCase):
         event = {"pull_request": event_pr(NUMBER, head, "main")}
         with mock.patch.object(gate_guard, "api_request", side_effect=request), \
                 mock.patch.object(gate_guard, "MAX_API_PAGES", max_pages), \
-                mock.patch.object(gate_guard, "fetch_diff", return_value=""):
+                mock.patch.object(gate_guard, "fetch_diff", return_value=("", None)):
             code, verdict, _ = TargetFailures.run_target(github, event)
         return code, verdict, requested
 
@@ -751,9 +751,9 @@ class FetchDiff(unittest.TestCase):
         fetch_argv, env = calls[1]
         self.assertEqual(fetch_argv[3:5], ["fetch", "-q"])
         self.assertIn("--depth=1", fetch_argv)
-        # init, fetch and diff only: nothing is checked out.
-        self.assertEqual([next(a for a in ("init", "fetch", "diff", "checkout") if a in argv) for argv, _ in calls],
-                         ["init", "fetch", "diff"])
+        # init, fetch, diff and reads of the two trees only: nothing is checked out.
+        self.assertEqual([next(a for a in ("init", "fetch", "diff", "ls-tree", "checkout") if a in argv)
+                          for argv, _ in calls], ["init", "fetch", "diff", "ls-tree", "ls-tree"])
         self.assertTrue(all("s3cret" not in " ".join(argv) for argv, _ in calls))
         self.assertEqual(env["GIT_CONFIG_COUNT"], "3")
         self.assertEqual(env["GIT_CONFIG_KEY_2"], "http.extraheader")

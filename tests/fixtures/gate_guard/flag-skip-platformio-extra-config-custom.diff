@@ -1,0 +1,25 @@
+# gate-guard fixture: an unchanged platformio.ini loads selection.ini, whose custom section narrows test_filter
+# expect: skip-marker
+# hits: 1
+#
+# platformio.ini is unchanged. Its all-context hunk gives --diff-file the file
+# the workflows read from the base and head trees.
+
+diff --git a/firmware/platformio.ini b/firmware/platformio.ini
+--- a/firmware/platformio.ini
++++ b/firmware/platformio.ini
+@@ -1,6 +1,6 @@
+ [platformio]
+ extra_configs = selection.ini
+
+ [env:native]
+ platform = native
+ test_filter = ${selection.suites}
+diff --git a/firmware/selection.ini b/firmware/selection.ini
+index 2b7e4a1..9c0d3f5 100644
+--- a/firmware/selection.ini
++++ b/firmware/selection.ini
+@@ -1,2 +1,2 @@
+ [selection]
+-suites = test_logic, test_controls
++suites = test_logic

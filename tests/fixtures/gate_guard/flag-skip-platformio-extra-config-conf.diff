@@ -1,0 +1,25 @@
+# gate-guard fixture: an unchanged platformio.ini loads test.conf, which gains a test_ignore
+# expect: skip-marker
+# hits: 1
+#
+# platformio.ini is unchanged. Its all-context hunk gives --diff-file the file
+# the workflows read from the base and head trees.
+
+diff --git a/firmware/platformio.ini b/firmware/platformio.ini
+--- a/firmware/platformio.ini
++++ b/firmware/platformio.ini
+@@ -1,6 +1,6 @@
+ [platformio]
+ extra_configs = test.conf
+
+ [env:native]
+ platform = native
+ test_framework = unity
+diff --git a/firmware/test.conf b/firmware/test.conf
+index 6a1f0e2..d47b9c8 100644
+--- a/firmware/test.conf
++++ b/firmware/test.conf
+@@ -1,2 +1,3 @@
+ [env:native]
+ build_flags = -DFAST
++test_ignore = test_controls

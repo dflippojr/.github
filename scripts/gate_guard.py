@@ -75,9 +75,11 @@ class FileDiff:
         self.new_path = new_path
         self.status = "modified"
         self.lines = []
-        # (old start, new start) of each hunk, and whether git called the file binary.
+        # (old start, new start) of each hunk, whether git called the file binary,
+        # and the modes its header names (120000 is a symbolic link, 160000 a submodule).
         self.hunks = []
         self.binary = False
+        self.modes = set()
 
     @property
     def path(self):
@@ -93,6 +95,7 @@ class FileDiff:
 
 # ---------------------------------------------------------------- diff parsing
 
+LINK_MODES = {"120000", "160000"}
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
@@ -169,6 +172,8 @@ def parse_diff(text):
             continue
         if cur is None:
             continue
+        if line.startswith(("new file mode ", "deleted file mode ", "old mode ", "new mode ", "index ")):
+            cur.modes.add(line.split()[-1])
         if line.startswith("new file mode"):
             cur.status = "added"
         elif line.startswith("deleted file mode"):
@@ -227,6 +232,14 @@ def _ext(path):
 
 def _in_test_dir(path):
     return any(d in TEST_DIRS for d in path.lower().split("/")[:-1])
+
+
+def _test_dir(path, roots=()):
+    """The outermost test directory path sits in, lowercased, or None. roots are
+    more test directories, the ones PlatformIO's test_dir options name."""
+    parts = path.lower().split("/")
+    return next(("/".join(parts[:i + 1]) for i, d in enumerate(parts[:-1]) if d in TEST_DIRS),
+                next((r for r in roots if r == "" or path.lower().startswith(r + "/")), None))
 
 
 def is_doc(path):
@@ -343,9 +356,16 @@ C_LEXEME = re.compile(
     r"|(?<!\w)(?:u8|[uUL])?R\"([^()\\\s]{0,16})\(.*?(?:\)\1\"|\Z)"
     r"|(?:(?<!\w)(?:u8|[uUL]))?\"(?:\\.|[^\"\\\n])*\"?"
     r"|(?<!\w)(?:u8|[uUL])?'(?:\\.|[^'\\\n])*'", re.S)
-C_DIRECTIVE = re.compile(r"^[ \t]*#[ \t]*([A-Za-z_]\w*)(.*)$")
-# Headers are not test modules, but a directive in one can turn tests off.
-C_HEADER_EXTS = {".h", ".hh", ".hpp", ".hxx"}
+# A directive starts with #, its digraph %: or its trigraph ??=, after any
+# whitespace; a null directive or a line marker has no name.
+C_DIRECTIVE = re.compile(r"^[ \t\f\v]*(#|%:|\?\?=)[ \t\f\v]*([A-Za-z_]\w*)?(.*)$")
+# A trigraph is replaced before lines are spliced or comments removed, so ??/
+# can splice a line into a comment. The guard does not translate them.
+C_TRIGRAPH = re.compile(r"\?\?[=/'()!<>\-]")
+# Headers are not test modules, but they can register tests and turn tests off.
+C_HEADER_EXTS = {".h", ".hh", ".hpp", ".hxx", ".inc", ".ipp"}
+# Files in a C/C++ test directory that no test source would #include.
+C_TEST_DIR_KNOWN_EXTS = CODE_EXTS | C_HEADER_EXTS | {".md", ".markdown", ".rst", ".adoc"}
 # directives are (name, text, (first, last) physical line) for each preprocessor directive.
 UnityScan = collections.namedtuple("UnityScan", "items directives others")
 
@@ -401,10 +421,11 @@ def _unity_scan(text):
         plain.append(depth == 0)
         m = C_DIRECTIVE.match(line)
         if m:
-            directives.append((m.group(1), " ".join(("#" + m.group(1) + m.group(2)).split()), spans[k]))
-            if m.group(1) in ("if", "ifdef", "ifndef"):
+            name = m.group(2) or ""
+            directives.append((name, " ".join((m.group(1) + name + m.group(3)).split()), spans[k]))
+            if name in ("if", "ifdef", "ifndef"):
                 depth += 1
-            elif m.group(1) == "endif":
+            elif name == "endif":
                 depth = max(depth - 1, 0)
     macros = any(name in ("define", "undef") for name, _, _ in directives)
     starts = [0] + [i + 1 for i, c in enumerate(blank) if c == "\n"]
@@ -441,13 +462,16 @@ def _unity_defs(fd):
     registration; removed_test_hits counts a test's two kinds once, by name.
     The region keeps a test that moves across a directive from cancelling.
     When the two sides' directives differ, _c_test_problems flags the file
-    and tests are counted by name and kind alone.
+    and tests are counted by name and kind alone. A header's tests run only
+    where a source includes it, so they never pair with another file's.
     """
     sides = _whole_sides(fd)
     if sides is None:
         return [], []
     old, new = (_unity_scan(text) for text in sides)
-    items = old.items, new.items
+    header = _ext(fd.path) in C_HEADER_EXTS
+    items = [[(n, line, kind, region, plain and not header) for n, line, kind, region, plain in side]
+             for side in (old.items, new.items)]
     if [d[1] for d in old.directives] != [d[1] for d in new.directives]:
         items = [[(n, line, kind, None, plain) for n, line, kind, _, plain in side] for side in items]
     return _cancel_pairs(*items, key=_def_key)
@@ -465,12 +489,17 @@ def _directive_changed(fd, old, new):
     return False
 
 
-def _c_test_source(fd):
+def _c_test_source(fd, roots=()):
     """A C/C++ source or header under a test directory."""
-    return any(_ext(p) in C_EXTS | C_HEADER_EXTS and _in_test_dir(p) for p in fd.paths)
+    return any(_ext(p) in C_EXTS | C_HEADER_EXTS and _test_dir(p, roots) for p in fd.paths)
 
 
-def _c_test_problems(fd):
+def _c_test_module(path, roots=()):
+    """A C/C++ source under a test directory, which PlatformIO compiles as a test."""
+    return is_test_module(path) or (_ext(path) in C_EXTS and _test_dir(path, roots) is not None)
+
+
+def _c_test_problems(fd, roots=()):
     """Why the guard fails closed on a changed C/C++ file under a test directory.
 
     It does not evaluate the preprocessor, so any change to a directive in an
@@ -479,7 +508,7 @@ def _c_test_problems(fd):
     registration of another kind. A directive in a new file cannot turn an
     existing test off, and a test moved into one pairs only when it is plain.
     """
-    if fd.status == "deleted" and is_test_module(fd.path):
+    if fd.status == "deleted" and _c_test_module(fd.path, roots):
         # Already a hit as a deleted test file.
         return []
     sides = _whole_sides(fd)
@@ -497,6 +526,8 @@ def _c_test_problems(fd):
     if _directive_changed(fd, old, new):
         problems.append("adds, removes, moves or edits a preprocessor directive, which can turn tests off "
                         "and which the guard does not evaluate")
+    if any(C_TRIGRAPH.search(text) for text in sides):
+        problems.append("uses a trigraph, which the guard does not translate")
     lost = collections.Counter(old.others) - collections.Counter(new.others)
     if lost:
         problems.append(f"loses a test registration the guard does not count: {', '.join(sorted({n for n, _ in lost}))}")
@@ -530,8 +561,11 @@ def _marker_defs(fd, marker, name_re):
     return out["-"], out["+"]
 
 
-def test_defs(fd):
-    """(removed, added) test definitions on changed lines: lists of (name, line)."""
+def test_defs(fd, roots=()):
+    """(removed, added) test definitions on changed lines: lists of (name, line).
+
+    roots are more test directories for C/C++, the ones PlatformIO's test_dir options name.
+    """
     ext = _ext(fd.path)
     if ext in PY_EXTS and any(is_test_file(p) for p in fd.paths):
         return _line_defs(fd, PY_DEF, 1)
@@ -543,7 +577,7 @@ def test_defs(fd):
         return _marker_defs(fd, JVM_MARK, JVM_NAME)
     if ext == ".rs":
         return _marker_defs(fd, RS_MARK, RS_NAME)
-    if ext in C_EXTS and any(is_test_module(p) for p in fd.paths):
+    if ext in C_EXTS | C_HEADER_EXTS and _c_test_source(fd, roots):
         return _unity_defs(fd)
     return [], []
 
@@ -595,11 +629,37 @@ def _decrease(removed, added):
     return max(fewer("run"), fewer("def"))
 
 
-def removed_test_hits(files):
+def _c_test_dir_hits(files, facts):
+    """Changes the guard cannot count in a test directory that holds C/C++ files.
+
+    A test source can #include any file, so a changed file there that is not
+    a C/C++ source or header is a hit, and so is a symbolic link or submodule,
+    whose target the guard does not read. A test source that tests for a file
+    with __has_include can turn tests off when any file is added or removed.
+    """
+    hits = []
+    for fd in files:
+        if fd.status == "modified" and not fd.changed() and not fd.binary and not fd.modes & LINK_MODES:
+            continue
+        in_dir = [p for p in fd.paths if _test_dir(p, facts.test_roots) in facts.c_test_dirs]
+        if in_dir and fd.modes & LINK_MODES:
+            hits.append(Hit("removed-tests", fd.path, None, "changes a symbolic link or submodule in a C/C++ test "
+                            "directory, which the guard does not follow, so it cannot count the tests it holds"))
+        elif any(_ext(p) not in C_TEST_DIR_KNOWN_EXTS for p in in_dir):
+            hits.append(Hit("removed-tests", fd.path, None, "changes a file in a C/C++ test directory that is not a "
+                            "C/C++ source or header; a test source may #include it, so the guard cannot count its tests"))
+        elif facts.has_include and fd.status != "modified":
+            hits.append(Hit("removed-tests", fd.path, None, f"C/C++ test source {facts.has_include[0]} tests whether "
+                            "files exist with __has_include, and this change adds or removes a file"))
+    return hits
+
+
+def removed_test_hits(files, facts=None):
     """Deleted test files and per-file decreases, after pairing renames and moves."""
+    facts = facts or tree_facts(DiffTrees(files))
     left = {}
     for fd in files:
-        removed, added = test_defs(fd)
+        removed, added = test_defs(fd, facts.test_roots)
         # A test removed and re-added in the same file was edited, not removed.
         left[id(fd)] = list(_cancel_pairs(removed, added, key=_def_key))
     # A test removed from one file and added to another was moved.
@@ -625,7 +685,8 @@ def removed_test_hits(files):
         decrease = _decrease(*left[id(fd)])
         removed, added = map(_by_name, left[id(fd)])
         plural = "s" if decrease != 1 else ""
-        if fd.status == "deleted" and (decrease > 0 or (not test_defs(fd)[0] and is_test_module(fd.path))):
+        if fd.status == "deleted" and (decrease > 0 or (not test_defs(fd, facts.test_roots)[0]
+                                                         and _c_test_module(fd.path, facts.test_roots))):
             detail = "test file deleted"
             if decrease > 0:
                 detail += f", {decrease} test{plural} removed: {_names(removed)}"
@@ -635,11 +696,11 @@ def removed_test_hits(files):
             if added:
                 detail += f"; added {_names(added)}"
             hits.append(Hit("removed-tests", fd.path, None, detail))
-        problems = _c_test_source(fd) and _c_test_problems(fd)
+        problems = _c_test_source(fd, facts.test_roots) and _c_test_problems(fd, facts.test_roots)
         if problems:
             kind = "Unity test file" if _ext(fd.path) in C_EXTS else "C/C++ header in a test directory"
             hits.append(Hit("removed-tests", fd.path, None, f"{kind} {'; '.join(problems)}"))
-    return hits
+    return hits + _c_test_dir_hits(files, facts)
 
 
 # --------------------------------------------------------------- skip markers
@@ -763,22 +824,26 @@ def _pio_value(value):
     return _snippet(" ".join(value.split()), 60) or "(empty)"
 
 
-def _pio_details(fd):
-    """Why a change to an ini file may change what PlatformIO tests, as hit details.
+def _pio_details(fd, loader=None):
+    """Why a change to an ini file, or to a file loader loads, may change what PlatformIO tests, as hit details.
 
     Any change to a test_* or extends option is a hit. Where the guard cannot
     see what the options read, any change to the file is: a test_* or extends
-    value with a ${...} or %(...)s reference, extra_configs set anywhere, and
-    an ini file other than platformio.ini that reads as PlatformIO's, which
-    a platformio.ini may load through extra_configs.
+    value with a ${...} or %(...)s reference, extra_configs set anywhere, a
+    file a platformio.ini loads through extra_configs, whatever its name or
+    content, and an ini file other than platformio.ini that reads as
+    PlatformIO's, which a platformio.ini the guard did not read may load.
     """
-    main = any(_name(p) == "platformio.ini" for p in fd.paths)
+    main = loader is not None or any(_name(p) == "platformio.ini" for p in fd.paths)
+    verb = {"added": "adds", "deleted": "deletes", "renamed": "renames"}.get(fd.status, "edits")
+    loaded = f"PlatformIO {loader} loads {fd.path} through extra_configs, and this change {verb} it"
     pio_lines = main or any(PIO_SECTION_LINE.match(l.text) or PIO_OPTION_LINE.match(l.text) for l in fd.lines)
     sides = _whole_sides(fd)
     if sides is None:
         return [f"PlatformIO {fd.path} is not shown whole in the diff, so the guard cannot read it"] if pio_lines else []
     if sides[0] == sides[1]:
-        return []
+        # Renamed or deleted, a file PlatformIO loaded is no longer loaded.
+        return [loaded] if loader and fd.status != "modified" else []
     try:
         old, new = (_ini_options(text) for text in sides)
     except configparser.Error as exc:
@@ -812,16 +877,24 @@ def _pio_details(fd):
     if any("extra_configs" in c[s] for c in (old, new) for s in c):
         details.append(f"PlatformIO {fd.path} loads extra_configs the guard cannot read, "
                        "so it cannot tell what this change runs")
-    if not main:
+    if loader:
+        details.append(loaded)
+    elif not main:
         details.append(f"PlatformIO {fd.path} may be loaded through extra_configs by a platformio.ini the diff "
                        "does not show, so the guard cannot tell what this change runs")
     return details
 
 
-def platformio_hits(files):
-    """Changes to an ini file that may change which PlatformIO tests run; see _pio_details."""
-    return [Hit("skip-marker", fd.path, None, d)
-            for fd in files if any(_ext(p) == ".ini" for p in fd.paths) for d in _pio_details(fd)]
+def platformio_hits(files, facts):
+    """Changes that may change which PlatformIO tests run (see _pio_details), and the
+    platformio.ini files the diff leaves unchanged whose extra_configs the guard cannot follow."""
+    hits = []
+    for fd in files:
+        loader = next((facts.loaded[p] for p in fd.paths if p in facts.loaded), None)
+        if loader or any(_ext(p) == ".ini" for p in fd.paths):
+            hits += [Hit("skip-marker", fd.path, None, d) for d in _pio_details(fd, loader)]
+    changed = {p for fd in files if fd.changed() or fd.status != "modified" or fd.binary for p in fd.paths}
+    return hits + [Hit("skip-marker", path, None, d) for path, d in facts.problems if path not in changed]
 
 
 def _new_lines(files, rules, imperative_rules=()):
@@ -832,10 +905,10 @@ def _new_lines(files, rules, imperative_rules=()):
     return _cancel_pairs(removed, added, key=lambda f: f[2].text.strip())
 
 
-def skip_hits(files):
+def skip_hits(files, facts=None):
     _, added = _new_lines(files, SKIP_RULES, IMPERATIVE_SKIP_RULES)
     return ([Hit("skip-marker", path, l.new, f"{label}: {_snippet(l.text)}") for label, path, l in added]
-            + platformio_hits(files))
+            + platformio_hits(files, facts or tree_facts(DiffTrees(files))))
 
 
 # -------------------------------------------------------------------- retries
@@ -1024,10 +1097,223 @@ def gate_config_hits(files):
     return hits
 
 
+# ---------------------------------------------------------------------- trees
+#
+# Some rules read files the diff does not show: the platformio.ini files and
+# what they load through extra_configs, and the C/C++ files in test
+# directories. Each side is "-" (base) or "+" (head).
+
+class DiffTrees:
+    """The files the diff shows, as the trees of a --diff-file run; a file it does not show whole cannot be read."""
+
+    def __init__(self, files):
+        self.files = {"-": {}, "+": {}}
+        self.link_paths = [p for fd in files if fd.modes & LINK_MODES for p in fd.paths]
+        for fd in files:
+            sides = _whole_sides(fd)
+            for side, path, i in (("-", fd.old_path, 0), ("+", fd.new_path, 1)):
+                if path:
+                    self.files[side][path] = None if sides is None or fd.modes & LINK_MODES else sides[i]
+
+    def paths(self, side):
+        return list(self.files[side])
+
+    def links(self, side):
+        return self.link_paths
+
+    def read(self, side, path):
+        return self.files[side].get(path)
+
+
+class GitTrees:
+    """The base and head trees of a git repository, read as data: nothing is checked out or run."""
+
+    def __init__(self, repo_dir, base, head):
+        self.repo_dir, self.revs = repo_dir, {"-": base, "+": head}
+        self.trees, self.link_paths, self.blobs = {}, {}, {}
+
+    def _git(self, *args):
+        return subprocess.run(["git", "-C", self.repo_dir, *args], check=True, capture_output=True).stdout
+
+    def _tree(self, side):
+        if side not in self.trees:
+            tree, links = {}, []
+            for entry in self._git("ls-tree", "-r", "-z", "--full-tree", self.revs[side]).split(b"\0"):
+                meta, _, raw = entry.partition(b"\t")
+                mode, kind, sha = (meta.decode("ascii").split() + ["", "", ""])[:3]
+                path = raw.decode("utf-8", "replace")
+                if mode in LINK_MODES:
+                    # A symbolic link's blob is its target, and a submodule's files are not in the tree.
+                    links.append(path)
+                if kind == "blob":
+                    tree[path] = None if mode in LINK_MODES else sha
+            self.trees[side], self.link_paths[side] = tree, links
+        return self.trees[side]
+
+    def paths(self, side):
+        return list(self._tree(side))
+
+    def links(self, side):
+        self._tree(side)
+        return self.link_paths[side]
+
+    def read(self, side, path):
+        sha = self._tree(side).get(path)
+        if sha is None:
+            return None
+        if sha not in self.blobs:
+            self.blobs[sha] = self._git("cat-file", "blob", sha)
+        try:
+            return self.blobs[sha].decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+
+
+# loaded: {path: the platformio.ini that loads it through extra_configs, on either side};
+# problems: [(path, detail)] where discovery could not complete; test_roots: the
+# directories PlatformIO's test_dir options name, lowercased; c_test_dirs: test
+# directories that hold C/C++ files; has_include: C/C++ test files that use __has_include.
+TreeFacts = collections.namedtuple("TreeFacts", "loaded problems test_roots c_test_dirs has_include")
+PIO_CANNOT_TELL = "so the guard cannot tell which files PlatformIO loads"
+
+
+def _pio_glob(pattern):
+    """A regex for PlatformIO's glob.glob(pattern, recursive=True). It matches dot files too, which only adds hits."""
+    out, i = [], 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] in "*?":
+            out.append("[^/]*" if pattern[i] == "*" else "[^/]")
+            i += 1
+        elif pattern[i] == "[" and "]" in pattern[i + 2:]:
+            end = pattern.index("]", i + 2)
+            body = pattern[i + 1:end]
+            out.append("[" + ("^" + body[1:] if body.startswith("!") else body).replace("\\", "\\\\") + "]")
+            i = end + 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
+def _pio_unresolvable(item):
+    """Why an extra_configs entry cannot be matched against the repository, or None."""
+    if "$" in item or "%" in item or "\\" in item:
+        return "reads other values"
+    if item.startswith(("~", "/")) or re.match(r"[A-Za-z]:", item):
+        return "is outside the repository"
+    return None
+
+
+def _pio_path(config, option, item, project):
+    """(the repository path an extra_configs or test_dir entry names, None) or (None, a problem detail)."""
+    path = posixpath.normpath(posixpath.join(project, item))
+    why = _pio_unresolvable(item) or ("is outside the repository" if path.split("/")[0] == ".." else None)
+    if why:
+        return None, f"PlatformIO {config} {option} entry {item} {why} and cannot be resolved, {PIO_CANNOT_TELL}"
+    return path, None
+
+
+def _pio_options(trees, side, config, problems):
+    """config's options as ConfigParser reads them, or None once problems says why it cannot be read."""
+    text = trees.read(side, config)
+    try:
+        if text is None:
+            raise ValueError("it is binary, not UTF-8 or a symbolic link")
+        return _ini_options(text)
+    except (configparser.Error, ValueError) as exc:
+        error = str(exc).strip().splitlines()[0]
+        problems.append((config, f"PlatformIO {config} cannot be read, {PIO_CANNOT_TELL}: {_snippet(error)}"))
+        return None
+
+
+def _pio_test_roots(config, options, project, roots, problems):
+    """Add the directories config's test_dir options name, when the guard's test directory names miss them."""
+    for item in (v.strip() for section in options.values() for o, v in section.items() if o == "test_dir"):
+        root, problem = _pio_path(config, "test_dir", item or ".", project)
+        if problem:
+            problems.append((config, problem))
+        elif root.split("/")[-1].lower() not in TEST_DIRS:
+            roots.add("" if root == "." else root.lower())
+
+
+def _pio_globs(config, options, project, links, problems):
+    """Regexes for config's extra_configs entries, PlatformIO's lists split on commas and newlines.
+
+    An entry the guard cannot follow goes to problems instead.
+    """
+    regexes = []
+    entries = [i.strip() for section in options.values() for o, v in section.items() if o == "extra_configs"
+               for i in re.split(r"[,\n]", v)]
+    for item in filter(None, entries):
+        pattern, problem = _pio_path(config, "extra_configs", item, project)
+        parts = pattern.split("/") if pattern else []
+        if not problem and any(_pio_glob("/".join(parts[:k])).match(link)
+                               for k in range(1, len(parts)) for link in links):
+            problem = (f"PlatformIO {config} extra_configs entry {item} passes through a symbolic link or "
+                       f"submodule, which the guard does not follow, {PIO_CANNOT_TELL}")
+        if problem:
+            problems.append((config, problem))
+        else:
+            regexes.append(_pio_glob(pattern))
+    return regexes
+
+
+def _pio_includes(trees, side, loaded, problems, roots):
+    """Add what each platformio.ini on one side loads through extra_configs, and the test_dir it names.
+
+    PlatformIO globs every extra_configs entry from the project directory,
+    and an included file can add entries of its own. Every section's
+    extra_configs and test_dir counts, which can only add files.
+    """
+    paths, links = trees.paths(side), trees.links(side)
+    for main in (p for p in paths if _name(p) == "platformio.ini"):
+        project = posixpath.dirname(main)
+        queue, seen = [main], {main}
+        while queue:
+            config = queue.pop()
+            options = _pio_options(trees, side, config, problems)
+            if options is None:
+                continue
+            _pio_test_roots(config, options, project, roots, problems)
+            regexes = _pio_globs(config, options, project, links, problems)
+            found = list(dict.fromkeys(p for r in regexes for p in paths if r.match(p) and p != main))
+            for path in found:
+                loaded.setdefault(path, main)
+            queue += [path for path in found if path not in seen]
+            seen.update(found)
+
+
+def tree_facts(trees):
+    """The TreeFacts of a base and head tree; see TreeFacts."""
+    loaded, problems, roots, c_test_dirs, has_include = {}, [], set(), set(), []
+    for side in ("-", "+"):
+        _pio_includes(trees, side, loaded, problems, roots)
+    for side in ("-", "+"):
+        for path in trees.paths(side):
+            if _ext(path) in C_EXTS | C_HEADER_EXTS and _test_dir(path, roots) is not None:
+                c_test_dirs.add(_test_dir(path, roots))
+                if "__has_include" in (trees.read(side, path) or "") and path not in has_include:
+                    has_include.append(path)
+    return TreeFacts(loaded, list(dict.fromkeys(problems)), frozenset(roots), c_test_dirs, has_include)
+
+
+def repo_hits(repo_dir, base, head):
+    """The hits from base to head of a git repository, reading its trees beyond the diff."""
+    return analyze(parse_diff(git_diff(repo_dir, base, head)), tree_facts(GitTrees(repo_dir, base, head)))
+
+
 # ------------------------------------------------------------------ reporting
 
-def analyze(files):
-    hits = removed_test_hits(files) + skip_hits(files) + retry_hits(files) + gate_config_hits(files)
+def analyze(files, facts=None):
+    """The hits of a diff. facts come from the base and head trees; without them, from the files the diff shows."""
+    facts = facts or tree_facts(DiffTrees(files))
+    hits = removed_test_hits(files, facts) + skip_hits(files, facts) + retry_hits(files) + gate_config_hits(files)
     seen = set()
     unique = []
     for h in hits:
@@ -1252,11 +1538,11 @@ def git_diff(repo_dir, base, head):
 
 
 def fetch_diff(url, token, base, head):
-    """The diff from base to head, fetched as objects into an empty repository.
+    """(diff, TreeFacts) from base to head, fetched as objects into an empty repository.
 
     Nothing is checked out, so no file from the pull request reaches the disk,
-    let alone runs. The token reaches git through the environment, never the
-    command line or a config file.
+    let alone runs; the trees are read as data. The token reaches git through
+    the environment, never the command line or a config file.
     """
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
     if token:
@@ -1269,7 +1555,7 @@ def fetch_diff(url, token, base, head):
         subprocess.run(["git", "init", "-q", tmp], check=True, capture_output=True, env=env)
         subprocess.run(["git", "-C", tmp, "fetch", "-q", "--no-tags", "--no-recurse-submodules", "--depth=1",
                         url, base, head], check=True, capture_output=True, env=env)
-        return git_diff(tmp, base, head)
+        return git_diff(tmp, base, head), tree_facts(GitTrees(tmp, base, head))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1401,7 +1687,8 @@ def _target_hits(github, repo, base_ref, sha, server, token):
     try:
         compare = github.get(f"/repos/{repo}/compare/{urllib.parse.quote(base_ref, safe='/')}...{sha}?per_page=1")
         merge_base = compare["merge_base_commit"]["sha"]
-        return analyze(parse_diff(fetch_diff(f"{server}/{repo}.git", token, merge_base, sha))), None
+        diff, facts = fetch_diff(f"{server}/{repo}.git", token, merge_base, sha)
+        return analyze(parse_diff(diff), facts), None
     except subprocess.CalledProcessError as e:
         detail = (e.stderr or b"").decode("utf-8", "replace").strip()
         return [], f"could not fetch the pull request's commits ({detail or e})"
@@ -1511,16 +1798,18 @@ def run_target(args, github=None):
 
 # ----------------------------------------------------------------------- main
 
-def read_diff(args):
+def read_hits(args):
+    """The hits of the diff file, or of base to head in the repository, whose trees are read too."""
     if args.diff_file:
         with open(args.diff_file, encoding="utf-8", errors="replace") as f:
-            return f.read()
-    return git_diff(args.repo_dir, args.base, args.head)
+            return analyze(parse_diff(f.read()))
+    return repo_hits(args.repo_dir, args.base, args.head)
 
 
 def parse_args(argv):
     p = argparse.ArgumentParser(description="Flag pull request changes that loosen a repository's test gate.")
-    p.add_argument("--diff-file", help="read the diff from this file instead of git")
+    p.add_argument("--diff-file", help="read the diff from this file instead of git; the guard then reads only "
+                                         "the files the diff shows, not the rest of the trees")
     p.add_argument("--repo-dir", default=".", help="git checkout to diff (default: .)")
     p.add_argument("--base", default="HEAD^1", help="base revision (default: HEAD^1)")
     p.add_argument("--head", default="HEAD", help="head revision (default: HEAD)")
@@ -1546,13 +1835,12 @@ def main(argv=None):
     if args.pull_request_target:
         return run_target(args)
     try:
-        diff = read_diff(args)
+        hits = read_hits(args)
     except (OSError, subprocess.CalledProcessError) as e:
         detail = getattr(e, "stderr", b"") or b""
         print(f"gate-guard: cannot read the diff: {e} {detail.decode('utf-8', 'replace')}".strip(),
               file=sys.stderr)
         return 2
-    hits = analyze(parse_diff(diff))
     approved, note = approval(args) if hits else (True, "")
     summary = render_summary(hits, approved, note)
     print(summary)

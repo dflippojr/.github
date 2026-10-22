@@ -30,7 +30,7 @@ merging the pull request would change and reports each hit in the job summary:
 
 | Rule | Hits |
 | --- | --- |
-| `removed-tests` | A deleted test file, or fewer test functions in a file (`def test_`, `test(`/`it(`, `@Test`, `#[test]`, `func Test`, and in a C/C++ file under a test directory, Unity `RUN_TEST(name)` and `void test_name(void)`, counted over the whole file); in a C/C++ source or header under a test directory, any added, removed, moved or edited preprocessor directive (see below). |
+| `removed-tests` | A deleted test file, or fewer test functions in a file (`def test_`, `test(`/`it(`, `@Test`, `#[test]`, `func Test`, and in a C/C++ source or header under a test directory, Unity `RUN_TEST(name)` and `void test_name(void)`, counted over the whole file); in a C/C++ source or header under a test directory, any added, removed, moved or edited preprocessor directive, and other changes the guard cannot count (see below). |
 | `skip-marker` | A new `pytest.mark.skip`/`skipif`/`xfail`, `unittest.skip`, `.skip(`/`.only(`/`test.fixme`/`xit(`/`xdescribe(`, `@Disabled`, `#[ignore]`, any change to a PlatformIO `test_*` or `extends` option (see below), or pytest `--deselect`/`-k "not …"` in config. `pytest.skip()` and Go `t.Skip()` count when unconditional or when the condition checks `CI`. |
 | `retry` | New or raised Playwright `retries`, `--reruns`, `pytest-rerunfailures`, `flaky`, `jest.retryTimes`, Surefire `rerunFailingTestsCount`. |
 | `gate-config` | Any edit to `.github/workflows/**`, `sonar-project.properties`, `CODEOWNERS` or coverage config (`.coveragerc`, `[tool.coverage]`, `fail_under`, JaCoCo rules, c8/nyc/Jest thresholds); a lint rule disabled; a size or performance budget raised. |
@@ -41,13 +41,20 @@ turn tests off:
 
 - **Test sources.** Any change to a preprocessor directive (`#if`, `#ifdef`,
   `#ifndef`, `#elif`, `#else`, `#endif`, `#define`, `#undef`, `#include` and
-  the rest, continuation lines included) in an existing C/C++ source or header
-  under a test directory is a `removed-tests` hit, even a harmless one. Unity
-  registrations and definitions are still counted over the whole file, with
-  comments and literals blanked, and a decrease is a hit; a test that moves
-  across a directive is not the same test. Also flagged: a file the diff does
-  not show whole, a macro that uses `RUN_TEST`, and a removed registration the
-  guard does not count (Unity fixture, GoogleTest, doctest, Catch2).
+  the rest, spelled with `#`, `%:` or `??=`, null directives and continuation
+  lines included) in an existing C/C++ source or header (`.h`, `.hh`, `.hpp`,
+  `.hxx`, `.inc`, `.ipp`) under a test directory is a `removed-tests` hit, even
+  a harmless one. Unity registrations and definitions are counted over the
+  whole of each source and header, with comments and literals blanked, and a
+  decrease is a hit; a test that moves across a directive, or into or out of a
+  header, is not the same test. Also flagged: a file the diff does not show
+  whole, a trigraph, a macro that uses `RUN_TEST`, a removed registration the
+  guard does not count (Unity fixture, GoogleTest, doctest, Catch2), and, in a
+  test directory that holds C/C++ files, any changed file that is not a source
+  or header (a test source may `#include` it) and any changed symbolic link or
+  submodule. When a test source uses `__has_include`, adding or removing any
+  file is a hit. A directory a PlatformIO `test_dir` option names counts as a
+  test directory.
 - **platformio.ini.** Any change to a `test_*` option (`test_filter`,
   `test_ignore`, `test_dir`, `test_framework`, `test_build_src`, ...) or an
   `extends` option, in any section, is a `skip-marker` hit, even one that runs
@@ -55,7 +62,15 @@ turn tests off:
   a line moved within its section is not a change). So is any change to a file whose `test_*` or `extends`
   values reference other values (`${...}`, `%(...)s`), or that sets
   `extra_configs`, or that cannot be read, and any change to another `.ini`
-  file that reads as PlatformIO's, which `extra_configs` may load.
+  file that reads as PlatformIO's.
+- **extra_configs.** The guard reads every `platformio.ini` in the base and
+  head trees, expands their `extra_configs` globs (and those of the files they
+  load) from the project directory, and flags any change to a loaded file,
+  whatever its name, sections or content. It fails closed, flagging every pull
+  request, when it cannot finish: a config it cannot read, or an entry that
+  references other values, leaves the repository or passes through a symbolic
+  link or submodule. With `--diff-file` it reads only the files the diff shows;
+  both workflows read the trees.
 
 A test renamed in place or moved to another file, a renamed test file, and a
 skip marker that moves with its test are not hits. The job fails on any hit

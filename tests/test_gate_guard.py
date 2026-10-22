@@ -28,6 +28,42 @@ def analyze_text(text):
     return gate_guard.analyze(gate_guard.parse_diff(text))
 
 
+class Link(str):
+    """A symbolic link's target, as a value of git_commit's files."""
+
+
+def git_commit(root, files, message):
+    """Replace the work tree of the repository at root with files (path -> text, bytes or Link) and commit it."""
+    def git(*args, **kwargs):
+        return subprocess.run(["git", "-C", root, "-c", "core.autocrlf=false", *args], check=True,
+                              capture_output=True, **kwargs).stdout
+    for p in pathlib.Path(root).iterdir():
+        if p.name != ".git":
+            shutil.rmtree(p) if p.is_dir() else p.unlink()
+    for rel, text in files.items():
+        if isinstance(text, Link):
+            continue
+        target = pathlib.Path(root, rel)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(text if isinstance(text, bytes) else text.encode("utf-8"))
+    git("add", "-A")
+    # Links go straight into the index, so the test needs no symbolic link support from the file system.
+    for rel, text in files.items():
+        if isinstance(text, Link):
+            sha = git("hash-object", "-w", "--stdin", input=text.encode("utf-8")).decode("ascii").strip()
+            git("update-index", "--add", "--cacheinfo", f"120000,{sha},{rel}")
+    git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", message)
+
+
+def judge_commits(base, head):
+    """The hits for a base and a head commit of a scratch repository, read through git as the workflows read it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(["git", "init", "-q", tmp], check=True, capture_output=True)
+        git_commit(tmp, base, "base")
+        git_commit(tmp, head, "head")
+        return gate_guard.repo_hits(tmp, "HEAD^1", "HEAD")
+
+
 def clean_env(extra=None):
     """The process environment without GitHub Actions variables, plus extra."""
     env = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "GH_"))}
@@ -702,6 +738,173 @@ class RuleDetails(unittest.TestCase):
         [hit] = analyze_text(diff)
         self.assertEqual(hit.path, "test/test_a/test_main.cpp")
 
+    def test_unity_alternative_directive_spellings_fail_closed(self):
+        main = "test/test_a/test_main.cpp"
+        detail = ("Unity test file adds, removes, moves or edits a preprocessor directive, "
+                  "which can turn tests off and which the guard does not evaluate")
+        [hit] = self.hits("flag-fewer-tests-cpp-digraph-directive")
+        self.assertEqual(hit.detail, detail)
+        wrapped = """ void test_a(void) {{}}
+ int main() {{
++{0}
+   RUN_TEST(test_a);
++{1}
+ }}
+"""
+        for opening, closing in (("%:if 0", "%:endif"), ("??=if 0", "??=endif"), ("  %:  if 0", "%: endif"),
+                                 ("/* off */ %:if 0", "%:endif"), ("/* off\n+*/ %:if 0", "%:endif"),
+                                 ("\f#if 0", "\v#endif"), ("#", "# 7 \"x.c\"")):
+            with self.subTest(opening=opening):
+                hits = analyze_text(self.platformio_diff(wrapped.format(opening, closing), main))
+                self.assertTrue(any(detail in h.detail for h in hits), hits)
+        # A trigraph can splice a registration into a comment.
+        [hit] = analyze_text(self.platformio_diff(""" void test_a(void) {}
+ int main() {
++  // the next line is commented out ??/
+   RUN_TEST(test_a);
+ }
+""", main))
+        self.assertEqual(hit.detail, "Unity test file uses a trigraph, which the guard does not translate")
+        # An edit next to an unchanged digraph directive is still fine.
+        self.assertEqual(analyze_text(self.platformio_diff(""" %:include <unity.h>
+ void test_a(void) {}
++void test_b(void) {}
+ int main() {
+   RUN_TEST(test_a);
++  RUN_TEST(test_b);
+ }
+""", main)), [])
+
+    def test_unity_registrations_in_test_headers_are_counted(self):
+        [hit] = self.hits("flag-fewer-tests-cpp-header")
+        self.assertEqual((hit.path, hit.detail), ("firmware/test/test_a/cases.h",
+                                                  "1 fewer test in this file; removed test_controls"))
+        for ext in (".hh", ".hpp", ".hxx", ".inc", ".ipp"):
+            with self.subTest(ext=ext):
+                [hit] = analyze_text(self.platformio_diff(""" void register_cases(void) {
+     RUN_TEST(test_logic);
+-    RUN_TEST(test_controls);
+ }
+""", f"test/test_a/cases{ext}"))
+                self.assertEqual(hit.detail, "1 fewer test in this file; removed test_controls")
+        # A header's tests run only where a source includes it, so a registration
+        # moved from a source into a header does not pair; neither does one moved out.
+        diff = self.platformio_diff(""" #include "cases.h"
+ void test_logic(void) {}
+ int main() {
+-  RUN_TEST(test_logic);
++  register_cases();
+ }
+""", "test/test_a/test_main.cpp") + self.platformio_diff(""" void register_cases(void) {
++  RUN_TEST(test_logic);
+ }
+""", "test/test_a/cases.h")
+        [hit] = analyze_text(diff)
+        self.assertEqual((hit.path, hit.detail), ("test/test_a/test_main.cpp",
+                                                  "1 fewer test in this file; removed test_logic"))
+
+    def test_other_files_in_a_c_test_directory_fail_closed(self):
+        detail = ("changes a file in a C/C++ test directory that is not a C/C++ source or header; a test source "
+                  "may #include it, so the guard cannot count its tests")
+        [hit] = self.hits("flag-fewer-tests-cpp-included-fragment")
+        self.assertEqual((hit.rule, hit.path, hit.detail), ("removed-tests", "firmware/test/test_a/cases.def", detail))
+        source = self.platformio_diff(""" #include <unity.h>
+ int main() {
+ }
+""", "test/test_a/test_main.cpp")
+        for path in ("test/test_a/cases.txt", "test/shared/CASES", "test/test_a/data.json"):
+            with self.subTest(path=path):
+                [hit] = analyze_text(source + self.platformio_diff("-RUN_TEST(test_b);\n", path))
+                self.assertEqual((hit.path, hit.detail), (path, detail))
+        # Outside a test directory that holds C/C++ files, the rule does not apply.
+        self.assertEqual(analyze_text(self.platformio_diff("-a\n+b\n", "tests/fixtures/data.json")), [])
+        # A symbolic link's target is not read, whatever its name.
+        link = ("diff --git a/test/test_a/cases.h b/test/test_a/cases.h\nindex 1b2c3d4..5e6f7a8 120000\n"
+                "--- a/test/test_a/cases.h\n+++ b/test/test_a/cases.h\n@@ -1 +1 @@\n-../../shared/full.h\n"
+                "\\ No newline at end of file\n+../../shared/min.h\n\\ No newline at end of file\n")
+        [hit] = analyze_text(source + link)
+        self.assertEqual((hit.path, hit.detail), ("test/test_a/cases.h", (
+            "changes a symbolic link or submodule in a C/C++ test directory, which the guard does not follow, "
+            "so it cannot count the tests it holds")))
+
+    def test_unity_tests_in_a_platformio_test_dir_are_counted(self):
+        source = "void test_a(void) {}\nvoid test_b(void) {}\nint main() {\n  RUN_TEST(test_a);\n  RUN_TEST(test_b);\n}\n"
+        fewer = source.replace("  RUN_TEST(test_b);\n", "")
+        for config in ("[platformio]\ntest_dir = unit\n", "[env]\nbuild_flags = -DX\n[platformio]\ntest_dir = ./checks/unit\n"):
+            root = config.split("= ")[-1].strip().lstrip("./")
+            with self.subTest(config=config):
+                base = {"fw/platformio.ini": config, f"fw/{root}/test_a/main.cpp": source}
+                [hit] = judge_commits(base, dict(base, **{f"fw/{root}/test_a/main.cpp": fewer}))
+                self.assertEqual(hit.detail, "1 fewer test in this file; removed test_b")
+                [hit] = judge_commits(base, {"fw/platformio.ini": config})
+                self.assertTrue(hit.detail.startswith("test file deleted"), hit)
+                [hit] = judge_commits(base, dict(base, **{f"fw/{root}/test_a/cases.txt": "RUN_TEST(test_c);\n"}))
+                self.assertEqual(hit.path, f"fw/{root}/test_a/cases.txt")
+        # Without test_dir, unit/ is not a test directory.
+        base = {"fw/platformio.ini": "[env:native]\n", "fw/unit/test_a/main.cpp": source}
+        self.assertEqual(judge_commits(base, dict(base, **{"fw/unit/test_a/main.cpp": fewer})), [])
+        base = {"fw/platformio.ini": "[platformio]\ntest_dir = ${PROJECT_DIR}/unit\n"}
+        [hit] = judge_commits(dict(base, **{"src/a.c": "int a;\n"}), dict(base, **{"src/a.c": "int b;\n"}))
+        self.assertIn("test_dir entry ${PROJECT_DIR}/unit reads other values and cannot be resolved", hit.detail)
+
+    def test_unity_has_include_fails_closed_on_added_and_removed_files(self):
+        base = {"test/test_a/test_main.cpp": "#if __has_include(\"skip.h\")\n#else\nRUN_TEST(test_a);\n#endif\n"}
+        hits = judge_commits(base, dict(base, **{"include/skip.h": ""}))
+        detail = ("C/C++ test source test/test_a/test_main.cpp tests whether files exist with __has_include, "
+                  "and this change adds or removes a file")
+        self.assertEqual([(h.path, h.detail) for h in hits], [("include/skip.h", detail)])
+        self.assertEqual(judge_commits(dict(base, **{"src/a.c": "int a;\n"}), dict(base, **{"src/a.c": "int b;\n"})),
+                         [])
+
+    def test_platformio_files_loaded_by_an_unchanged_config_fail_closed(self):
+        [hit] = self.hits("flag-skip-platformio-extra-config-custom")
+        self.assertEqual(hit.path, "firmware/selection.ini")
+        self.assertEqual(hit.detail, "PlatformIO firmware/platformio.ini loads firmware/selection.ini through "
+                                     "extra_configs, and this change edits it")
+        [hit] = self.hits("flag-skip-platformio-extra-config-conf")
+        self.assertEqual((hit.path, hit.detail),
+                         ("firmware/test.conf", "PlatformIO [env:native] test_ignore added: test_controls"))
+        main = "[platformio]\nextra_configs =\n  configs/*.ini\n  extra/**/*.cfg, nested.ini\n[env:native]\n"
+        base = {"platformio.ini": main, "configs/a.ini": "[selection]\nsuites = a, b\n",
+                "extra/deep/x.cfg": "[x]\ny = 1\n", "nested.ini": "[platformio]\nextra_configs = more.txt\n",
+                "more.txt": "[x]\ny = 1\n", "other/tox.ini": "[tox]\nenvlist = py311\n"}
+        for changed, text in (("configs/a.ini", "[selection]\nsuites = a\n"), ("configs/b.ini", "[x]\n"),
+                              ("extra/deep/x.cfg", "[x]\ny = 2\n"), ("more.txt", "[x]\ny = 2\n")):
+            with self.subTest(changed=changed):
+                [hit] = judge_commits(base, dict(base, **{changed: text}))
+                self.assertEqual((hit.rule, hit.path), ("skip-marker", changed))
+                self.assertIn("through extra_configs", hit.detail)
+        deleted = dict(base)
+        del deleted["configs/a.ini"]
+        [hit] = judge_commits(base, deleted)
+        self.assertEqual(hit.path, "configs/a.ini")
+        # A file nothing loads is not a PlatformIO change.
+        self.assertEqual(judge_commits(base, dict(base, **{"other/tox.ini": "[tox]\nenvlist = py312\n"})), [])
+
+    def test_platformio_discovery_that_cannot_complete_fails_closed(self):
+        change = ({"src/a.c": "int a;\n"}, {"src/a.c": "int b;\n"})
+        for value, why in (("${sysenv.CFG}.ini", "cannot be resolved"), ("~/pio.ini", "cannot be resolved"),
+                           ("/etc/pio.ini", "cannot be resolved"), ("../../x.ini", "cannot be resolved"),
+                           ("%(here)s/x.ini", "cannot be resolved")):
+            with self.subTest(value=value):
+                config = {"fw/platformio.ini": f"[platformio]\nextra_configs = {value}\n"}
+                [hit] = judge_commits(dict(config, **change[0]), dict(config, **change[1]))
+                self.assertEqual((hit.rule, hit.path), ("skip-marker", "fw/platformio.ini"))
+                self.assertIn(why, hit.detail)
+        # PlatformIO's glob follows a symbolic link the guard cannot; so does a submodule's path.
+        config = {"platformio.ini": "[platformio]\nextra_configs = shared/*.ini\n", "shared": Link("../common")}
+        [hit] = judge_commits(dict(config, **change[0]), dict(config, **change[1]))
+        self.assertEqual(hit.path, "platformio.ini")
+        self.assertIn("passes through a symbolic link or submodule", hit.detail)
+        for config in ({"platformio.ini": "[env:a]\ntest_filter = a\ntest_filter = b\n"},
+                       {"platformio.ini": "[platformio]\nextra_configs = x.ini\n", "x.ini": Link("y.ini")},
+                       {"platformio.ini": "[platformio]\nextra_configs = x.ini\n", "x.ini": "no section\n"},
+                       {"platformio.ini": "[platformio]\nextra_configs = x.ini\n", "x.ini": b"[a]\nb = \xff\n"}):
+            with self.subTest(config=config):
+                [hit] = judge_commits(dict(config, **change[0]), dict(config, **change[1]))
+                self.assertEqual(hit.rule, "skip-marker")
+                self.assertIn("cannot be read, so the guard cannot tell which files PlatformIO loads", hit.detail)
+
     def test_environment_guard_skip_is_not_a_hit(self):
         details = " ".join(h.detail for h in self.hits("flag-skip-python"))
         self.assertIn("flaky", details)
@@ -937,32 +1140,19 @@ def _trees(diff_text):
 class GitEndToEnd(unittest.TestCase):
     """The CLI diffs two real commits the way the workflow does and reaches the same verdict."""
 
-    def git(self, *args):
-        subprocess.run(["git", "-C", self.root, "-c", "core.autocrlf=false", *args], check=True,
-                       capture_output=True)
-
-    def commit(self, files, message):
-        for p in pathlib.Path(self.root).iterdir():
-            if p.name != ".git":
-                shutil.rmtree(p) if p.is_dir() else p.unlink()
-        for rel, text in files.items():
-            target = pathlib.Path(self.root, rel)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(text.encode("utf-8"))
-        self.git("add", "-A")
-        self.git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", message)
-
     def test_fixtures_through_git(self):
         for name in ["flag-deleted-test-files", "flag-gate-coverage-python", "flag-skip-js",
                      "pass-rename-test-file", "pass-split-test-file", "flag-deleted-test-cpp",
-                     "flag-fewer-tests-cpp", "flag-skip-platformio", "pass-rename-test-file-cpp"]:
+                     "flag-fewer-tests-cpp", "flag-skip-platformio", "pass-rename-test-file-cpp",
+                     "flag-fewer-tests-cpp-digraph-directive", "flag-skip-platformio-extra-config-custom",
+                     "flag-skip-platformio-extra-config-conf", "flag-fewer-tests-cpp-header",
+                     "flag-fewer-tests-cpp-included-fragment"]:
             with self.subTest(fixture=name), tempfile.TemporaryDirectory() as tmp:
-                self.root = tmp
-                self.git("init", "-q")
+                subprocess.run(["git", "init", "-q", tmp], check=True, capture_output=True)
                 text = (FIXTURES / f"{name}.diff").read_text(encoding="utf-8")
                 before, after = _trees(text)
-                self.commit(before, "base")
-                self.commit(after, "head")
+                git_commit(tmp, before, "base")
+                git_commit(tmp, after, "head")
                 code, out = run_main(["--repo-dir", tmp, "--base", "HEAD^1", "--head", "HEAD"])
                 expected = gate_guard.render_summary(analyze_text(text), False,
                                                      "no pull request to read labels from")
