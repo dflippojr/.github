@@ -1,0 +1,29 @@
+# gate-guard fixture: an unchanged platformio.ini loads configs/deep/selection.cfg through configs/**/../selection.cfg
+# expect: skip-marker
+# hits: 1
+#
+# platformio.ini and keep.txt are unchanged. Their all-context hunks give
+# --diff-file the files the workflows read from the base and head trees.
+
+diff --git a/platformio.ini b/platformio.ini
+--- a/platformio.ini
++++ b/platformio.ini
+@@ -1,5 +1,5 @@
+ [platformio]
+ extra_configs = configs/**/../selection.cfg
+ [env:native]
+ platform = native
+ test_filter = ${selection.suites}
+diff --git a/configs/deep/nested/keep.txt b/configs/deep/nested/keep.txt
+--- a/configs/deep/nested/keep.txt
++++ b/configs/deep/nested/keep.txt
+@@ -1,1 +1,1 @@
+ keep
+diff --git a/configs/deep/selection.cfg b/configs/deep/selection.cfg
+index 4b2e1c0..9a7d3f2 100644
+--- a/configs/deep/selection.cfg
++++ b/configs/deep/selection.cfg
+@@ -1,2 +1,2 @@
+ [selection]
+-suites = test_logic, test_controls
++suites = test_logic

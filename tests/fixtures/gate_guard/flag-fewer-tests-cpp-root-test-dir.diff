@@ -1,0 +1,28 @@
+# gate-guard fixture: a RUN_TEST is removed from a suite under test_dir = ., the repository root
+# expect: removed-tests
+# hits: 1
+#
+# platformio.ini is unchanged. Its all-context hunk gives --diff-file the file
+# the workflows read from the base and head trees.
+
+diff --git a/platformio.ini b/platformio.ini
+--- a/platformio.ini
++++ b/platformio.ini
+@@ -1,4 +1,4 @@
+ [platformio]
+ test_dir = .
+ [env:native]
+ platform = native
+diff --git a/test_a/main.cpp b/test_a/main.cpp
+index 7c1d2e3..0f4a5b6 100644
+--- a/test_a/main.cpp
++++ b/test_a/main.cpp
+@@ -1,8 +1,7 @@
+ #include <unity.h>
+ void test_a(void) {}
+ void test_b(void) {}
+ int main(void) {
+     RUN_TEST(test_a);
+-    RUN_TEST(test_b);
+     return 0;
+ }

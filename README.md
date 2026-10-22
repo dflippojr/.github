@@ -50,11 +50,15 @@ turn tests off:
   header, is not the same test. Also flagged: a file the diff does not show
   whole, a trigraph, a macro that uses `RUN_TEST`, a removed registration the
   guard does not count (Unity fixture, GoogleTest, doctest, Catch2), and, in a
-  test directory that holds C/C++ files, any changed file that is not a source
-  or header (a test source may `#include` it) and any changed symbolic link or
-  submodule. When a test source uses `__has_include`, adding or removing any
-  file is a hit. A directory a PlatformIO `test_dir` option names counts as a
-  test directory.
+  test directory that holds C/C++ files, any changed file that is not a C/C++
+  source or header, whatever its extension (a test source may `#include` it).
+  In a repository with C/C++ files, any symbolic link or submodule at or in a
+  test directory is a hit, changed or not. When any file in a C/C++ test
+  directory may test whether a file exists (`__has_include` after line
+  splicing, token pasting with `##` or `%:%:`, a trigraph, or a file the guard
+  cannot read), adding or removing any file is a hit. A directory a PlatformIO
+  `test_dir` option names counts as a test directory, `test_dir = .` making
+  the whole project one.
 - **platformio.ini.** Any change to a `test_*` option (`test_filter`,
   `test_ignore`, `test_dir`, `test_framework`, `test_build_src`, ...) or an
   `extends` option, in any section, is a `skip-marker` hit, even one that runs
@@ -65,12 +69,13 @@ turn tests off:
   file that reads as PlatformIO's.
 - **extra_configs.** The guard reads every `platformio.ini` in the base and
   head trees, expands their `extra_configs` globs (and those of the files they
-  load) from the project directory, and flags any change to a loaded file,
-  whatever its name, sections or content. It fails closed, flagging every pull
-  request, when it cannot finish: a config it cannot read, or an entry that
-  references other values, leaves the repository or passes through a symbolic
-  link or submodule. With `--diff-file` it reads only the files the diff shows;
-  both workflows read the trees.
+  load) from the project directory, ignoring case, and flags any change to a
+  loaded file, whatever its name, sections or content. It fails closed,
+  flagging every pull request, when it cannot finish: a config it cannot read,
+  or an `extra_configs` or `test_dir` entry that references other values,
+  leaves the repository, has a `..` component, has a bracket expression with a
+  slash, or passes through a symbolic link or submodule. With `--diff-file` it
+  reads only the files the diff shows; both workflows read the trees.
 
 A test renamed in place or moved to another file, a renamed test file, and a
 skip marker that moves with its test are not hits. The job fails on any hit

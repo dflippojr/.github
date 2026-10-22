@@ -1,0 +1,27 @@
+# gate-guard fixture: a RUN_TEST is deleted from cases.md, which the unchanged test source #includes
+# expect: removed-tests
+# hits: 1
+#
+# test_main.cpp is unchanged. Its all-context hunk gives --diff-file the file
+# the workflows read from the base and head trees.
+
+diff --git a/test/test_a/test_main.cpp b/test/test_a/test_main.cpp
+--- a/test/test_a/test_main.cpp
++++ b/test/test_a/test_main.cpp
+@@ -1,9 +1,9 @@
+ #include <unity.h>
+
+ void test_logic(void) {}
+ void test_controls(void) {}
+
+ int main(void) {
+ #include "cases.md"
+     return 0;
+ }
+diff --git a/test/test_a/cases.md b/test/test_a/cases.md
+index 3c9e0a2..f18b6d7 100644
+--- a/test/test_a/cases.md
++++ b/test/test_a/cases.md
+@@ -1,2 +1,1 @@
+ RUN_TEST(test_logic);
+-RUN_TEST(test_controls);

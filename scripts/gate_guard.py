@@ -364,8 +364,8 @@ C_DIRECTIVE = re.compile(r"^[ \t\f\v]*(#|%:|\?\?=)[ \t\f\v]*([A-Za-z_]\w*)?(.*)$
 C_TRIGRAPH = re.compile(r"\?\?[=/'()!<>\-]")
 # Headers are not test modules, but they can register tests and turn tests off.
 C_HEADER_EXTS = {".h", ".hh", ".hpp", ".hxx", ".inc", ".ipp"}
-# Files in a C/C++ test directory that no test source would #include.
-C_TEST_DIR_KNOWN_EXTS = CODE_EXTS | C_HEADER_EXTS | {".md", ".markdown", ".rst", ".adoc"}
+# The only files in a C/C++ test directory the guard reads; a test source can #include any other.
+C_TEST_DIR_KNOWN_EXTS = C_EXTS | C_HEADER_EXTS
 # directives are (name, text, (first, last) physical line) for each preprocessor directive.
 UnityScan = collections.namedtuple("UnityScan", "items directives others")
 
@@ -491,7 +491,7 @@ def _directive_changed(fd, old, new):
 
 def _c_test_source(fd, roots=()):
     """A C/C++ source or header under a test directory."""
-    return any(_ext(p) in C_EXTS | C_HEADER_EXTS and _test_dir(p, roots) for p in fd.paths)
+    return any(_ext(p) in C_EXTS | C_HEADER_EXTS and _test_dir(p, roots) is not None for p in fd.paths)
 
 
 def _c_test_module(path, roots=()):
@@ -632,25 +632,29 @@ def _decrease(removed, added):
 def _c_test_dir_hits(files, facts):
     """Changes the guard cannot count in a test directory that holds C/C++ files.
 
-    A test source can #include any file, so a changed file there that is not
-    a C/C++ source or header is a hit, and so is a symbolic link or submodule,
-    whose target the guard does not read. A test source that tests for a file
-    with __has_include can turn tests off when any file is added or removed.
+    A test source can #include any file, whatever its extension, so a changed
+    file there that is not a C/C++ source or header the guard counts is a hit.
+    So is any symbolic link or submodule at or in a test directory, changed
+    or not, whose target the guard does not read (facts.blind). A test file
+    that may test for a file with __has_include can turn tests off when any
+    file is added or removed.
     """
-    hits = []
+    hits = [Hit("removed-tests", path, None, "a symbolic link or submodule at or in a test directory, in a repository "
+                "with C/C++ files; the guard does not follow it, so it cannot count the tests it holds")
+            for path in facts.blind]
     for fd in files:
         if fd.status == "modified" and not fd.changed() and not fd.binary and not fd.modes & LINK_MODES:
             continue
+        if fd.path in facts.blind:
+            continue
         in_dir = [p for p in fd.paths if _test_dir(p, facts.test_roots) in facts.c_test_dirs]
-        if in_dir and fd.modes & LINK_MODES:
-            hits.append(Hit("removed-tests", fd.path, None, "changes a symbolic link or submodule in a C/C++ test "
-                            "directory, which the guard does not follow, so it cannot count the tests it holds"))
-        elif any(_ext(p) not in C_TEST_DIR_KNOWN_EXTS for p in in_dir):
+        if any(_ext(p) not in C_TEST_DIR_KNOWN_EXTS for p in in_dir):
             hits.append(Hit("removed-tests", fd.path, None, "changes a file in a C/C++ test directory that is not a "
                             "C/C++ source or header; a test source may #include it, so the guard cannot count its tests"))
         elif facts.has_include and fd.status != "modified":
-            hits.append(Hit("removed-tests", fd.path, None, f"C/C++ test source {facts.has_include[0]} tests whether "
-                            "files exist with __has_include, and this change adds or removes a file"))
+            hits.append(Hit("removed-tests", fd.path, None, f"C/C++ test file {facts.has_include[0]} may test whether "
+                            "files exist (__has_include, token pasting, a trigraph or an unreadable file), and this "
+                            "change adds or removes a file"))
     return hits
 
 
@@ -1172,13 +1176,23 @@ class GitTrees:
 # loaded: {path: the platformio.ini that loads it through extra_configs, on either side};
 # problems: [(path, detail)] where discovery could not complete; test_roots: the
 # directories PlatformIO's test_dir options name, lowercased; c_test_dirs: test
-# directories that hold C/C++ files; has_include: C/C++ test files that use __has_include.
-TreeFacts = collections.namedtuple("TreeFacts", "loaded problems test_roots c_test_dirs has_include")
+# directories that hold C/C++ files; has_include: files in them that may test
+# whether a file exists; blind: symbolic links and submodules at or in a test
+# directory, in a repository with C/C++ files.
+TreeFacts = collections.namedtuple("TreeFacts", "loaded problems test_roots c_test_dirs has_include blind")
 PIO_CANNOT_TELL = "so the guard cannot tell which files PlatformIO loads"
+# What a file may use to test whether a file exists: __has_include (and
+# __has_include_next), or a name the guard cannot read whole, pasted with ##
+# or %:%:, or spelled with a trigraph. Lines are spliced first.
+C_EXISTS_TEST = re.compile(r"__has_include|##|%:%:|\?\?[=/'()!<>\-]")
 
 
 def _pio_glob(pattern):
-    """A regex for PlatformIO's glob.glob(pattern, recursive=True). It matches dot files too, which only adds hits."""
+    """A regex that matches at least what PlatformIO's glob.glob(pattern, recursive=True) does.
+
+    It ignores case, as the file system may, matches dot files, and lets a
+    bracket expression match any one character, all of which only add hits.
+    """
     out, i = [], 0
     while i < len(pattern):
         if pattern.startswith("**/", i):
@@ -1191,32 +1205,44 @@ def _pio_glob(pattern):
             out.append("[^/]*" if pattern[i] == "*" else "[^/]")
             i += 1
         elif pattern[i] == "[" and "]" in pattern[i + 2:]:
-            end = pattern.index("]", i + 2)
-            body = pattern[i + 1:end]
-            out.append("[" + ("^" + body[1:] if body.startswith("!") else body).replace("\\", "\\\\") + "]")
-            i = end + 1
+            out.append("[^/]")
+            i = pattern.index("]", i + 2) + 1
         else:
             out.append(re.escape(pattern[i]))
             i += 1
-    return re.compile("".join(out) + r"\Z")
+    return re.compile("".join(out) + r"\Z", re.IGNORECASE)
 
 
 def _pio_unresolvable(item):
-    """Why an extra_configs entry cannot be matched against the repository, or None."""
+    """Why an extra_configs or test_dir entry cannot be matched against the repository's paths, or None.
+
+    The guard matches an entry as written; it does not resolve a reference, a
+    parent directory, which glob applies after wildcards and links, or a
+    bracket expression that spans directories.
+    """
     if "$" in item or "%" in item or "\\" in item:
         return "reads other values"
     if item.startswith(("~", "/")) or re.match(r"[A-Za-z]:", item):
         return "is outside the repository"
+    if ".." in item.split("/"):
+        return "traverses a parent directory"
+    if re.search(r"\[[^\]]*/", item):
+        return "has a bracket expression with a slash"
     return None
 
 
 def _pio_path(config, option, item, project):
     """(the repository path an extra_configs or test_dir entry names, None) or (None, a problem detail)."""
-    path = posixpath.normpath(posixpath.join(project, item))
-    why = _pio_unresolvable(item) or ("is outside the repository" if path.split("/")[0] == ".." else None)
+    why = _pio_unresolvable(item)
     if why:
         return None, f"PlatformIO {config} {option} entry {item} {why} and cannot be resolved, {PIO_CANNOT_TELL}"
-    return path, None
+    return posixpath.normpath(posixpath.join(project, item)), None
+
+
+def _through_link(path, links):
+    """Whether path is, or is under, a symbolic link or submodule; the guard does not follow them."""
+    path = path.lower()
+    return any(path == link.lower() or path.startswith(link.lower() + "/") for link in links)
 
 
 def _pio_options(trees, side, config, problems):
@@ -1232,10 +1258,13 @@ def _pio_options(trees, side, config, problems):
         return None
 
 
-def _pio_test_roots(config, options, project, roots, problems):
+def _pio_test_roots(config, options, project, links, roots, problems):
     """Add the directories config's test_dir options name, when the guard's test directory names miss them."""
     for item in (v.strip() for section in options.values() for o, v in section.items() if o == "test_dir"):
         root, problem = _pio_path(config, "test_dir", item or ".", project)
+        if root is not None and _through_link(root, links):
+            problem = (f"PlatformIO {config} test_dir entry {item} passes through a symbolic link or submodule, "
+                       "which the guard does not follow, so it cannot tell which tests PlatformIO runs")
         if problem:
             problems.append((config, problem))
         elif root.split("/")[-1].lower() not in TEST_DIRS:
@@ -1280,7 +1309,7 @@ def _pio_includes(trees, side, loaded, problems, roots):
             options = _pio_options(trees, side, config, problems)
             if options is None:
                 continue
-            _pio_test_roots(config, options, project, roots, problems)
+            _pio_test_roots(config, options, project, links, roots, problems)
             regexes = _pio_globs(config, options, project, links, problems)
             found = list(dict.fromkeys(p for r in regexes for p in paths if r.match(p) and p != main))
             for path in found:
@@ -1289,18 +1318,29 @@ def _pio_includes(trees, side, loaded, problems, roots):
             seen.update(found)
 
 
+def _may_test_existence(text):
+    """Whether a file may test whether a file exists, as C_EXISTS_TEST reads it; an unreadable file may."""
+    return text is None or bool(C_EXISTS_TEST.search(re.sub(r"\\\r?\n", "", text)))
+
+
 def tree_facts(trees):
     """The TreeFacts of a base and head tree; see TreeFacts."""
-    loaded, problems, roots, c_test_dirs, has_include = {}, [], set(), set(), []
+    loaded, problems, roots, c_test_dirs, has_include, blind = {}, [], set(), set(), [], []
     for side in ("-", "+"):
         _pio_includes(trees, side, loaded, problems, roots)
-    for side in ("-", "+"):
-        for path in trees.paths(side):
-            if _ext(path) in C_EXTS | C_HEADER_EXTS and _test_dir(path, roots) is not None:
-                c_test_dirs.add(_test_dir(path, roots))
-                if "__has_include" in (trees.read(side, path) or "") and path not in has_include:
-                    has_include.append(path)
-    return TreeFacts(loaded, list(dict.fromkeys(problems)), frozenset(roots), c_test_dirs, has_include)
+    sides = [(side, path) for side in ("-", "+") for path in trees.paths(side)]
+    for _, path in sides:
+        if _ext(path) in C_EXTS | C_HEADER_EXTS and _test_dir(path, roots) is not None:
+            c_test_dirs.add(_test_dir(path, roots))
+    for side, path in sides:
+        if _test_dir(path, roots) in c_test_dirs and path not in has_include and _may_test_existence(
+                trees.read(side, path)):
+            has_include.append(path)
+    if any(_ext(path) in C_EXTS | C_HEADER_EXTS for _, path in sides):
+        for link in (l for side in ("-", "+") for l in trees.links(side)):
+            if (_test_dir(link, roots) is not None or link.split("/")[-1].lower() in TEST_DIRS) and link not in blind:
+                blind.append(link)
+    return TreeFacts(loaded, list(dict.fromkeys(problems)), frozenset(roots), c_test_dirs, has_include, blind)
 
 
 def repo_hits(repo_dir, base, head):
