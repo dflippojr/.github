@@ -1,0 +1,24 @@
+# gate-guard fixture: an unchanged platformio.ini loads configs/a.cfg through configs/[!]].cfg, and a.cfg narrows a filter
+# expect: skip-marker
+# hits: 1
+#
+# platformio.ini is unchanged. Its all-context hunk gives --diff-file the file
+# the workflows read from the base and head trees.
+
+diff --git a/platformio.ini b/platformio.ini
+--- a/platformio.ini
++++ b/platformio.ini
+@@ -1,5 +1,5 @@
+ [platformio]
+ extra_configs = configs/[!]].cfg
+ [env:native]
+ platform = native
+ test_filter = ${selection.suites}
+diff --git a/configs/a.cfg b/configs/a.cfg
+index 4b2e1c0..9a7d3f2 100644
+--- a/configs/a.cfg
++++ b/configs/a.cfg
+@@ -1,2 +1,2 @@
+ [selection]
+-suites = test_logic, test_controls
++suites = test_logic

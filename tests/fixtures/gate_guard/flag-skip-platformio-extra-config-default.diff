@@ -1,7 +1,18 @@
 # gate-guard fixture: an ini file that an unchanged platformio.ini loads through extra_configs gives every env a test_filter in [env]
 # expect: skip-marker
 # hits: 1
+#
+# platformio.ini is unchanged. Its all-context hunk gives --diff-file the file
+# the workflows read from the base and head trees.
 
+diff --git a/firmware/platformio.ini b/firmware/platformio.ini
+--- a/firmware/platformio.ini
++++ b/firmware/platformio.ini
+@@ -1,4 +1,4 @@
+ [platformio]
+ extra_configs = test.ini
+ [env:native]
+ platform = native
 diff --git a/firmware/test.ini b/firmware/test.ini
 index 7d3a9e0..2b8f6c1 100644
 --- a/firmware/test.ini

@@ -1,0 +1,28 @@
+# gate-guard fixture: a new test/test_a/features.h shadows include/features.h and compiles test_a out
+# expect: removed-tests
+# hits: 1
+#
+# test_main.cpp is unchanged. Its all-context hunk gives --diff-file the file
+# the workflows read from the base and head trees.
+
+diff --git a/test/test_a/test_main.cpp b/test/test_a/test_main.cpp
+--- a/test/test_a/test_main.cpp
++++ b/test/test_a/test_main.cpp
+@@ -1,10 +1,10 @@
+ #include <unity.h>
+ #include "features.h"
+ void test_a(void) {}
+ void test_b(void) {}
+ int main(void) {
+ #if ENABLE_A
+     RUN_TEST(test_a);
+ #endif
+     RUN_TEST(test_b);
+ }
+diff --git a/test/test_a/features.h b/test/test_a/features.h
+new file mode 100644
+index 0000000..4c9d2e1
+--- /dev/null
++++ b/test/test_a/features.h
+@@ -0,0 +1 @@
++#define ENABLE_A 0

@@ -1,0 +1,37 @@
+# gate-guard fixture: a Unity test file renamed as-is and one renamed with a small edit; two C/C++ test files changed
+# expect: removed-tests
+# hits: 2
+
+diff --git a/firmware/test/test_controls/test_main.cpp b/firmware/test/test_input/test_main.cpp
+similarity index 100%
+rename from firmware/test/test_controls/test_main.cpp
+rename to firmware/test/test_input/test_main.cpp
+diff --git a/firmware/test/test_logic/test_main.cpp b/firmware/test/test_math/test_main.cpp
+similarity index 87%
+rename from firmware/test/test_logic/test_main.cpp
+rename to firmware/test/test_math/test_main.cpp
+index ffbb337..529baae 100644
+--- a/firmware/test/test_logic/test_main.cpp
++++ b/firmware/test/test_math/test_main.cpp
+@@ -1,20 +1,20 @@
+ #include <unity.h>
+ #include "logic.h"
+ 
+ void setUp(void) {}
+ void tearDown(void) {}
+ 
+ void test_clamp_low(void) {
+     TEST_ASSERT_EQUAL(0, clamp(-5, 0, 10));
+ }
+ 
+ void test_clamp_high(void) {
+-    TEST_ASSERT_EQUAL(10, clamp(50, 0, 10));
++    TEST_ASSERT_EQUAL(10, clamp(500, 0, 10));
+ }
+ 
+ int main(int argc, char **argv) {
+     UNITY_BEGIN();
+     RUN_TEST(test_clamp_low);
+     RUN_TEST(test_clamp_high);
+     return UNITY_END();
+ }

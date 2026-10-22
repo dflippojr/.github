@@ -1,5 +1,5 @@
 # gate-guard fixture: a RUN_TEST is removed from a suite under test_dir = ., the repository root
-# expect: removed-tests
+# expect: skip-marker
 # hits: 1
 #
 # platformio.ini is unchanged. Its all-context hunk gives --diff-file the file

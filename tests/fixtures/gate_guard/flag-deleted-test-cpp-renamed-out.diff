@@ -1,0 +1,8 @@
+# gate-guard fixture: a Unity suite is moved unchanged out of the test directory, so PlatformIO no longer runs it
+# expect: removed-tests
+# hits: 1
+
+diff --git a/test/test_controls/test_main.cpp b/archive/test_controls/test_main.cpp
+similarity index 100%
+rename from test/test_controls/test_main.cpp
+rename to archive/test_controls/test_main.cpp
