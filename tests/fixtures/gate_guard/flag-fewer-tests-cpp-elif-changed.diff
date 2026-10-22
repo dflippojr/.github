@@ -1,0 +1,34 @@
+# gate-guard fixture: an earlier #elif turns on, so the #else around a RUN_TEST no longer runs
+# expect: removed-tests
+# hits: 1
+
+diff --git a/firmware/test/test_controls/test_main.cpp b/firmware/test/test_controls/test_main.cpp
+index 1a2b3c4..5d6e7f8 100644
+--- a/firmware/test/test_controls/test_main.cpp
++++ b/firmware/test/test_controls/test_main.cpp
+@@ -1,24 +1,24 @@
+ #include <unity.h>
+ #include "controls.h"
+ 
+ void setUp(void) {}
+ void tearDown(void) {}
+ 
+ void test_button_press(void) {
+     TEST_ASSERT_EQUAL(1, button_state(1));
+ }
+ 
+ void test_button_release(void) {
+     TEST_ASSERT_EQUAL(0, button_state(0));
+ }
+ 
+ int main(int argc, char **argv) {
+     UNITY_BEGIN();
+ #if 0
+-#elif 0
++#elif 1
+ #else
+     RUN_TEST(test_button_press);
+ #endif
+     RUN_TEST(test_button_release);
+     return UNITY_END();
+ }

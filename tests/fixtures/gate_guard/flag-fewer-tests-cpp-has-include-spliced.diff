@@ -1,0 +1,22 @@
+# gate-guard fixture: an empty skip.h is added, which an unchanged test source tests for with a spliced __has_include
+# expect: removed-tests
+# hits: 1
+#
+# test_main.cpp is unchanged. Its all-context hunk gives --diff-file the file
+# the workflows read from the base and head trees.
+
+diff --git a/test/test_a/test_main.cpp b/test/test_a/test_main.cpp
+--- a/test/test_a/test_main.cpp
++++ b/test/test_a/test_main.cpp
+@@ -1,8 +1,8 @@
+ #include <unity.h>
+ void test_a(void) {}
+ int main(void) {
+ #if !__has_\
+ include("skip.h")
+   RUN_TEST(test_a);
+ #endif
+ }
+diff --git a/test/test_a/skip.h b/test/test_a/skip.h
+new file mode 100644
+index 0000000..e69de29

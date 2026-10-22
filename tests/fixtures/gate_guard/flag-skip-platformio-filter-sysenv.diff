@@ -1,0 +1,17 @@
+# gate-guard fixture: a test_filter reads an environment variable, whose value the guard cannot see, and the value around it changes
+# expect: skip-marker
+# hits: 1
+
+diff --git a/firmware/platformio.ini b/firmware/platformio.ini
+index 8e4b2d6..1a7c3f0 100644
+--- a/firmware/platformio.ini
++++ b/firmware/platformio.ini
+@@ -1,7 +1,7 @@
+ [platformio]
+ default_envs = native
+ 
+ [env:native]
+ platform = native
+ test_framework = unity
+-test_filter = ${sysenv.TEST_SUITES}
++test_filter = ${sysenv.TEST_SUITES}, test_soak

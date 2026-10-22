@@ -1,0 +1,13 @@
+# gate-guard fixture: a RUN_TEST registration is deleted from a header that the unchanged test source includes
+# expect: removed-tests
+# hits: 1
+
+diff --git a/firmware/test/test_a/cases.h b/firmware/test/test_a/cases.h
+index 0b6c2d1..7e3a9f4 100644
+--- a/firmware/test/test_a/cases.h
++++ b/firmware/test/test_a/cases.h
+@@ -1,4 +1,3 @@
+ void register_cases(void) {
+     RUN_TEST(test_logic);
+-    RUN_TEST(test_controls);
+ }

@@ -1,0 +1,25 @@
+# gate-guard fixture: a harmless #include is added to a Unity test file; any preprocessor edit there fails closed
+# expect: removed-tests
+# hits: 1
+
+diff --git a/firmware/test/test_logic/test_main.cpp b/firmware/test/test_logic/test_main.cpp
+index 1a2b3c4..5d6e7f8 100644
+--- a/firmware/test/test_logic/test_main.cpp
++++ b/firmware/test/test_logic/test_main.cpp
+@@ -1,15 +1,16 @@
+ #include <unity.h>
++#include <string.h>
+ #include "logic.h"
+ 
+ void setUp(void) {}
+ void tearDown(void) {}
+ 
+ void test_clamp_low(void) {
+     TEST_ASSERT_EQUAL(0, clamp(-5, 0, 10));
+ }
+ 
+ int main(int argc, char **argv) {
+     UNITY_BEGIN();
+     RUN_TEST(test_clamp_low);
+     return UNITY_END();
+ }

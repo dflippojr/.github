@@ -1,0 +1,25 @@
+# gate-guard fixture: a test_ignore reaches another section's option through two references, and that option gains an entry
+# expect: skip-marker
+# hits: 1
+
+diff --git a/firmware/platformio.ini b/firmware/platformio.ini
+index 0a9c4d1..e6b2f75 100644
+--- a/firmware/platformio.ini
++++ b/firmware/platformio.ini
+@@ -1,16 +1,16 @@
+ [platformio]
+ default_envs = native
+ 
+ [suites]
+-slow = test_soak
++slow = test_soak test_controls
+ 
+ [common]
+ skipped = ${suites.slow}
+ 
+ [env:native]
+ platform = native
+ test_framework = unity
+ test_ignore = ${common.skipped}
+ build_flags = -std=gnu++17
+ 

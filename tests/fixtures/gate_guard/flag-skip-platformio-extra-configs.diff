@@ -1,0 +1,21 @@
+# gate-guard fixture: platformio.ini loads extra_configs the diff does not show, so a change to an option they may read is flagged
+# expect: skip-marker
+# hits: 1
+
+diff --git a/firmware/platformio.ini b/firmware/platformio.ini
+index e7a1b4c..36d0f92 100644
+--- a/firmware/platformio.ini
++++ b/firmware/platformio.ini
+@@ -1,11 +1,11 @@
+ [platformio]
+ default_envs = native
+ extra_configs = test.ini
+ 
+ [selection]
+-suites = test_logic, test_controls
++suites = test_logic
+ 
+ [env:native]
+ platform = native
+ test_framework = unity
+ build_flags = -std=gnu++17

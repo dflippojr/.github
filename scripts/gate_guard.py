@@ -10,7 +10,10 @@ Reads the pull request's unified diff and reports each hit:
                    rule disabled, or a size or performance budget raised
 
 Moved lines are not hits: a test renamed or moved to another file, or a skip
-marker that moves with its test, cancels out. Exit status is 0 when there are
+marker that moves with its test, cancels out. A repository with a
+platformio.ini or a C/C++ source or header fails closed instead: any change
+that could change which tests run or what they include is a hit, whatever its
+content (see c_cpp_hits and platformio_hits). Exit status is 0 when there are
 no hits or the pull request carries the gate-change-approved label, 1 when
 there are unapproved hits, and 2 when the diff cannot be read. Only the
 standard library is used, and only the GitHub API is contacted, to read the
@@ -34,7 +37,9 @@ one notice annotation states the verdict for pr_body_lint.py.
 """
 import argparse
 import base64
+import bisect
 import collections
+import configparser
 import datetime
 import json
 import os
@@ -73,6 +78,13 @@ class FileDiff:
         self.new_path = new_path
         self.status = "modified"
         self.lines = []
+        # (old start, new start) of each hunk, whether git called the file binary,
+        # the modes its header names (120000 is a symbolic link, 160000 a submodule),
+        # and whether its mode changed.
+        self.hunks = []
+        self.binary = False
+        self.modes = set()
+        self.mode_changed = False
 
     @property
     def path(self):
@@ -88,6 +100,7 @@ class FileDiff:
 
 # ---------------------------------------------------------------- diff parsing
 
+LINK_MODES = {"120000", "160000"}
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
@@ -164,6 +177,10 @@ def parse_diff(text):
             continue
         if cur is None:
             continue
+        if line.startswith(("new file mode ", "deleted file mode ", "old mode ", "new mode ", "index ")):
+            cur.modes.add(line.split()[-1])
+        if line.startswith("old mode "):
+            cur.mode_changed = True
         if line.startswith("new file mode"):
             cur.status = "added"
         elif line.startswith("deleted file mode"):
@@ -180,10 +197,13 @@ def parse_diff(text):
             cur.new_path = _strip_prefix(line[4:], "b/")
             if cur.new_path is None:
                 cur.status = "deleted"
+        elif line.startswith(("Binary files ", "GIT binary patch")):
+            cur.binary = True
         else:
             m = HUNK_RE.match(line)
             if m:
                 old_no, new_no = int(m.group(1)), int(m.group(3))
+                cur.hunks.append((old_no, new_no))
                 old_left = int(m.group(2)) if m.group(2) is not None else 1
                 new_left = int(m.group(4)) if m.group(4) is not None else 1
     for fd in files:
@@ -200,6 +220,7 @@ DOC_EXTS = {".md", ".markdown", ".rst", ".txt", ".adoc", ".diff", ".patch"}
 PY_EXTS = {".py"}
 JS_EXTS = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"}
 JVM_EXTS = {".java", ".kt", ".groovy", ".scala"}
+C_EXTS = {".c", ".cc", ".cpp", ".cxx"}
 CODE_EXTS = PY_EXTS | JS_EXTS | JVM_EXTS | {
     ".rs", ".go", ".cs", ".rb", ".php", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp",
     ".vue", ".svelte", ".sh", ".ps1"}
@@ -235,7 +256,7 @@ def is_test_module(path):
         return name.endswith("_test.go")
     if ext in JVM_EXTS:
         return bool(re.search(r"(tests?|it|spec)\.[^.]+$", name))
-    if ext == ".rs":
+    if ext == ".rs" or ext in C_EXTS:
         return _in_test_dir(path)
     return False
 
@@ -315,6 +336,23 @@ JVM_MARK = re.compile(
 JVM_NAME = re.compile(r"\b(?:void|fun)\s+(`[^`]+`|\w+)\s*\(")
 RS_MARK = re.compile(r"^\s*#\[(?:[\w:]+::)?test\b")
 RS_NAME = re.compile(r"\bfn\s+(\w+)")
+# Unity registers a test with RUN_TEST(name) and defines it as void test_name(void).
+# Both are read from the whole file, once comments and literals are blanked, so
+# a call may span lines and a line may hold several. The count only names what
+# a change removed: any change to a test directory of a C/C++ repository is a
+# hit anyway (see c_cpp_hits).
+UNITY_RUN = re.compile(r"\bRUN_TEST\s*\(\s*(\w+)")
+UNITY_DEF = re.compile(r"\bvoid\s+(test_\w*)\s*\(\s*(?:void\s*)?\)(?!\s*;)")
+# A comment, or a raw, string or character literal. A quote after a word
+# character is a digit separator, not a literal.
+C_LEXEME = re.compile(
+    r"//[^\n]*|/\*.*?(?:\*/|\Z)"
+    r"|(?<!\w)(?:u8|[uUL])?R\"([^()\\\s]{0,16})\(.*?(?:\)\1\"|\Z)"
+    r"|(?:(?<!\w)(?:u8|[uUL]))?\"(?:\\.|[^\"\\\n])*\"?"
+    r"|(?<!\w)(?:u8|[uUL])?'(?:\\.|[^'\\\n])*'", re.S)
+C_HEADER_EXTS = {".h", ".hh", ".hpp", ".hxx", ".inc", ".ipp"}
+# Files that can be C/C++ sources or headers. A header needs no extension (<vector>).
+C_FILE_EXTS = C_EXTS | C_HEADER_EXTS | {".c++", ".cp", ".h++", ".tpp", ".tcc", ".inl", ".ino", ".pde", ".s", ""}
 
 
 def _line_defs(fd, regex, group):
@@ -324,6 +362,54 @@ def _line_defs(fd, regex, group):
         if m:
             (removed if l.kind == "-" else added).append((m.group(group), l.old or l.new))
     return removed, added
+
+
+def _c_blank(text):
+    """text with lines spliced as the C preprocessor splices them, and comments and literals blanked."""
+    text = text.replace("\\\n", "")
+    out, pos = [], 0
+    for m in C_LEXEME.finditer(text):
+        lines = "\n" * m.group(0).count("\n")
+        out += [text[pos:m.start()], " " + lines if m.group(0).startswith(("//", "/*")) else '""' + lines]
+        pos = m.end()
+    return "".join(out + [text[pos:]])
+
+
+def _unity_items(text):
+    """(name, line, kind) for each RUN_TEST registration ("run") and test definition ("def") in one side of a file."""
+    blank = _c_blank(text)
+    starts = [0] + [i + 1 for i, c in enumerate(blank) if c == "\n"]
+    items = [(m.group(1), bisect.bisect_right(starts, m.start()), kind)
+             for kind, regex in (("run", UNITY_RUN), ("def", UNITY_DEF)) for m in regex.finditer(blank)]
+    return sorted(items, key=lambda d: d[1])
+
+
+def _whole_sides(fd):
+    """(old text, new text) of fd, or None when the diff does not show the whole file.
+
+    git_diff asks for full context, so a changed file is one hunk from line 1.
+    A file with no hunk is empty, or renamed or re-moded without a change.
+    """
+    if fd.binary or len(fd.hunks) > 1 or any(start > 1 for hunk in fd.hunks for start in hunk):
+        return None
+    return _side_text(fd, "-"), _side_text(fd, "+")
+
+
+def _side_text(fd, side):
+    """One side of a file, rebuilt from the diff, which carries the whole file (git_diff asks for full context)."""
+    return "".join(l.text + "\n" for l in fd.lines if l.kind in (" ", side))
+
+
+def _unity_defs(fd):
+    """Unity registrations and definitions one side of the whole file has more of than the other.
+
+    The kind keeps an edit to a definition from cancelling the removal of its
+    registration; removed_test_hits counts a test's two kinds once, by name.
+    """
+    sides = _whole_sides(fd)
+    if sides is None:
+        return [], []
+    return _cancel_pairs(*(_unity_items(text) for text in sides), key=_def_key)
 
 
 def _marker_defs(fd, marker, name_re):
@@ -366,12 +452,45 @@ def test_defs(fd):
         return _marker_defs(fd, JVM_MARK, JVM_NAME)
     if ext == ".rs":
         return _marker_defs(fd, RS_MARK, RS_NAME)
+    if ext in C_EXTS | C_HEADER_EXTS and any(_in_test_dir(p) for p in fd.paths):
+        return _unity_defs(fd)
     return [], []
 
 
 def _names(defs, limit=5):
-    names = [n if n is not None else f"test at line {line}" for n, line in defs]
+    names = [d[0] if d[0] is not None else f"test at line {d[1]}" for d in defs]
     return ", ".join(names[:limit]) + (f" and {len(names) - limit} more" if len(names) > limit else "")
+
+
+def _def_key(d):
+    """Identity of a definition in its file: its name, and for Unity whether it is
+    a registration or a definition."""
+    return (d[0], *d[2:3])
+
+
+def _by_name(defs):
+    """Unity items named once, a test's registration and definition together."""
+    seen = set()
+    out = []
+    for d in defs:
+        if len(d) > 2:
+            if d[0] in seen:
+                continue
+            seen.add(d[0])
+        out.append(d)
+    return out
+
+
+def _decrease(removed, added):
+    """How many fewer tests a file has. Unity registrations and definitions are
+    counted apart, so a new test that is never registered does not offset a
+    registration that was removed, and a test removed whole counts once."""
+    if not any(len(d) > 2 for d in removed + added):
+        return len(removed) - len(added)
+
+    def fewer(kind):
+        return sum(d[2] == kind for d in removed) - sum(d[2] == kind for d in added)
+    return max(fewer("run"), fewer("def"), 0)
 
 
 def removed_test_hits(files):
@@ -380,29 +499,29 @@ def removed_test_hits(files):
     for fd in files:
         removed, added = test_defs(fd)
         # A test removed and re-added in the same file was edited, not removed.
-        left[id(fd)] = list(_cancel_pairs(removed, added, key=lambda d: d[0]))
+        left[id(fd)] = list(_cancel_pairs(removed, added, key=_def_key))
     # A test removed from one file and added to another was moved.
     pool = collections.defaultdict(list)
     for fd in files:
         for d in left[id(fd)][1]:
             if d[0] is not None:
-                pool[d[0]].append((id(fd), d))
+                pool[_def_key(d)].append((id(fd), d))
     for fd in files:
         removed = left[id(fd)][0]
         kept = []
         for d in removed:
-            match = next((i for i, (owner, _) in enumerate(pool.get(d[0], [])) if owner != id(fd)), None)
+            match = next((i for i, (owner, _) in enumerate(pool.get(_def_key(d), [])) if owner != id(fd)), None)
             if match is None:
                 kept.append(d)
                 continue
-            owner, added = pool[d[0]].pop(match)
+            owner, added = pool[_def_key(d)].pop(match)
             left[owner][1].remove(added)
         left[id(fd)][0] = kept
 
     hits = []
     for fd in files:
-        removed, added = left[id(fd)]
-        decrease = len(removed) - len(added)
+        decrease = _decrease(*left[id(fd)])
+        removed, added = map(_by_name, left[id(fd)])
         plural = "s" if decrease != 1 else ""
         if fd.status == "deleted" and (decrease > 0 or (not test_defs(fd)[0] and is_test_module(fd.path))):
             detail = "test file deleted"
@@ -417,6 +536,58 @@ def removed_test_hits(files):
     return hits
 
 
+# ------------------------------------------------------------ C/C++ and PlatformIO
+#
+# The guard does not model the C preprocessor or PlatformIO's config: ten
+# review rounds each found another way a model missed a removed test. In a
+# repository with a platformio.ini or a C/C++ source or header in either tree,
+# it stays quiet only when a pull request cannot change which tests run or
+# what they include. Anything else is a hit, whatever its content:
+#
+#   - a change to any platformio.ini (skip-marker, see platformio_hits);
+#   - a change to any file in or under a test directory, in either tree;
+#   - an added, deleted or renamed C/C++ source or header anywhere, or a
+#     changed submodule;
+#   - every pull request, when a platformio.ini names extra_configs or test_dir
+#     (any file may be a config it loads or a test it runs), cannot be read, or
+#     the trees hold a symbolic link or submodule at or in a test directory.
+
+def _touched(fd):
+    """Whether the diff changes fd at all: its content, mode, path or existence."""
+    return bool(fd.changed()) or fd.status != "modified" or fd.binary or fd.mode_changed
+
+
+def _at_test_dir(path):
+    """Whether path is a test directory or is in one."""
+    return any(d in TEST_DIRS for d in path.lower().split("/"))
+
+
+def c_cpp_hits(files, facts, flagged):
+    """removed-tests hits for a C/C++ repository's changes that may change which tests run or what they include.
+
+    flagged holds the paths that already have a removed-tests hit.
+    """
+    if not facts.c_cpp:
+        return []
+    hits = [Hit("removed-tests", path, None, "a symbolic link or submodule at or in a test directory; the guard "
+                "does not follow it, so any change may change the tests it holds")
+            for path in facts.blind] if any(_touched(fd) for fd in files) else []
+    for fd in files:
+        if not _touched(fd) or fd.path in flagged or fd.path in facts.blind:
+            continue
+        if any(_at_test_dir(p) for p in fd.paths):
+            detail = f"{fd.status} a file in a test directory of a C/C++ repository"
+        elif fd.modes & {"160000"}:
+            detail = f"{fd.status} a submodule of a C/C++ repository, which may hold sources or headers"
+        elif fd.status != "modified" and any(_ext(p) in C_FILE_EXTS for p in fd.paths):
+            detail = f"{fd.status} a C/C++ source or header, which can change what tests include"
+        else:
+            continue
+        hits.append(Hit("removed-tests", fd.path, None, detail + "; the guard does not read C/C++ tests, so this "
+                        "needs approval whatever the change"))
+    return hits
+
+
 # --------------------------------------------------------------- skip markers
 
 def _py_tests(path):
@@ -426,6 +597,10 @@ def _py_tests(path):
 def _js_tests(path):
     return _ext(path) in JS_EXTS and is_test_file(path)
 
+
+# The test_* and extends options a platformio.ini hit names. Option names
+# ignore case, as ConfigParser lowers them; section names keep theirs.
+PIO_TEST_OPTION = re.compile(r"^(?:test_\w*|extends)$")
 
 SKIP_RULES = [
     ("pytest skip/xfail", _py_tests, re.compile(r"\bmark\.(?:skip|skipif|xfail)\b")),
@@ -482,6 +657,62 @@ def _matching_lines(files, rules, imperative=False):
     return out
 
 
+def _ini_options(text):
+    """{section: {option: value as written}} for one side of an ini file, [DEFAULT] as a section of its own.
+
+    PlatformIO parses with ConfigParser(inline_comment_prefixes=("#", ";")).
+    """
+    parser = configparser.ConfigParser(inline_comment_prefixes=("#", ";"), interpolation=None, default_section="\0")
+    parser.read_string(text)
+    return {s: dict(parser.items(s)) for s in parser.sections()}
+
+
+def _pio_value(value):
+    return _snippet(" ".join(value.split()), 60) or "(empty)"
+
+
+def _pio_details(fd):
+    """What a change to a platformio.ini does, as hit details. Any change is a hit:
+    the details name each test_* or extends option it changes, when the guard can
+    read both sides, and otherwise say that the file changed."""
+    sides = _whole_sides(fd)
+    details = []
+    try:
+        old, new = (_ini_options(text) for text in sides) if sides else ({}, {})
+    except configparser.Error:
+        old = new = {}
+    for section in dict.fromkeys([*new, *old]):
+        before, after = old.get(section, {}), new.get(section, {})
+        for option in dict.fromkeys([*after, *before]):
+            if not PIO_TEST_OPTION.match(option) or before.get(option) == after.get(option):
+                continue
+            if option not in before:
+                change = f"added: {_pio_value(after[option])}"
+            elif option not in after:
+                change = f"removed, was: {_pio_value(before[option])}"
+            else:
+                change = f"changed: {_pio_value(before[option])} -> {_pio_value(after[option])}"
+            details.append(f"PlatformIO [{section}] {option} {change}")
+    generic = (f"PlatformIO {fd.path} {fd.status}; the guard does not read PlatformIO's config, so any change to it "
+               "needs approval")
+    return details or [generic]
+
+
+def platformio_hits(files, facts):
+    """skip-marker hits for every changed platformio.ini, and for every platformio.ini in either
+    tree whose extra_configs or test_dir the guard does not follow, or that it cannot read."""
+    hits, changed = [], set()
+    for fd in files:
+        if _touched(fd) and any(_name(p) == "platformio.ini" for p in fd.paths):
+            hits += [Hit("skip-marker", fd.path, None, d) for d in _pio_details(fd)]
+            changed.update(fd.paths)
+    if any(_touched(fd) for fd in files):
+        hits += [Hit("skip-marker", path, None, f"PlatformIO {path} {why}, so any changed file may be a config "
+                     "PlatformIO loads or a test it runs")
+                 for path, why in facts.open_configs if path not in changed]
+    return hits
+
+
 def _new_lines(files, rules, imperative_rules=()):
     """Added matches that are not a moved copy of a removed match anywhere in the diff."""
     found = _matching_lines(files, rules) + _matching_lines(files, imperative_rules, imperative=True)
@@ -490,9 +721,10 @@ def _new_lines(files, rules, imperative_rules=()):
     return _cancel_pairs(removed, added, key=lambda f: f[2].text.strip())
 
 
-def skip_hits(files):
+def skip_hits(files, facts=None):
     _, added = _new_lines(files, SKIP_RULES, IMPERATIVE_SKIP_RULES)
-    return [Hit("skip-marker", path, l.new, f"{label}: {_snippet(l.text)}") for label, path, l in added]
+    return ([Hit("skip-marker", path, l.new, f"{label}: {_snippet(l.text)}") for label, path, l in added]
+            + platformio_hits(files, facts or tree_facts(DiffTrees(files))))
 
 
 # -------------------------------------------------------------------- retries
@@ -681,10 +913,119 @@ def gate_config_hits(files):
     return hits
 
 
+# ---------------------------------------------------------------------- trees
+#
+# The C/C++ and PlatformIO rules read the trees beyond the diff: which paths
+# exist, which are links or submodules, and the text of every platformio.ini.
+# Each side is "-" (base) or "+" (head).
+
+class DiffTrees:
+    """The files the diff shows, as the trees of a --diff-file run; a file it does not show whole cannot be read."""
+
+    def __init__(self, files):
+        self.files = {"-": {}, "+": {}}
+        self.link_paths = [p for fd in files if fd.modes & LINK_MODES for p in fd.paths]
+        for fd in files:
+            sides = _whole_sides(fd)
+            for side, path, i in (("-", fd.old_path, 0), ("+", fd.new_path, 1)):
+                if path:
+                    self.files[side][path] = None if sides is None or fd.modes & LINK_MODES else sides[i]
+
+    def paths(self, side):
+        return list(self.files[side])
+
+    def links(self, side):
+        return self.link_paths
+
+    def read(self, side, path):
+        return self.files[side].get(path)
+
+
+class GitTrees:
+    """The base and head trees of a git repository, read as data: nothing is checked out or run."""
+
+    def __init__(self, repo_dir, base, head):
+        self.repo_dir, self.revs = repo_dir, {"-": base, "+": head}
+        self.trees, self.link_paths, self.blobs = {}, {}, {}
+
+    def _git(self, *args):
+        return subprocess.run(["git", "-C", self.repo_dir, *args], check=True, capture_output=True).stdout
+
+    def _tree(self, side):
+        if side not in self.trees:
+            tree, links = {}, []
+            for entry in self._git("ls-tree", "-r", "-z", "--full-tree", self.revs[side]).split(b"\0"):
+                meta, _, raw = entry.partition(b"\t")
+                mode, kind, sha = (meta.decode("ascii").split() + ["", "", ""])[:3]
+                path = raw.decode("utf-8", "replace")
+                if mode in LINK_MODES:
+                    # A symbolic link's blob is its target, and a submodule's files are not in the tree.
+                    links.append(path)
+                if kind == "blob":
+                    tree[path] = None if mode in LINK_MODES else sha
+            self.trees[side], self.link_paths[side] = tree, links
+        return self.trees[side]
+
+    def paths(self, side):
+        return list(self._tree(side))
+
+    def links(self, side):
+        self._tree(side)
+        return self.link_paths[side]
+
+    def read(self, side, path):
+        sha = self._tree(side).get(path)
+        if sha is None:
+            return None
+        if sha not in self.blobs:
+            self.blobs[sha] = self._git("cat-file", "blob", sha)
+        try:
+            return self.blobs[sha].decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+
+
+# c_cpp: whether either tree has a platformio.ini or a C/C++ source or header;
+# open_configs: [(platformio.ini, why)] for those that name extra_configs or
+# test_dir, or that cannot be read; blind: symbolic links and submodules at or
+# in a test directory, in a C/C++ repository.
+TreeFacts = collections.namedtuple("TreeFacts", "c_cpp open_configs blind")
+PIO_OPEN_OPTION = re.compile(r"extra_configs|test_dir", re.IGNORECASE)
+
+
+def tree_facts(trees):
+    """The TreeFacts of a base and head tree; see TreeFacts. Nothing is parsed: a
+    platformio.ini that mentions extra_configs or test_dir anywhere, even in a
+    comment, is open."""
+    paths = {(side, path) for side in ("-", "+") for path in trees.paths(side)}
+    c_cpp = any(_name(p) == "platformio.ini" or _ext(p) in C_EXTS | {".h", ".hh", ".hpp", ".hxx"} for _, p in paths)
+    open_configs = {}
+    for side, path in sorted(paths):
+        if _name(path) != "platformio.ini" or path in open_configs:
+            continue
+        text = trees.read(side, path)
+        if text is None:
+            open_configs[path] = "cannot be read (binary, not UTF-8 or a symbolic link)"
+        elif PIO_OPEN_OPTION.search(text):
+            open_configs[path] = f"names {' and '.join(sorted({m.lower() for m in PIO_OPEN_OPTION.findall(text)}))}"
+    links = dict.fromkeys(link for side in ("-", "+") for link in trees.links(side))
+    blind = [link for link in links if _at_test_dir(link)] if c_cpp else []
+    return TreeFacts(c_cpp, sorted(open_configs.items()), blind)
+
+
+def repo_hits(repo_dir, base, head):
+    """The hits from base to head of a git repository, reading its trees beyond the diff."""
+    return analyze(parse_diff(git_diff(repo_dir, base, head)), tree_facts(GitTrees(repo_dir, base, head)))
+
+
 # ------------------------------------------------------------------ reporting
 
-def analyze(files):
-    hits = removed_test_hits(files) + skip_hits(files) + retry_hits(files) + gate_config_hits(files)
+def analyze(files, facts=None):
+    """The hits of a diff. facts come from the base and head trees; without them, from the files the diff shows."""
+    facts = facts or tree_facts(DiffTrees(files))
+    removed = removed_test_hits(files)
+    hits = (removed + c_cpp_hits(files, facts, {h.path for h in removed}) + skip_hits(files, facts)
+            + retry_hits(files) + gate_config_hits(files))
     seen = set()
     unique = []
     for h in hits:
@@ -909,11 +1250,11 @@ def git_diff(repo_dir, base, head):
 
 
 def fetch_diff(url, token, base, head):
-    """The diff from base to head, fetched as objects into an empty repository.
+    """(diff, TreeFacts) from base to head, fetched as objects into an empty repository.
 
     Nothing is checked out, so no file from the pull request reaches the disk,
-    let alone runs. The token reaches git through the environment, never the
-    command line or a config file.
+    let alone runs; the trees are read as data. The token reaches git through
+    the environment, never the command line or a config file.
     """
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
     if token:
@@ -926,7 +1267,7 @@ def fetch_diff(url, token, base, head):
         subprocess.run(["git", "init", "-q", tmp], check=True, capture_output=True, env=env)
         subprocess.run(["git", "-C", tmp, "fetch", "-q", "--no-tags", "--no-recurse-submodules", "--depth=1",
                         url, base, head], check=True, capture_output=True, env=env)
-        return git_diff(tmp, base, head)
+        return git_diff(tmp, base, head), tree_facts(GitTrees(tmp, base, head))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1058,7 +1399,8 @@ def _target_hits(github, repo, base_ref, sha, server, token):
     try:
         compare = github.get(f"/repos/{repo}/compare/{urllib.parse.quote(base_ref, safe='/')}...{sha}?per_page=1")
         merge_base = compare["merge_base_commit"]["sha"]
-        return analyze(parse_diff(fetch_diff(f"{server}/{repo}.git", token, merge_base, sha))), None
+        diff, facts = fetch_diff(f"{server}/{repo}.git", token, merge_base, sha)
+        return analyze(parse_diff(diff), facts), None
     except subprocess.CalledProcessError as e:
         detail = (e.stderr or b"").decode("utf-8", "replace").strip()
         return [], f"could not fetch the pull request's commits ({detail or e})"
@@ -1168,16 +1510,18 @@ def run_target(args, github=None):
 
 # ----------------------------------------------------------------------- main
 
-def read_diff(args):
+def read_hits(args):
+    """The hits of the diff file, or of base to head in the repository, whose trees are read too."""
     if args.diff_file:
         with open(args.diff_file, encoding="utf-8", errors="replace") as f:
-            return f.read()
-    return git_diff(args.repo_dir, args.base, args.head)
+            return analyze(parse_diff(f.read()))
+    return repo_hits(args.repo_dir, args.base, args.head)
 
 
 def parse_args(argv):
     p = argparse.ArgumentParser(description="Flag pull request changes that loosen a repository's test gate.")
-    p.add_argument("--diff-file", help="read the diff from this file instead of git")
+    p.add_argument("--diff-file", help="read the diff from this file instead of git; the guard then reads only "
+                                         "the files the diff shows, not the rest of the trees")
     p.add_argument("--repo-dir", default=".", help="git checkout to diff (default: .)")
     p.add_argument("--base", default="HEAD^1", help="base revision (default: HEAD^1)")
     p.add_argument("--head", default="HEAD", help="head revision (default: HEAD)")
@@ -1203,13 +1547,12 @@ def main(argv=None):
     if args.pull_request_target:
         return run_target(args)
     try:
-        diff = read_diff(args)
+        hits = read_hits(args)
     except (OSError, subprocess.CalledProcessError) as e:
         detail = getattr(e, "stderr", b"") or b""
         print(f"gate-guard: cannot read the diff: {e} {detail.decode('utf-8', 'replace')}".strip(),
               file=sys.stderr)
         return 2
-    hits = analyze(parse_diff(diff))
     approved, note = approval(args) if hits else (True, "")
     summary = render_summary(hits, approved, note)
     print(summary)

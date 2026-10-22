@@ -1,0 +1,30 @@
+# gate-guard fixture: a PlatformIO Unity test_main.cpp is deleted
+# expect: removed-tests
+# hits: 1
+
+diff --git a/firmware/test/test_logic/test_main.cpp b/firmware/test/test_logic/test_main.cpp
+deleted file mode 100644
+index ffbb337..0000000
+--- a/firmware/test/test_logic/test_main.cpp
++++ /dev/null
+@@ -1,20 +0,0 @@
+-#include <unity.h>
+-#include "logic.h"
+-
+-void setUp(void) {}
+-void tearDown(void) {}
+-
+-void test_clamp_low(void) {
+-    TEST_ASSERT_EQUAL(0, clamp(-5, 0, 10));
+-}
+-
+-void test_clamp_high(void) {
+-    TEST_ASSERT_EQUAL(10, clamp(50, 0, 10));
+-}
+-
+-int main(int argc, char **argv) {
+-    UNITY_BEGIN();
+-    RUN_TEST(test_clamp_low);
+-    RUN_TEST(test_clamp_high);
+-    return UNITY_END();
+-}

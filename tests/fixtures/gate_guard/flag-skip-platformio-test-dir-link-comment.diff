@@ -1,0 +1,37 @@
+# gate-guard fixture: test_dir = cases (a link to unit) gets a comment-only edit while a RUN_TEST is removed from unit
+# expect: skip-marker
+# hits: 1
+#
+# The cases link is unchanged. Its all-context hunk (with its mode on the
+# index line) gives --diff-file the file the workflows read from the trees.
+
+diff --git a/platformio.ini b/platformio.ini
+index 5a1b2c3..6d7e8f9 100644
+--- a/platformio.ini
++++ b/platformio.ini
+@@ -1,4 +1,5 @@
+ [platformio]
+ test_dir = cases
+ [env:native]
+ platform = native
++; native build for the host
+diff --git a/cases b/cases
+index 3f2a1b0..3f2a1b0 120000
+--- a/cases
++++ b/cases
+@@ -1 +1 @@
+ unit
+\ No newline at end of file
+diff --git a/unit/test_a/main.cpp b/unit/test_a/main.cpp
+index 7c1d2e3..0f4a5b6 100644
+--- a/unit/test_a/main.cpp
++++ b/unit/test_a/main.cpp
+@@ -1,8 +1,7 @@
+ #include <unity.h>
+ void test_a(void) {}
+ void test_b(void) {}
+ int main(void) {
+     RUN_TEST(test_a);
+-    RUN_TEST(test_b);
+     return 0;
+ }

@@ -1,0 +1,27 @@
+# gate-guard fixture: an env drops the later parent whose empty test_ignore overrode an earlier parent's; only the extends line changes
+# expect: skip-marker
+# hits: 1
+
+diff --git a/firmware/platformio.ini b/firmware/platformio.ini
+index 5b1e7a2..c3d90f4 100644
+--- a/firmware/platformio.ini
++++ b/firmware/platformio.ini
+@@ -1,17 +1,17 @@
+ [platformio]
+ default_envs = native
+ 
+ [filtered]
+ platform = native
+ test_ignore = test_controls
+ 
+ [unfiltered]
+ platform = native
+ test_ignore =
+ 
+ [env:native]
+ test_framework = unity
+-extends = filtered, unfiltered
++extends = filtered
+ build_flags = -std=gnu++17
+ lib_deps = throwtheswitch/Unity@^2.6.0
+ 

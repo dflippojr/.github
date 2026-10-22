@@ -1,0 +1,23 @@
+# gate-guard fixture: a test_filter takes its entries from another section's option, which loses one; the test_filter line is untouched
+# expect: skip-marker
+# hits: 1
+
+diff --git a/firmware/platformio.ini b/firmware/platformio.ini
+index 7d2a4e9..1f08b3c 100644
+--- a/firmware/platformio.ini
++++ b/firmware/platformio.ini
+@@ -1,14 +1,14 @@
+ [platformio]
+ default_envs = native
+ 
+ [selection]
+-suites = test_logic, test_controls
++suites = test_logic
+ 
+ [env:native]
+ platform = native
+ test_framework = unity
+ test_filter = ${selection.suites}
+ build_flags = -std=gnu++17
+ lib_deps = throwtheswitch/Unity@^2.6.0
+ 

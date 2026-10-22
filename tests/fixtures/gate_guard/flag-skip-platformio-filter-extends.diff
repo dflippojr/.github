@@ -1,0 +1,31 @@
+# gate-guard fixture: an env now extends one that carries a test_filter, so it inherits the narrowing
+# expect: skip-marker
+# hits: 1
+
+diff --git a/firmware/platformio.ini b/firmware/platformio.ini
+index 5d0e7b1..e83a4f6 100644
+--- a/firmware/platformio.ini
++++ b/firmware/platformio.ini
+@@ -1,21 +1,21 @@
+ [platformio]
+ default_envs = esp32
+ 
+ [env]
+ framework = arduino
+ lib_deps = throwtheswitch/Unity@^2.6.0
+ 
+ [env:esp32]
+ platform = espressif32
+ board = esp32dev
+ 
+ [env:native]
+ platform = native
+ test_framework = unity
+ test_filter =
+     test_logic
+ build_flags = -std=gnu++17
+ 
+ [env:native-coverage]
+-extends = env:esp32
++extends = env:native
+ build_flags = --coverage

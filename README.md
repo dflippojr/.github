@@ -30,13 +30,43 @@ merging the pull request would change and reports each hit in the job summary:
 
 | Rule | Hits |
 | --- | --- |
-| `removed-tests` | A deleted test file, or fewer test functions in a file (`def test_`, `test(`/`it(`, `@Test`, `#[test]`, `func Test`). |
-| `skip-marker` | A new `pytest.mark.skip`/`skipif`/`xfail`, `unittest.skip`, `.skip(`/`.only(`/`test.fixme`/`xit(`/`xdescribe(`, `@Disabled`, `#[ignore]`, or pytest `--deselect`/`-k "not …"` in config. `pytest.skip()` and Go `t.Skip()` count when unconditional or when the condition checks `CI`. |
+| `removed-tests` | A deleted test file, or fewer test functions in a file (`def test_`, `test(`/`it(`, `@Test`, `#[test]`, `func Test`, and in a C/C++ source or header under a test directory, Unity `RUN_TEST(name)` and `void test_name(void)`, counted over the whole file); in a C/C++ or PlatformIO repository, any change that could change which tests run or what they include (see below). |
+| `skip-marker` | A new `pytest.mark.skip`/`skipif`/`xfail`, `unittest.skip`, `.skip(`/`.only(`/`test.fixme`/`xit(`/`xdescribe(`, `@Disabled`, `#[ignore]`, any change to a PlatformIO `platformio.ini` (see below), or pytest `--deselect`/`-k "not …"` in config. `pytest.skip()` and Go `t.Skip()` count when unconditional or when the condition checks `CI`. |
 | `retry` | New or raised Playwright `retries`, `--reruns`, `pytest-rerunfailures`, `flaky`, `jest.retryTimes`, Surefire `rerunFailingTestsCount`. |
 | `gate-config` | Any edit to `.github/workflows/**`, `sonar-project.properties`, `CODEOWNERS` or coverage config (`.coveragerc`, `[tool.coverage]`, `fail_under`, JaCoCo rules, c8/nyc/Jest thresholds); a lint rule disabled; a size or performance budget raised. |
 
-A test renamed in place or moved to another file, a renamed test file, and a
-skip marker that moves with its test are not hits. The job fails on any hit
+C/C++ and PlatformIO repositories fail closed instead. Ten review rounds each
+found another way a model of the preprocessor or of PlatformIO's config missed
+a removed test, so the guard models neither. In a repository whose base or head
+tree has a `platformio.ini` or a C/C++ source or header (`.c`, `.cc`, `.cpp`,
+`.cxx`, `.h`, `.hh`, `.hpp`, `.hxx`), it stays quiet only when a pull request
+cannot change which tests run or what they include. Any of these is a hit,
+whatever the change:
+
+- any change to a `platformio.ini` (`skip-marker`; the detail names each
+  `test_*` or `extends` option it changes, when the guard can read both sides);
+- any change to a file in or under a test directory (`test`, `tests`,
+  `__tests__`, `e2e`, `spec`, `specs`), in either tree, whatever its extension
+  (`removed-tests`);
+- an added, deleted or renamed C/C++ source or header anywhere, including
+  `.c++`, `.cp`, `.h++`, `.tpp`, `.tcc`, `.inl`, `.ino`, `.pde`, `.s` and files
+  with no extension, which can shadow or drop an include; and any changed
+  submodule (`removed-tests`);
+- every pull request, when a `platformio.ini` in either tree mentions
+  `extra_configs` or `test_dir` anywhere, even in a comment (any file may be a
+  config it loads or a test it runs), or cannot be read (`skip-marker`); and
+  when either tree has a symbolic link or submodule at or in a test directory
+  (`removed-tests`).
+
+Unity `RUN_TEST(name)` registrations and `void test_name(void)` definitions are
+still counted, so a hit names the tests a change removed. Editing a source or
+header in place outside the test directories, or any other file, is not a hit.
+With `--diff-file` the guard sees only the files the diff shows; both workflows
+read the trees.
+
+Outside C/C++ and PlatformIO repositories, a test renamed in place or moved to
+another file, a renamed test file, and a skip marker that moves with its test
+are not hits. The job fails on any hit
 unless the pull request carries the `gate-change-approved` label; with the label
 it passes and still lists every hit. Only the owner applies that label: it
 records that the owner reviewed the removals or gate changes on this PR.
