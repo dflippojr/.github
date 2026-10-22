@@ -1,12 +1,12 @@
-# gate-guard fixture: an entry is added to a test_filter and another env gains one, which only runs more tests
-# expect: 
-# hits: 0
+# gate-guard fixture: test_ignore is removed and an env's own test_filter line moves within its section; a test option the change touches fails closed, though PlatformIO would run no fewer tests
+# expect: skip-marker
+# hits: 1
 
 diff --git a/firmware/platformio.ini b/firmware/platformio.ini
-index 2f6c1d0..96834b5 100644
+index 5a79842..3a51fba 100644
 --- a/firmware/platformio.ini
 +++ b/firmware/platformio.ini
-@@ -1,21 +1,23 @@
+@@ -1,21 +1,20 @@
  [platformio]
  default_envs = esp32
  
@@ -21,12 +21,11 @@ index 2f6c1d0..96834b5 100644
  [env:native]
  platform = native
  test_framework = unity
- test_filter =
-     test_logic
-+    test_controls
+-test_ignore = test_controls
  build_flags = -std=gnu++17
  
  [env:native-coverage]
  extends = env:native
-+test_filter = test_logic
+-test_filter = test_logic
  build_flags = ${env:native.build_flags} --coverage
++test_filter = test_logic

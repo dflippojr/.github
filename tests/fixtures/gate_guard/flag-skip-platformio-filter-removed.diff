@@ -1,6 +1,6 @@
-# gate-guard fixture: the whole test_filter key is deleted, so the env and the one extending it run every test
-# expect: 
-# hits: 0
+# gate-guard fixture: the whole test_filter key is deleted, so the env and the one extending it run every test; a test option the change touches fails closed, though PlatformIO would run no fewer tests
+# expect: skip-marker
+# hits: 1
 
 diff --git a/firmware/platformio.ini b/firmware/platformio.ini
 index 2f6c1d0..7b94a0e 100644

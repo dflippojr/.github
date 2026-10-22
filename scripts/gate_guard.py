@@ -344,7 +344,10 @@ C_LEXEME = re.compile(
     r"|(?:(?<!\w)(?:u8|[uUL]))?\"(?:\\.|[^\"\\\n])*\"?"
     r"|(?<!\w)(?:u8|[uUL])?'(?:\\.|[^'\\\n])*'", re.S)
 C_DIRECTIVE = re.compile(r"^[ \t]*#[ \t]*([A-Za-z_]\w*)(.*)$")
-UnityScan = collections.namedtuple("UnityScan", "items defines includes others")
+# Headers are not test modules, but a directive in one can turn tests off.
+C_HEADER_EXTS = {".h", ".hh", ".hpp", ".hxx"}
+# directives are (name, text, (first, last) physical line) for each preprocessor directive.
+UnityScan = collections.namedtuple("UnityScan", "items directives others")
 
 
 def _line_defs(fd, regex, group):
@@ -357,7 +360,17 @@ def _line_defs(fd, regex, group):
 
 
 def _c_code(text):
-    """(text without comments, text without comments or literals), lines spliced as the C preprocessor splices them."""
+    """(text without comments, text without comments or literals, the physical lines each line spans).
+
+    Lines are spliced as the C preprocessor splices them, so a line of the
+    result spans one physical line and those its backslashes continue.
+    """
+    spans, start = [], 0
+    physical = text.split("\n")
+    for i, line in enumerate(physical):
+        if not line.endswith("\\") or i == len(physical) - 1:
+            spans.append((start, i))
+            start = i + 1
     text = text.replace("\\\n", "")
     code, blank = [], []
     pos = 0
@@ -367,45 +380,42 @@ def _c_code(text):
         code += [text[pos:m.start()], " " + lines if comment else m.group(0)]
         blank += [text[pos:m.start()], " " + lines if comment else '""' + lines]
         pos = m.end()
-    return "".join(code + [text[pos:]]), "".join(blank + [text[pos:]])
+    return "".join(code + [text[pos:]]), "".join(blank + [text[pos:]]), spans
 
 
 def _unity_scan(text):
-    """One side of a Unity test file, read whole.
+    """One side of a C/C++ test file, read whole.
 
-    items are (name, line, kind, branch) for each RUN_TEST registration ("run")
-    and test definition ("def"); branch is the #if branches around it, so a
-    test that moves into another branch, or whose branch changes, is not the
-    same test. defines and includes are those directive lines, and others the
+    items are (name, line, kind, region, plain) for each RUN_TEST registration
+    ("run") and test definition ("def"). region is how many preprocessor
+    directives come before it, so a test that moves across one is not the same
+    test; plain is whether it is outside every #if in a side with no #define
+    or #undef, the only tests the guard pairs across files. others are the
     registrations the guard does not count, a RUN_TEST it cannot read among them.
     """
-    code, blank = _c_code(text)
-    branches, stack = [], []
-    defines, includes = [], []
-    for line in code.split("\n"):
+    code, blank, spans = _c_code(text)
+    directives, regions, plain = [], [], []
+    depth = 0
+    for k, line in enumerate(code.split("\n")):
+        regions.append(len(directives))
+        plain.append(depth == 0)
         m = C_DIRECTIVE.match(line)
         if m:
-            name, directive = m.group(1), " ".join(("#" + m.group(1) + m.group(2)).split())
-            if name in ("if", "ifdef", "ifndef"):
-                stack.append((directive,))
-            elif name in ("elif", "elifdef", "elifndef", "else") and stack:
-                stack[-1] = (stack[-1][0], directive)
-            elif name == "endif" and stack:
-                stack.pop()
-            elif name in ("define", "undef"):
-                defines.append(directive)
-            elif name in ("include", "include_next", "import"):
-                includes.append(directive)
-        branches.append(tuple(stack))
+            directives.append((m.group(1), " ".join(("#" + m.group(1) + m.group(2)).split()), spans[k]))
+            if m.group(1) in ("if", "ifdef", "ifndef"):
+                depth += 1
+            elif m.group(1) == "endif":
+                depth = max(depth - 1, 0)
+    macros = any(name in ("define", "undef") for name, _, _ in directives)
     starts = [0] + [i + 1 for i, c in enumerate(blank) if c == "\n"]
     items = []
     for kind, regex in (("run", UNITY_RUN), ("def", UNITY_DEF)):
         for m in regex.finditer(blank):
             line = bisect.bisect_right(starts, m.start())
-            items.append((m.group(1), line, kind, branches[line - 1]))
+            items.append((m.group(1), line, kind, regions[line - 1], plain[line - 1] and not macros))
     others = [(m.group(1), " ".join((m.group(2) or "").split()) or None) for m in UNITY_OTHER.finditer(code)]
     others += [("RUN_TEST", None)] * (len(UNITY_RUN_TOKEN.findall(blank)) - len(UNITY_RUN.findall(blank)))
-    return UnityScan(sorted(items, key=lambda d: d[1]), defines, includes, others)
+    return UnityScan(sorted(items, key=lambda d: d[1]), directives, others)
 
 
 def _whole_sides(fd):
@@ -419,47 +429,78 @@ def _whole_sides(fd):
     return _side_text(fd, "-"), _side_text(fd, "+")
 
 
+def _side_text(fd, side):
+    """One side of a file, rebuilt from the diff, which carries the whole file (git_diff asks for full context)."""
+    return "".join(l.text + "\n" for l in fd.lines if l.kind in (" ", side))
+
+
 def _unity_defs(fd):
     """Unity registrations and definitions one side of the whole file has more of than the other.
 
     The kind keeps an edit to a definition from cancelling the removal of its
     registration; removed_test_hits counts a test's two kinds once, by name.
+    The region keeps a test that moves across a directive from cancelling.
+    When the two sides' directives differ, _c_test_problems flags the file
+    and tests are counted by name and kind alone.
     """
     sides = _whole_sides(fd)
     if sides is None:
         return [], []
-    old, new = (_unity_scan(text).items for text in sides)
-    return _cancel_pairs(old, new, key=_def_key)
+    old, new = (_unity_scan(text) for text in sides)
+    items = old.items, new.items
+    if [d[1] for d in old.directives] != [d[1] for d in new.directives]:
+        items = [[(n, line, kind, None, plain) for n, line, kind, _, plain in side] for side in items]
+    return _cancel_pairs(*items, key=_def_key)
 
 
-def _unity_problem(fd):
-    """Why the guard cannot count a changed Unity test file's tests, or None.
+def _directive_changed(fd, old, new):
+    """Whether the diff adds, removes, moves or edits a preprocessor directive, continuation lines included."""
+    if [d[1] for d in old.directives] != [d[1] for d in new.directives]:
+        return True
+    for side, scan in (("-", old), ("+", new)):
+        kinds = [l.kind for l in fd.lines if l.kind in (" ", side)]
+        if any(kinds[i] != " " for _, _, (first, last) in scan.directives
+               for i in range(first, min(last + 1, len(kinds)))):
+            return True
+    return False
 
-    It fails closed on what it does not model: a file the diff does not show
-    whole, a macro that uses RUN_TEST, a changed #define or #undef, a removed
-    #include, and a removed registration it does not count.
+
+def _c_test_source(fd):
+    """A C/C++ source or header under a test directory."""
+    return any(_ext(p) in C_EXTS | C_HEADER_EXTS and _in_test_dir(p) for p in fd.paths)
+
+
+def _c_test_problems(fd):
+    """Why the guard fails closed on a changed C/C++ file under a test directory.
+
+    It does not evaluate the preprocessor, so any change to a directive in an
+    existing file is a hit. It does not count what it does not model: a file
+    the diff does not show whole, a macro that uses RUN_TEST, and a removed
+    registration of another kind. A directive in a new file cannot turn an
+    existing test off, and a test moved into one pairs only when it is plain.
     """
-    if fd.status == "deleted":
+    if fd.status == "deleted" and is_test_module(fd.path):
         # Already a hit as a deleted test file.
-        return None
+        return []
     sides = _whole_sides(fd)
     if sides is None:
-        return "is not shown whole in the diff, so the guard cannot count its tests"
+        return ["is not shown whole in the diff, so the guard cannot count its tests"]
     if sides[0] == sides[1]:
-        return None
+        return []
     old, new = (_unity_scan(text) for text in sides)
-    if any(UNITY_RUN_TOKEN.search(d) for d in old.defines + new.defines):
-        return "defines or undefines a macro that uses RUN_TEST, which the guard does not expand"
+    problems = []
+    if any(name in ("define", "undef") and UNITY_RUN_TOKEN.search(text)
+           for name, text, _ in old.directives + new.directives):
+        problems.append("defines or undefines a macro that uses RUN_TEST, which the guard does not expand")
     if fd.status == "added":
-        return None
-    if collections.Counter(old.defines) != collections.Counter(new.defines):
-        return "changes a #define or #undef, which the guard does not expand"
-    if collections.Counter(old.includes) - collections.Counter(new.includes):
-        return "removes an #include, which may hold tests the guard does not read"
+        return problems
+    if _directive_changed(fd, old, new):
+        problems.append("adds, removes, moves or edits a preprocessor directive, which can turn tests off "
+                        "and which the guard does not evaluate")
     lost = collections.Counter(old.others) - collections.Counter(new.others)
     if lost:
-        return f"loses a test registration the guard does not count: {', '.join(sorted({n for n, _ in lost}))}"
-    return None
+        problems.append(f"loses a test registration the guard does not count: {', '.join(sorted({n for n, _ in lost}))}")
+    return problems
 
 
 def _marker_defs(fd, marker, name_re):
@@ -509,15 +550,21 @@ def test_defs(fd):
 
 def _names(defs, limit=5):
     names = [d[0] if d[0] is not None else f"test at line {d[1]}" for d in defs]
-    # A Unity item inside #if branches says which.
-    names = [n + (f" (under {'; '.join(', '.join(b) for b in d[3])})" if len(d) > 3 and d[3] else "")
-             for n, d in zip(names, defs)]
     return ", ".join(names[:limit]) + (f" and {len(names) - limit} more" if len(names) > limit else "")
 
 
 def _def_key(d):
-    """Identity of a definition: its name, and for Unity whether it is a registration or a definition, and its #if branch."""
-    return (d[0], *d[2:])
+    """Identity of a definition in its file: its name, and for Unity whether it is
+    a registration or a definition, and how many directives come before it."""
+    return (d[0], *d[2:4])
+
+
+def _move_key(d):
+    """Identity of a definition across files, or None for a Unity test the
+    preprocessor may treat differently in another file, which is not paired."""
+    if len(d) > 2:
+        return (d[0], d[2]) if d[4] else None
+    return d[0]
 
 
 def _by_name(defs):
@@ -535,9 +582,9 @@ def _by_name(defs):
 
 def _decrease(removed, added):
     """How many fewer tests a file has. Unity registrations and definitions are
-    counted apart, and each #if branch apart, so a new test that is never
-    registered, or one in another branch, does not offset a registration that
-    was removed, and a test removed whole counts once."""
+    counted apart, and each region between directives apart, so a new test
+    that is never registered, or one across a directive, does not offset a
+    registration that was removed, and a test removed whole counts once."""
     if not any(len(d) > 2 for d in removed + added):
         return len(removed) - len(added)
 
@@ -559,17 +606,17 @@ def removed_test_hits(files):
     pool = collections.defaultdict(list)
     for fd in files:
         for d in left[id(fd)][1]:
-            if d[0] is not None:
-                pool[_def_key(d)].append((id(fd), d))
+            if d[0] is not None and _move_key(d) is not None:
+                pool[_move_key(d)].append((id(fd), d))
     for fd in files:
         removed = left[id(fd)][0]
         kept = []
         for d in removed:
-            match = next((i for i, (owner, _) in enumerate(pool.get(_def_key(d), [])) if owner != id(fd)), None)
+            match = next((i for i, (owner, _) in enumerate(pool.get(_move_key(d), [])) if owner != id(fd)), None)
             if match is None:
                 kept.append(d)
                 continue
-            owner, added = pool[_def_key(d)].pop(match)
+            owner, added = pool[_move_key(d)].pop(match)
             left[owner][1].remove(added)
         left[id(fd)][0] = kept
 
@@ -588,9 +635,10 @@ def removed_test_hits(files):
             if added:
                 detail += f"; added {_names(added)}"
             hits.append(Hit("removed-tests", fd.path, None, detail))
-        problem = _ext(fd.path) in C_EXTS and any(is_test_module(p) for p in fd.paths) and _unity_problem(fd)
-        if problem:
-            hits.append(Hit("removed-tests", fd.path, None, f"Unity test file {problem}"))
+        problems = _c_test_source(fd) and _c_test_problems(fd)
+        if problems:
+            kind = "Unity test file" if _ext(fd.path) in C_EXTS else "C/C++ header in a test directory"
+            hits.append(Hit("removed-tests", fd.path, None, f"{kind} {'; '.join(problems)}"))
     return hits
 
 
@@ -604,41 +652,15 @@ def _js_tests(path):
     return _ext(path) in JS_EXTS and is_test_file(path)
 
 
-# PlatformIO reads these from any env, and an env that extends another inherits them.
-# test_ignore lists tests that do not run, so adding to it is a skip. test_filter
-# lists the only tests that run, so removing from it is. Option names ignore
-# case, as ConfigParser lowers them; section names keep theirs.
-PIO_IGNORE_KEY = re.compile(r"^\s*test_ignore\s*[=:]", re.I)
-# ${section.option}; ${this.option} is the section being read, and a reference
-# with no section or to sysenv comes from outside the file. PlatformIO's VARTPL_RE, as written.
-PIO_REFERENCE = re.compile(r"\$\{(?:([^\.\}\()]+)\.)?([^\}]+)\}")
-# Built-in variables PlatformIO fills from the machine; any other ${NAME} is an
-# SCons variable it leaves as written.
-PIO_BUILTIN_VARS = ("PROJECT_DIR", "PROJECT_HASH", "UNIX_TIME")
-# The options PlatformIO 6.2.0 defines (platformio/project/options.py), with
-# their old names. PlatformIO reads these with a type, a default or an
-# environment variable, which the guard models only for test_filter,
-# test_ignore and extends; a reference to any other one is unresolved.
-PIO_TYPED_OPTIONS = {
-    "platformio": frozenset(
-        "boards_dir build_cache_dir build_dir cache_dir core_dir data_dir default_envs description env_default"
-        " extra_configs globallib_dir home_dir include_dir lib_dir libdeps_dir monitor_dir name packages_dir"
-        " platforms_dir shared_dir src_dir test_dir workspace_dir".split()),
-    "env": frozenset(
-        "board board_build.f_cpu board_build.f_flash board_build.flash_mode board_build.mcu board_f_cpu"
-        " board_f_flash board_flash_mode board_mcu build_flags build_src_filter build_src_flags build_type"
-        " build_unflags check_flags check_patterns check_severity check_skip_packages check_src_filters"
-        " check_tool debug_build_flags debug_extra_cmds debug_init_break debug_init_cmds debug_load_cmd"
-        " debug_load_cmds debug_load_mode debug_port debug_server debug_server_ready_pattern debug_speed"
-        " debug_svd_path debug_test debug_tool extra_script extra_scripts framework lib_archive"
-        " lib_compat_mode lib_deps lib_extra_dirs lib_force lib_ignore lib_install lib_ldf_mode lib_use"
-        " monitor_baud monitor_dtr monitor_echo monitor_encoding monitor_eol monitor_filters monitor_parity"
-        " monitor_port monitor_raw monitor_rts monitor_speed platform platform_packages src_build_flags"
-        " src_filter targets test_build_project_src test_build_src test_framework test_port test_speed"
-        " test_testing_command upload_command upload_flags upload_port upload_protocol upload_resetmethod"
-        " upload_speed".split()),
-}
-PIO_LABEL = "PlatformIO test_ignore"
+# PlatformIO reads its test options (test_filter, test_ignore, test_dir,
+# test_framework, test_build_src, ...) from platformio.ini and the files it
+# loads through extra_configs, and an env inherits them through extends,
+# [env] and [DEFAULT]. The guard does not resolve that inheritance: any change
+# to a test_* or extends option is a hit. Option names ignore case, as
+# ConfigParser lowers them; section names keep theirs.
+PIO_TEST_OPTION = re.compile(r"^(?:test_\w*|extends)$")
+PIO_SECTION_LINE = re.compile(r"^\s*\[\s*(?:env|platformio)\s*[:\]]")
+PIO_OPTION_LINE = re.compile(r"^\s*(?:test_\w*|extends)\s*[=:]", re.I)
 
 SKIP_RULES = [
     ("pytest skip/xfail", _py_tests, re.compile(r"\bmark\.(?:skip|skipif|xfail)\b")),
@@ -652,7 +674,6 @@ SKIP_RULES = [
     ("pytest deselect/ignore", is_config, re.compile(
         r"--deselect\b|--ignore(?:-glob)?[= ]|(?:^|\s)-[km]\s+['\"]?not\b")),
     ("test ignore pattern", is_config, re.compile(r"\btestPathIgnorePatterns\b|\btestIgnore\b")),
-    (PIO_LABEL, lambda p: _ext(p) == ".ini", PIO_IGNORE_KEY),
 ]
 # Skips called from inside a test count only when unconditional, or when the
 # condition is about CI: an environment guard such as "node isn't installed"
@@ -696,413 +717,125 @@ def _matching_lines(files, rules, imperative=False):
     return out
 
 
-def _ini_value_lines(files):
-    """Changed value lines that continue a test_ignore key which is itself unchanged.
+def _ini_options(text):
+    """{section: {option: value as written}} for one side of an ini file, [DEFAULT] as a section of its own.
 
-    A multi-line ini value is indented under its key; a key line that was
-    changed is reported by its own rule, so its values are not counted again.
+    PlatformIO parses with ConfigParser(inline_comment_prefixes=("#", ";")),
+    so a comment, spacing, or a line moved within its section is no change.
+    """
+    parser = configparser.ConfigParser(inline_comment_prefixes=("#", ";"), interpolation=None, default_section="\0")
+    parser.read_string(text)
+    return {s: dict(parser.items(s)) for s in parser.sections()}
+
+
+def _pio_like(*configs):
+    """Whether an ini file reads as PlatformIO's: an env or platformio section, or a test_* or extends option."""
+    return any(s == "platformio" or s.split(":", 1)[0] == "env" or any(PIO_TEST_OPTION.match(o) for o in c[s])
+               for c in configs for s in c)
+
+
+def _pio_lines_touched(fd):
+    """Changed lines that set a test_* or extends option or continue one's value, comments included.
+
+    The options compared as ConfigParser reads them miss an edit it reads the
+    same, such as a comment; a changed line counts anyway.
     """
     out = []
-    for fd in files:
-        if _ext(fd.path) != ".ini":
-            continue
-        # side -> whether the open key line was unchanged context, or None
-        key = {"-": None, "+": None}
+    for side in ("-", "+"):
+        current = False
         for l in fd.lines:
-            stripped = l.text.strip()
-            if not stripped or stripped.startswith(("#", ";")):
+            if l.kind not in (" ", side):
                 continue
-            for side in ("-", "+"):
-                if l.kind not in (" ", side):
-                    continue
-                if PIO_IGNORE_KEY.match(l.text):
-                    key[side] = l.kind == " "
-                elif not l.text[:1].isspace():
-                    key[side] = None
-                elif key[side] and l.kind == side:
-                    out.append((PIO_LABEL, fd.path, l))
+            if SECTION_RE.match(l.text):
+                current = False
+            elif PIO_OPTION_LINE.match(l.text):
+                current = True
+            elif l.text.strip() and not l.text[:1].isspace() and not l.text.lstrip().startswith(("#", ";")):
+                current = False
+            elif not (current and l.text[:1].isspace()):
+                continue
+            if current and l.kind == side:
+                out.append(l)
     return out
 
 
-def _option_entries(value):
-    """The words of a test_filter, test_ignore or extends value, split on commas and whitespace.
+def _pio_value(value):
+    return _snippet(" ".join(value.split()), 60) or "(empty)"
 
-    PlatformIO itself splits only on newlines or ", " (see _pio_values); these
-    finer words are compared too, so a list a reader takes for several entries
-    is judged that way as well.
+
+def _pio_details(fd):
+    """Why a change to an ini file may change what PlatformIO tests, as hit details.
+
+    Any change to a test_* or extends option is a hit. Where the guard cannot
+    see what the options read, any change to the file is: a test_* or extends
+    value with a ${...} or %(...)s reference, extra_configs set anywhere, and
+    an ini file other than platformio.ini that reads as PlatformIO's, which
+    a platformio.ini may load through extra_configs.
     """
-    return [e for e in re.split(r"[,\s]+", re.sub(r"\s[#;].*$", "", value.strip())) if e]
-
-
-def _pio_values(value):
-    """PlatformIO's parse_multi_values: one entry per line, or per ", " on a single line."""
-    value = value or ""
-    out = []
-    for item in value.split("\n" if "\n" in value else ", "):
-        item = item.strip()
-        if ";" in item:
-            item = re.sub(r"\s+;.*$", "", item).strip()
-        if item and not item.startswith((";", "#")):
-            out.append(item)
-    return out
-
-
-def _side_text(fd, side):
-    """One side of a file, rebuilt from the diff, which carries the whole file (git_diff asks for full context)."""
-    return "".join(l.text + "\n" for l in fd.lines if l.kind in (" ", side))
-
-
-def _strip_comment(text):
-    return re.sub(r"\s[#;].*$", "", text.strip())
-
-
-class PioUnresolved(Exception):
-    """A value PlatformIO would fail or loop on, or read from a file the diff does not show."""
-
-
-PIO_WALK_LIMIT = 1000
-PIO_LIST_OPTIONS = ("test_filter", "test_ignore", "extends")
-# Traced for a reference to an option the file does not set, or one PlatformIO
-# would stop on: PlatformIO raises, or fills in a default that may read any
-# other option (build_dir's reads workspace_dir), so equal traces prove nothing.
-PIO_DEFAULTED = "defaulted"
-
-
-def _env_scope(section):
-    return section.split(":", 1)[0] == "env"
-
-
-def _typed_option(section, option):
-    """Whether PlatformIO reads this option with metadata the guard does not model.
-
-    PlatformIO matches metadata by the option name as written in the
-    reference, so ${env:a.LIB_IGNORE} is a plain string to it, as here.
-    """
-    scope = section.split(":", 1)[0]
-    if scope == "env" and option in PIO_LIST_OPTIONS:
-        return False
-    return option in PIO_TYPED_OPTIONS.get(scope, ())
-
-
-class PioConfig:
-    """One side of a PlatformIO ini file, read the way platformio.project.config.ProjectConfig reads it.
-
-    PlatformIO parses the file with ConfigParser(inline_comment_prefixes=("#", ";")),
-    so [DEFAULT] reaches every section, %(option)s references expand within a
-    section, and option names ignore case while section names keep theirs. A
-    section's option is the first found walking the section, then the sections
-    it extends, the last listed first and each with its own extends before the
-    next, then, for an env, [env] and what it extends; the first found wins
-    even when it is empty. ${section.option} references expand recursively
-    through the same lookup. Where PlatformIO would stop with an error or loop,
-    the guard raises PioUnresolved.
-    """
-
-    def __init__(self, text):
-        self.parser = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
-        self.error = None
-        try:
-            self.parser.read_string(text)
-        except configparser.Error as exc:
-            self.error = exc
-
-    def sections(self):
-        return self.parser.sections()
-
-    def has_section(self, section):
-        return self.parser.has_section(section)
-
-    def has(self, section, option):
-        """Whether a section sets an option itself; one from [DEFAULT] counts as inherited."""
-        return self.parser.has_option(section, option) and option not in self.parser.defaults()
-
-    def extends(self, section):
-        return _pio_values(self.parser.get(section, "extends", fallback=""))
-
-    def safe_extends(self, section):
-        """extends, or its text as written when a %(option)s in it cannot be expanded."""
-        try:
-            return self.extends(section)
-        except configparser.Error:
-            return [self.parser.get(section, "extends", raw=True, fallback="")]
-
-    def _walk(self, root):
-        queue = ["env", root] if root.startswith("env:") else [root]
-        for _ in range(PIO_WALK_LIMIT):
-            if not queue:
-                return
-            section = queue.pop()
-            if self.parser.has_section(section):
-                yield section
-                queue.extend(self.extends(section))
-        raise PioUnresolved(f"[{root}] extends")
-
-    def _raw(self, section, option):
-        """(the section the value comes from, its value before ${} expansion), or (None, None) for none."""
-        for found in self._walk(section):
-            if option in self.parser.options(found):
-                return found, self.parser.get(found, option)
-        if option in PIO_LIST_OPTIONS and _env_scope(section):
-            return None, None
-        # PlatformIO's last resort, which raises NoSectionError or NoOptionError.
-        return section, self.parser.get(section, option)
-
-    def get(self, section, option, trace, stack=()):
-        """An option's value: a list for an env's test_filter, test_ignore or extends, else a string.
-
-        trace collects ((section, option), (where found, value as written)) for
-        the option and each value it references, None for a reference to a
-        value from outside the file or to a typed option, or PIO_DEFAULTED for
-        a reference to an option the file does not set, so the two sides can be
-        compared.
-        """
-        if (section, option) in stack:
-            raise PioUnresolved(f"${{{section}.{option}}}")
-        try:
-            found, raw = self._raw(section, option)
-        except configparser.Error as exc:
-            raise PioUnresolved(f"${{{section}.{option}}}") from exc
-        trace.append(((section, option), (found, raw)))
-        value = raw and self.expand(section, raw, trace, stack + ((section, option),))
-        if option in PIO_LIST_OPTIONS and _env_scope(section):
-            return _pio_values(value)
-        return value
-
-    def expand(self, section, text, trace, stack=()):
-        """text with each ${section.option} the file defines replaced by its value, recursively.
-
-        A value from outside the file (a built-in or environment variable) or
-        from an option PlatformIO types is left as written and traced as
-        unresolved, after tracing what it reads in the file.
-        """
-        def reference(m):
-            ref_section, option = m.group(1), m.group(2)
-            if ref_section is None and option not in PIO_BUILTIN_VARS:
-                # An SCons variable, which PlatformIO leaves as written.
-                return m.group(0)
-            if ref_section is None or ref_section == "sysenv":
-                trace.append(((ref_section, option), None))
-                return m.group(0)
-            if ref_section == "this":
-                if option == "__env__" and section.startswith("env:"):
-                    return section[4:]
-                ref_section = section
-            mark = len(trace)
-            try:
-                value = self.get(ref_section, option, trace, stack)
-            except PioUnresolved:
-                trace.append(((ref_section, option), PIO_DEFAULTED))
-                return m.group(0)
-            if trace[mark][1] == (None, None):
-                # An env's test_filter, test_ignore or extends that nothing sets.
-                trace.append(((ref_section, option), PIO_DEFAULTED))
-                return m.group(0)
-            if _typed_option(ref_section, option):
-                trace.append(((ref_section, option), None))
-                return m.group(0)
-            return "\n".join(value) if isinstance(value, list) else str(value)
-        if "$PROJECT_HASH" in text:
-            # PlatformIO's legacy spelling of ${PROJECT_HASH}.
-            trace.append(((None, "PROJECT_HASH"), None))
-        if "${" not in text or "}" not in text:
-            return text
-        return PIO_REFERENCE.sub(reference, text)
-
-    def test_option(self, section, option):
-        """(PlatformIO's entries, trace) for a section's test_filter or test_ignore."""
-        trace = []
-        try:
-            value = self.get(section, option, trace)
-        except (PioUnresolved, configparser.Error):
-            return [], trace + [((section, option), PIO_DEFAULTED)]
-        return (value if isinstance(value, list) else _pio_values(value)), trace
-
-    def snapshot(self):
-        return {s: dict(self.parser.items(s, raw=True)) for s in self.sections()}, dict(self.parser.defaults())
-
-
-def _words(entries):
-    return [w for e in entries for w in _option_entries(e)]
-
-
-def _unresolved(old_trace, new_trace, changed):
-    """The references either side cannot resolve, when a value they depend on may have changed.
-
-    Equal traces show that what an unresolved value reads in the file did not
-    change, except for an option the file does not set, whose default may
-    read any option: then any change to the file (changed) counts.
-    """
-    both = old_trace + new_trace
-    if old_trace == new_trace and not (changed and any(found == PIO_DEFAULTED for _, found in both)):
+    main = any(_name(p) == "platformio.ini" for p in fd.paths)
+    pio_lines = main or any(PIO_SECTION_LINE.match(l.text) or PIO_OPTION_LINE.match(l.text) for l in fd.lines)
+    sides = _whole_sides(fd)
+    if sides is None:
+        return [f"PlatformIO {fd.path} is not shown whole in the diff, so the guard cannot read it"] if pio_lines else []
+    if sides[0] == sides[1]:
         return []
-    refs = [f"${{{s}.{o}}}" if s else f"${{{o}}}" for (s, o), found in both if found in (None, PIO_DEFAULTED)]
-    return list(dict.fromkeys(refs))
-
-
-def _flagged_entries(fd, lines, config):
-    """The test_ignore entries added lines in fd already report, references expanded in their own section."""
-    ids = {id(l) for l in lines}
-    out = set()
-    section = ""
-    for l in fd.lines:
-        if l.kind == "-":
-            continue
-        m = SECTION_RE.match(l.text)
-        if m:
-            section = m.group(1)
-        elif id(l) in ids:
-            key = PIO_IGNORE_KEY.match(l.text)
-            entries = _pio_values(config.expand(section, _strip_comment(l.text[key.end():] if key else l.text), []))
-            out.update(entries + _words(entries))
-    return out
-
-
-def _filter_removed(before, after):
-    """What a test_filter change removes. An empty filter, like none, runs every test."""
-    if not (before and after):
-        return []
-    removed = [w for w in _words(before) if w not in _words(after)]
-    if removed:
-        return [f"PlatformIO test_filter entry removed: {w}" for w in removed]
-    removed = [e for e in before if e not in after]
-    if removed:
-        return [f"PlatformIO test_filter, split on newlines or ', ' as PlatformIO splits it, "
-                f"lost: {', '.join(removed[:5])}"]
-    return []
-
-
-def _filter_details(name, before, after, own):
-    """What an env's test_filter change removes, or that an env that ran every test now runs a subset."""
-    if before:
-        return _filter_removed(before, after)
-    if after:
-        runs = f"runs only {', '.join(after[:5])}"
-        return [f"PlatformIO test_filter added to {name}: {runs}" if own
-                else f"PlatformIO {name} now inherits a test_filter: {runs}"]
-    return []
-
-
-def _ignore_gained(before, after, reported):
-    """The entries an env's test_ignore gained, word by word, else as PlatformIO splits it."""
-    gained = [w for w in _words(after) if w not in _words(before) and w not in reported]
-    return gained or [e for e in after if e not in before and e not in reported]
-
-
-PIO_SECTION_LINE = re.compile(r"^\s*\[\s*(?:env|platformio)\s*[:\]]")
-
-
-def _pio_file_details(fd, flagged):
-    """What one ini file's change does to what PlatformIO runs; see _inherited_hits."""
-    old, new = PioConfig(_side_text(fd, "-")), PioConfig(_side_text(fd, "+"))
-    main = _name(fd.path) == "platformio.ini"
-    if old.error or new.error:
-        if main or any(PIO_SECTION_LINE.match(l.text) for l in fd.lines):
-            error = str(old.error or new.error).strip().splitlines()[0]
-            return [f"PlatformIO {fd.path} cannot be read: {_snippet(error)}"]
+    try:
+        old, new = (_ini_options(text) for text in sides)
+    except configparser.Error as exc:
+        error = str(exc).strip().splitlines()[0]
+        return [f"PlatformIO {fd.path} cannot be read: {_snippet(error)}"] if pio_lines else []
+    if not (main or _pio_like(old, new)):
         return []
     details = []
-    # PlatformIO reads [platformio]'s extra_configs through its extends, and
-    # [DEFAULT] reaches it, so extra_configs set in any section counts.
-    if main and old.snapshot() != new.snapshot() and any(
-            "extra_configs" in c.parser.defaults() or any(c.parser.has_option(s, "extra_configs") for s in c.sections())
-            for c in (old, new)):
+    for section in dict.fromkeys([*new, *old]):
+        before, after = old.get(section, {}), new.get(section, {})
+        for option in dict.fromkeys([*after, *before]):
+            if not PIO_TEST_OPTION.match(option) or before.get(option) == after.get(option):
+                continue
+            if option not in before:
+                change = f"added: {_pio_value(after[option])}"
+            elif option not in after:
+                change = f"removed, was: {_pio_value(before[option])}"
+            else:
+                change = f"changed: {_pio_value(before[option])} -> {_pio_value(after[option])}"
+            details.append(f"PlatformIO [{section}] {option} {change}")
+    touched = _pio_lines_touched(fd)
+    if touched and not details:
+        details.append(f"PlatformIO {fd.path} edits a test_* or extends option line: {_snippet(touched[0].text)}")
+    if details or old == new:
+        return details
+    referencing = [f"[{s}] {o}" for c in (old, new) for s in c for o, v in c[s].items()
+                   if PIO_TEST_OPTION.match(o) and ("$" in v or "%(" in v)]
+    if referencing:
+        details.append(f"PlatformIO {', '.join(dict.fromkeys(referencing))} reads other values, which the guard "
+                       "does not resolve, and this change edits the file")
+    if any("extra_configs" in c[s] for c in (old, new) for s in c):
         details.append(f"PlatformIO {fd.path} loads extra_configs the guard cannot read, "
                        "so it cannot tell what this change runs")
-    reported = _flagged_entries(fd, flagged.get(fd.path, ()), new)
-    with_tests = any(c.parser.has_option(s, o) for c in (old, new) for s in c.sections()
-                     for o in ("test_filter", "test_ignore"))
-    for name in new.sections():
-        # A new env in platformio.ini runs what it is given; in another ini file,
-        # which platformio.ini may load through extra_configs, it may override one.
-        if name.startswith("env:") and (old.has_section(name) or not main):
-            details += _env_details(name, old, new, reported, with_tests)
-    # A section that lost an entry is also reported where it is edited, even if no env uses it.
-    for section in old.sections():
-        if new.has_section(section) and old.has(section, "test_filter") and new.has(section, "test_filter"):
-            details += _option_details(section, "test_filter", old, new, reported)
-    # Another ini file reaches envs the diff does not show: its [env] and
-    # [DEFAULT] are their defaults, and any of its values may be referenced.
-    if not main and not details and old.snapshot() != new.snapshot() and _pio_like(old, new):
+    if not main:
         details.append(f"PlatformIO {fd.path} may be loaded through extra_configs by a platformio.ini the diff "
                        "does not show, so the guard cannot tell what this change runs")
     return details
 
 
-def _pio_like(*configs):
-    """Whether an ini file reads as PlatformIO's: an env or platformio section, or a test_filter or test_ignore."""
-    return any(_env_scope(s) or s == "platformio" or any(c.parser.has_option(s, o) for o in ("test_filter", "test_ignore"))
-               for c in configs for s in c.sections()) or any(
-        o in c.parser.defaults() for c in configs for o in ("test_filter", "test_ignore"))
+def platformio_hits(files):
+    """Changes to an ini file that may change which PlatformIO tests run; see _pio_details."""
+    return [Hit("skip-marker", fd.path, None, d)
+            for fd in files if any(_ext(p) == ".ini" for p in fd.paths) for d in _pio_details(fd)]
 
 
-def _option_details(name, option, old, new, reported):
-    """What a section's effective test_filter or test_ignore change takes away."""
-    (before, old_trace), (after, new_trace) = old.test_option(name, option), new.test_option(name, option)
-    unresolved = _unresolved(old_trace, new_trace, old.snapshot() != new.snapshot())
-    if unresolved:
-        return [f"PlatformIO {name} {option} uses a value the guard cannot resolve: {', '.join(unresolved[:5])}"]
-    if option == "test_filter" and not name.startswith("env:"):
-        return _filter_removed(before, after)
-    if option == "test_filter":
-        return _filter_details(name, before, after, new.has(name, "test_filter"))
-    gained = _ignore_gained(before, after, reported)
-    return [f"PlatformIO {name} now inherits test_ignore: {', '.join(gained[:5])}"] if gained else []
-
-
-def _env_details(name, old, new, reported, with_tests):
-    details = _option_details(name, "test_filter", old, new, reported)
-    details += _option_details(name, "test_ignore", old, new, reported)
-    parents, old_parents = new.safe_extends(name), old.safe_extends(name)
-    unseen = [p for p in parents if not new.has_section(p)]
-    if unseen and with_tests and (not old.has_section(name) or parents != old_parents):
-        details.append(f"PlatformIO {name} extends a section the diff does not show: {', '.join(unseen)}")
-    return details
-
-
-def _inherited_hits(files, flagged):
-    """Where an existing PlatformIO env runs fewer tests through its effective test_filter or test_ignore.
-
-    Each side of an ini file is read as PlatformIO reads it (PioConfig). A
-    filter is an inclusion list, so fewer entries run fewer tests: hit when an
-    env that ran every test now runs a subset, wherever its filter now comes
-    from, and for each entry an env's effective filter lost, compared word by
-    word and as PlatformIO splits it. A reformatted or widened filter, a filter
-    emptied or dropped, and a new env in platformio.ini are not hits. An ignore
-    is an exclusion list, so each entry an env's effective test_ignore gained
-    is a hit, unless an added test_ignore line in the file already reports it
-    (`flagged`: {path: [Line]}). Where the guard cannot see what an env reads,
-    it flags the change: a reference it cannot resolve (an environment or
-    built-in variable, or an option PlatformIO types) once anything the value
-    depends on changed, a reference to an option the file does not set once
-    anything in the file changed, a changed extends that names a section the
-    file lacks, a file it cannot parse, any change to a platformio.ini that
-    sets extra_configs in any section, and any change to another ini file
-    that reads as PlatformIO's, which may be one of those.
-    """
-    hits = []
-    for fd in files:
-        if _ext(fd.path) == ".ini":
-            hits += [Hit("skip-marker", fd.path, None, d) for d in dict.fromkeys(_pio_file_details(fd, flagged))]
-    return hits
-
-
-def _new_lines(files, rules, imperative_rules=(), extra=()):
+def _new_lines(files, rules, imperative_rules=()):
     """Added matches that are not a moved copy of a removed match anywhere in the diff."""
-    found = _matching_lines(files, rules) + _matching_lines(files, imperative_rules, imperative=True) + list(extra)
+    found = _matching_lines(files, rules) + _matching_lines(files, imperative_rules, imperative=True)
     removed = [f for f in found if f[2].kind == "-"]
     added = [f for f in found if f[2].kind == "+"]
     return _cancel_pairs(removed, added, key=lambda f: f[2].text.strip())
 
 
 def skip_hits(files):
-    _, added = _new_lines(files, SKIP_RULES, IMPERATIVE_SKIP_RULES, _ini_value_lines(files))
-    # The added test_ignore lines, so an env inheriting their entries is not reported again.
-    flagged = {}
-    for label, path, l in added:
-        if label == PIO_LABEL:
-            flagged.setdefault(path, []).append(l)
+    _, added = _new_lines(files, SKIP_RULES, IMPERATIVE_SKIP_RULES)
     return ([Hit("skip-marker", path, l.new, f"{label}: {_snippet(l.text)}") for label, path, l in added]
-            + _inherited_hits(files, flagged))
+            + platformio_hits(files))
 
 
 # -------------------------------------------------------------------- retries

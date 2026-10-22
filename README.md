@@ -30,10 +30,32 @@ merging the pull request would change and reports each hit in the job summary:
 
 | Rule | Hits |
 | --- | --- |
-| `removed-tests` | A deleted test file, or fewer test functions in a file (`def test_`, `test(`/`it(`, `@Test`, `#[test]`, `func Test`, and in a C/C++ file under a test directory, Unity `RUN_TEST(name)` and `void test_name(void)`, registrations and definitions counted apart over the whole file once comments and string literals are blanked, so a call may span lines and a line may hold several, and each `#if` branch counted apart. A Unity file the guard does not model fails closed and is flagged: one the diff does not show whole, a macro that uses `RUN_TEST`, a changed `#define` or `#undef`, a removed `#include`, and a removed registration it does not count, such as Unity fixture, GoogleTest, doctest or Catch2 tests). |
-| `skip-marker` | A new `pytest.mark.skip`/`skipif`/`xfail`, `unittest.skip`, `.skip(`/`.only(`/`test.fixme`/`xit(`/`xdescribe(`, `@Disabled`, `#[ignore]`, PlatformIO `test_ignore` added, or an entry removed from `test_filter`, in a `.ini` file such as `platformio.ini` (each env's effective `test_filter` and `test_ignore` resolved the way PlatformIO's `ProjectConfig` resolves them: `extends` on every section with the last listed parent winning, `[env]` for envs, `[DEFAULT]`, an empty value still overriding, `${section.option}` and `%(option)s` references, entries split on newlines or `, `, and option names in any case; emptying a filter runs every test and passes. Anything the guard does not model fails closed and is flagged: a reference it cannot resolve, including `${sysenv.*}`, built-in variables and options PlatformIO reads with a type or default such as `lib_ignore`; a reference to an option the file does not set, whose default may read any other option, on any change to the file; a file it cannot parse; a change to a `platformio.ini` that sets `extra_configs` in any section; and a change to another `.ini` file that reads as PlatformIO's, which such a file may load), or pytest `--deselect`/`-k "not …"` in config. `pytest.skip()` and Go `t.Skip()` count when unconditional or when the condition checks `CI`. |
+| `removed-tests` | A deleted test file, or fewer test functions in a file (`def test_`, `test(`/`it(`, `@Test`, `#[test]`, `func Test`, and in a C/C++ file under a test directory, Unity `RUN_TEST(name)` and `void test_name(void)`, counted over the whole file); in a C/C++ source or header under a test directory, any added, removed, moved or edited preprocessor directive (see below). |
+| `skip-marker` | A new `pytest.mark.skip`/`skipif`/`xfail`, `unittest.skip`, `.skip(`/`.only(`/`test.fixme`/`xit(`/`xdescribe(`, `@Disabled`, `#[ignore]`, any change to a PlatformIO `test_*` or `extends` option (see below), or pytest `--deselect`/`-k "not …"` in config. `pytest.skip()` and Go `t.Skip()` count when unconditional or when the condition checks `CI`. |
 | `retry` | New or raised Playwright `retries`, `--reruns`, `pytest-rerunfailures`, `flaky`, `jest.retryTimes`, Surefire `rerunFailingTestsCount`. |
 | `gate-config` | Any edit to `.github/workflows/**`, `sonar-project.properties`, `CODEOWNERS` or coverage config (`.coveragerc`, `[tool.coverage]`, `fail_under`, JaCoCo rules, c8/nyc/Jest thresholds); a lint rule disabled; a size or performance budget raised. |
+
+C/C++ and PlatformIO fail closed rather than model the preprocessor or
+PlatformIO's config resolver, because each model the guard tried missed a way to
+turn tests off:
+
+- **Test sources.** Any change to a preprocessor directive (`#if`, `#ifdef`,
+  `#ifndef`, `#elif`, `#else`, `#endif`, `#define`, `#undef`, `#include` and
+  the rest, continuation lines included) in an existing C/C++ source or header
+  under a test directory is a `removed-tests` hit, even a harmless one. Unity
+  registrations and definitions are still counted over the whole file, with
+  comments and literals blanked, and a decrease is a hit; a test that moves
+  across a directive is not the same test. Also flagged: a file the diff does
+  not show whole, a macro that uses `RUN_TEST`, and a removed registration the
+  guard does not count (Unity fixture, GoogleTest, doctest, Catch2).
+- **platformio.ini.** Any change to a `test_*` option (`test_filter`,
+  `test_ignore`, `test_dir`, `test_framework`, `test_build_src`, ...) or an
+  `extends` option, in any section, is a `skip-marker` hit, even one that runs
+  more tests, compared as ConfigParser reads the file (a comment, spacing, or
+  a line moved within its section is not a change). So is any change to a file whose `test_*` or `extends`
+  values reference other values (`${...}`, `%(...)s`), or that sets
+  `extra_configs`, or that cannot be read, and any change to another `.ini`
+  file that reads as PlatformIO's, which `extra_configs` may load.
 
 A test renamed in place or moved to another file, a renamed test file, and a
 skip marker that moves with its test are not hits. The job fails on any hit

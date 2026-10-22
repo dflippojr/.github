@@ -1,6 +1,6 @@
-# gate-guard fixture: a test_filter is emptied, so the env runs every test
-# expect: 
-# hits: 0
+# gate-guard fixture: a test_filter is emptied, so the env runs every test; a test option the change touches fails closed, though PlatformIO would run no fewer tests
+# expect: skip-marker
+# hits: 1
 
 diff --git a/firmware/platformio.ini b/firmware/platformio.ini
 index 2d8e4f1..9a3b6c0 100644

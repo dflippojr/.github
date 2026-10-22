@@ -1,6 +1,6 @@
-# gate-guard fixture: the option a test_filter references gains an entry, so the env runs more tests
-# expect: 
-# hits: 0
+# gate-guard fixture: the option a test_filter references gains an entry, so the env runs more tests; an edit to a file whose test_filter reads another value fails closed, though PlatformIO would run no fewer tests
+# expect: skip-marker
+# hits: 1
 
 diff --git a/firmware/platformio.ini b/firmware/platformio.ini
 index 7d2a4e9..2c5e8a0 100644
