@@ -48,9 +48,14 @@ whatever the change:
 - any change to a file in or under a test directory (`test`, `tests`,
   `__tests__`, `e2e`, `spec`, `specs`), in either tree, whatever its extension
   (`removed-tests`), except a Python file in a test directory whose outermost
-  test directory holds no C/C++ source or header in either tree (a Python
-  backend's `backend/tests`), which is judged by removed tests and new skips as
-  in any repository;
+  test directory holds no C/C++ source or header in either tree (a file with no
+  extension counts, except `.gitignore`, `.gitattributes`, `.gitkeep` and
+  `.keep`), as in a Python backend's `backend/tests`. Such a file is judged by
+  removed tests and new skips as in any repository, but is still a hit when its
+  change touches what pytest collects (`collect_ignore`, `__test__`, a
+  `pytest_` hook, a constructor or a `Test` class), moves tests or the module
+  to a name or directory pytest does not collect, adds or rewires a
+  conditional skip, or is not shown whole;
 - an added, deleted or renamed C/C++ source or header anywhere, including
   `.c++`, `.cp`, `.h++`, `.tpp`, `.tcc`, `.inl`, `.ino`, `.pde`, `.s` and files
   with no extension, which can shadow or drop an include; and any changed

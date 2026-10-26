@@ -493,8 +493,11 @@ def _decrease(removed, added):
     return max(fewer("run"), fewer("def"), 0)
 
 
-def removed_test_hits(files):
-    """Deleted test files and per-file decreases, after pairing renames and moves."""
+def removed_test_hits(files, into=None):
+    """Deleted test files and per-file decreases, after pairing renames and moves.
+
+    into(source, destination), when given, says which files a test may move to.
+    """
     left = {}
     for fd in files:
         removed, added = test_defs(fd)
@@ -505,17 +508,18 @@ def removed_test_hits(files):
     for fd in files:
         for d in left[id(fd)][1]:
             if d[0] is not None:
-                pool[_def_key(d)].append((id(fd), d))
+                pool[_def_key(d)].append((fd, d))
     for fd in files:
         removed = left[id(fd)][0]
         kept = []
         for d in removed:
-            match = next((i for i, (owner, _) in enumerate(pool.get(_def_key(d), [])) if owner != id(fd)), None)
+            match = next((i for i, (owner, _) in enumerate(pool.get(_def_key(d), []))
+                          if owner is not fd and (into is None or into(fd, owner))), None)
             if match is None:
                 kept.append(d)
                 continue
             owner, added = pool[_def_key(d)].pop(match)
-            left[owner][1].remove(added)
+            left[id(owner)][1].remove(added)
         left[id(fd)][0] = kept
 
     hits = []
@@ -548,7 +552,12 @@ def removed_test_hits(files):
 #   - a change to any file in or under a test directory, in either tree,
 #     except a Python file in a test directory that holds no C/C++ source or
 #     header in either tree (a Python backend's tests/), which the Python
-#     rules judge as in any repository;
+#     rules judge as in any repository. They count test functions and skips,
+#     not what pytest collects, so such a file is still a hit when its change
+#     touches collection (collect_ignore, __test__, a pytest_ hook, a Test
+#     class), moves tests or the module where pytest does not collect them,
+#     or adds or rewires a conditional skip (a constant condition passes for
+#     an environment check), or when the diff does not show the whole file;
 #   - an added, deleted or renamed C/C++ source or header anywhere, or a
 #     changed submodule;
 #   - every pull request, when a platformio.ini names extra_configs or test_dir
@@ -576,6 +585,76 @@ def _python_test(path, facts):
     return _ext(path) in PY_EXTS and _test_root(path) not in facts.c_test_roots
 
 
+# Lines of a Python test file that can change what pytest collects: an ignore
+# list, __test__, a hook or plugin, a constructor (pytest skips a test class
+# that has one), and every line of a pytest_ hook's body.
+PY_COLLECT = re.compile(r"\bcollect_ignore(?:_glob)?\b|\b__test__\b|\bpytest_\w+|\bhookimpl\b|\bdef\s+__init__\s*\(")
+PY_TEST_CLASS = re.compile(r"^\s*class\s+Test")
+PY_FUNC = re.compile(r"^(\s*)(?:async\s+)?def\s+(\w+)")
+
+
+def _python_side_items(fd, side):
+    """Changed lines on one side of fd, a whole Python file, that the Python rules cannot judge.
+
+    Each item is ("collect", line), ("class", line) or ("skip", condition, skip):
+    a test class line, and a conditional skip whose condition or call changed.
+    """
+    items, funcs, previous = [], [], None
+    skip = IMPERATIVE_SKIP_RULES[0][2]
+    for l in fd.lines:
+        if l.kind not in (" ", side) or not l.text.strip() or l.text.strip().startswith("#"):
+            continue
+        indent = len(l.text) - len(l.text.lstrip())
+        while funcs and funcs[-1][0] >= indent:
+            funcs.pop()
+        m = PY_FUNC.match(l.text)
+        if m:
+            funcs.append((len(m.group(1)), m.group(2)))
+        condition = l if CONDITION_LINE.match(l.text) else previous
+        if skip.search(l.text) and condition is not None and CONDITION_LINE.match(condition.text) and (
+                l.kind == side or condition.kind == side):
+            items.append(("skip", condition.text.strip(), l.text.strip()))
+        if l.kind == side:
+            if PY_COLLECT.search(l.text) or any(name.startswith("pytest_") for _, name in funcs):
+                items.append(("collect", l.text.strip()))
+            elif PY_TEST_CLASS.match(l.text):
+                items.append(("class", l.text.strip()))
+        previous = l
+    return items
+
+
+def _python_unjudged(fd, moved_out):
+    """Why the Python rules cannot judge fd, a Python file in a Python test directory of a C/C++ repository, or None.
+
+    moved_out holds the paths that lose tests when moves count only into files pytest collects.
+    """
+    old, new = fd.old_path, fd.new_path
+    if fd.status == "renamed" and is_test_module(old) and not (
+            is_test_module(new) and _test_root(old) == _test_root(new)):
+        return "renamed a Python test module to a name or directory where pytest may not collect it"
+    if fd.path in moved_out:
+        return f"{fd.status} a Python test file whose tests moved to a file pytest does not collect"
+    if not fd.changed():
+        return None
+    if _whole_sides(fd) is None:
+        return f"{fd.status} a Python test file the diff does not show whole"
+    removed, added = _cancel_pairs(_python_side_items(fd, "-"), _python_side_items(fd, "+"), key=lambda i: i)
+    if any(i[0] == "collect" for i in removed + added):
+        return f"{fd.status} a Python test file's collection (collect_ignore, __test__ or a pytest_ hook)"
+    if any(i[0] == "class" for i in removed):
+        return f"{fd.status} a Python test file's test class, which may take its tests out of collection"
+    if any(i[0] == "skip" for i in added):
+        return (f"{fd.status} a conditional skip in a Python test file; the guard cannot tell an environment check "
+                "from a condition that always holds")
+    return None
+
+
+def _collected_move(source, destination):
+    """Whether a test moved from source to destination still runs: pytest collects it in the same test directory."""
+    return (destination.status != "deleted" and is_test_module(destination.new_path)
+            and _test_root(destination.new_path) == _test_root(source.path))
+
+
 def c_cpp_hits(files, facts, flagged):
     """removed-tests hits for a C/C++ repository's changes that may change which tests run or what they include.
 
@@ -586,12 +665,21 @@ def c_cpp_hits(files, facts, flagged):
     hits = [Hit("removed-tests", path, None, "a symbolic link or submodule at or in a test directory; the guard "
                 "does not follow it, so any change may change the tests it holds")
             for path in facts.blind] if any(_touched(fd) for fd in files) else []
+    moved_out = {h.path for h in removed_test_hits(files, into=_collected_move)}
     for fd in files:
         if not _touched(fd) or fd.path in flagged or fd.path in facts.blind:
             continue
-        # A Python test is judged by removed_test_hits and skip_hits, as in any repository.
-        if any(_at_test_dir(p) for p in fd.paths) and not all(_python_test(p, facts) for p in fd.paths):
-            detail = f"{fd.status} a file in a test directory of a C/C++ repository"
+        # A Python test is judged by removed_test_hits and skip_hits, as in any
+        # repository, unless its change is one they cannot judge.
+        if any(_at_test_dir(p) for p in fd.paths):
+            if not all(_python_test(p, facts) for p in fd.paths):
+                detail = f"{fd.status} a file in a test directory of a C/C++ repository"
+            else:
+                why = _python_unjudged(fd, moved_out)
+                if why:
+                    hits.append(Hit("removed-tests", fd.path, None, why + "; in a C/C++ repository the guard judges "
+                                    "Python tests only by removed tests and skips, so this needs approval"))
+                continue
         elif fd.modes & {"160000"}:
             detail = f"{fd.status} a submodule of a C/C++ repository, which may hold sources or headers"
         elif fd.status != "modified" and any(_ext(p) in C_FILE_EXTS for p in fd.paths):
@@ -1004,9 +1092,11 @@ class GitTrees:
 # open_configs: [(platformio.ini, why)] for those that name extra_configs or
 # test_dir, or that cannot be read; blind: symbolic links and submodules at or
 # in a test directory, in a C/C++ repository; c_test_roots: the outermost test
-# directories (see _test_root) that hold a C/C++ source or header in either tree.
+# directories (see _test_root) that hold a C/C++ source or header in either
+# tree, counting any file with no extension but git's own.
 TreeFacts = collections.namedtuple("TreeFacts", "c_cpp open_configs blind c_test_roots")
 PIO_OPEN_OPTION = re.compile(r"extra_configs|test_dir", re.IGNORECASE)
+GIT_FILES = {".gitignore", ".gitattributes", ".gitkeep", ".keep"}
 
 
 def tree_facts(trees):
@@ -1026,7 +1116,7 @@ def tree_facts(trees):
             open_configs[path] = f"names {' and '.join(sorted({m.lower() for m in PIO_OPEN_OPTION.findall(text)}))}"
     links = dict.fromkeys(link for side in ("-", "+") for link in trees.links(side))
     blind = [link for link in links if _at_test_dir(link)] if c_cpp else []
-    c_test_roots = {_test_root(p) for _, p in paths if _ext(p) in C_FILE_EXTS - {""}} - {None}
+    c_test_roots = {_test_root(p) for _, p in paths if _ext(p) in C_FILE_EXTS and _name(p) not in GIT_FILES} - {None}
     return TreeFacts(c_cpp, sorted(open_configs.items()), blind, c_test_roots)
 
 
