@@ -22,6 +22,16 @@ OPEN = "PlatformIO {} names {}, so any changed file may be a config PlatformIO l
 # A symbolic link or submodule at or in a test directory of a C/C++ repository.
 BLIND = ("a symbolic link or submodule at or in a test directory; the guard does not follow it, so any change may "
          "change the tests it holds")
+# Issue #40: a desk-controller-like tree, with PlatformIO firmware Unity tests beside a Python backend's tests.
+DESK_UNITY = ('#include <unity.h>\n#include "logic.h"\nvoid test_clamp_low(void) {\n'
+              '  TEST_ASSERT_EQUAL(0, clamp(-5, 0, 10));\n}\nint main() {\n  RUN_TEST(test_clamp_low);\n}\n')
+DESK_API = ("from backend.app import create_app\n\n\ndef test_health():\n    assert create_app()\n\n\n"
+            "def test_height_limits():\n    assert create_app().max_height == 120\n")
+DESK_TREE = {"firmware/platformio.ini": "[env:native]\nplatform = native\n",
+             "firmware/src/logic.cpp": "int clamp(int v, int lo, int hi) { return v; }\n",
+             "firmware/include/logic.h": "int clamp(int v, int lo, int hi);\n",
+             "firmware/test/test_logic/test_main.cpp": DESK_UNITY, "backend/app.py": "def create_app():\n    pass\n",
+             "backend/tests/conftest.py": "import pytest\n", "backend/tests/test_api.py": DESK_API}
 
 
 def fixture_expectations(path):
@@ -950,15 +960,7 @@ class RuleDetails(unittest.TestCase):
 
     def test_python_tests_in_a_c_cpp_repository_are_judged_as_python(self):
         """Issue #40: desk-controller's backend/tests are Python, beside firmware Unity tests."""
-        unity = ('#include <unity.h>\n#include "logic.h"\nvoid test_clamp_low(void) {\n'
-                 '  TEST_ASSERT_EQUAL(0, clamp(-5, 0, 10));\n}\nint main() {\n  RUN_TEST(test_clamp_low);\n}\n')
-        api = ("from backend.app import create_app\n\n\ndef test_health():\n    assert create_app()\n\n\n"
-               "def test_height_limits():\n    assert create_app().max_height == 120\n")
-        base = {"firmware/platformio.ini": "[env:native]\nplatform = native\n",
-                "firmware/src/logic.cpp": "int clamp(int v, int lo, int hi) { return v; }\n",
-                "firmware/include/logic.h": "int clamp(int v, int lo, int hi);\n",
-                "firmware/test/test_logic/test_main.cpp": unity, "backend/app.py": "def create_app():\n    pass\n",
-                "backend/tests/conftest.py": "import pytest\n", "backend/tests/test_api.py": api}
+        unity, api, base = DESK_UNITY, DESK_API, DESK_TREE
         edited = api.replace("120", "125")
         # (a) An assertion fixed, a conftest edited or a test added: no hit.
         for change in ({"backend/tests/test_api.py": edited},
@@ -1003,6 +1005,61 @@ class RuleDetails(unittest.TestCase):
         [hit] = judge_commits(dict(base, **{"backend/tests/data.json": "{}\n"}),
                               dict(base, **{"backend/tests/data.json": "[]\n"}))
         self.assertEqual((hit.path, hit.detail), ("backend/tests/data.json", TOUCHED))
+
+    def test_python_tests_in_a_c_cpp_repository_cannot_drop_tests_unseen(self):
+        """PR #41 review: a change the Python rules cannot judge stays a hit in a C/C++ repository."""
+        api, base, conftest = DESK_API, DESK_TREE, "backend/tests/conftest.py"
+
+        def flagged(start, change, drop=()):
+            head = {p: t for p, t in dict(start, **change).items() if p not in drop}
+            return {h.path for h in judge_commits(start, head)}
+
+        # (1) Collection controls: an ignore list, a collection hook or its body, __test__, a test class renamed.
+        hook = "import pytest\n\n\ndef pytest_collection_modifyitems(items):\n    pass\n"
+        cls = "class TestLimits:\n    def test_height(self):\n        assert True\n"
+        cases = [(base, {conftest: "import pytest\n\ncollect_ignore = ['test_api.py']\n"}),
+                 (base, {conftest: "import pytest\n\ncollect_ignore_glob = ['test_*.py']\n"}),
+                 (base, {conftest: hook}),
+                 (dict(base, **{conftest: hook}), {conftest: hook.replace("pass", "items.clear()")}),
+                 (base, {conftest: "import pytest\n\n\ndef pytest_ignore_collect(collection_path):\n    return True\n"}),
+                 (base, {"backend/tests/test_api.py": "__test__ = False\n" + api}),
+                 (dict(base, **{"backend/tests/test_cls.py": cls}),
+                  {"backend/tests/test_cls.py": cls.replace("TestLimits", "Limits")})]
+        for start, change in cases:
+            with self.subTest(change=change):
+                self.assertEqual(flagged(start, change), set(change))
+        # (2) A test module renamed out of pytest's discovery (a git rename, or a delete
+        # and an add), or a test moved into a helper module.
+        test_api, fewer = "backend/tests/test_api.py", api.split("\n\n\ndef test_height_limits")[0] + "\n"
+        for change in ({"backend/tests/api_checks.py": api}, {"backend/tests/api_checks.py": api + "# moved\n"},
+                       {"backend/tests/api_checks.py": api.replace("\n\n\n", "\n\n\n# moved\n", 1)}):
+            with self.subTest(change=change):
+                self.assertTrue(flagged(base, change, drop={test_api}), change)
+        helper = {test_api: fewer, "backend/tests/helpers.py": "def test_height_limits():\n    assert True\n"}
+        with self.subTest(change=helper):
+            self.assertEqual(flagged(base, helper), {test_api})
+        # (3) A skip behind a constant condition, in each imperative form.
+        for skip in ("pytest.skip('later')", "self.skipTest('later')", "raise unittest.SkipTest('later')"):
+            for condition in ("if True:", "if 1:", "if not False:", "if os.environ or True:"):
+                skipped = api.replace("    assert create_app().max_height",
+                                      f"    {condition}\n        {skip}\n    assert create_app().max_height")
+                with self.subTest(skip=skip, condition=condition):
+                    self.assertEqual(flagged(base, {test_api: skipped}), {test_api})
+        # (4) An extensionless C/C++ test keeps the Python generators in its directory guarded.
+        native = dict(base, **{"backend/tests/native": "#include <unity.h>\n", "backend/tests/gen_cases.py": "N = 3\n"})
+        with self.subTest(change="backend/tests/gen_cases.py"):
+            self.assertEqual(flagged(native, {"backend/tests/gen_cases.py": "N = 2\n"}), {"backend/tests/gen_cases.py"})
+        # Still no hit: a fixture added, a test moved or a module renamed between test modules,
+        # an edit beside git's own dotfiles.
+        keep = dict(base, **{"backend/tests/.gitkeep": "", "backend/tests/.gitignore": "*.log\n"})
+        fixture = "import pytest\n\n\n@pytest.fixture\ndef app():\n    pass\n"
+        for start, change, drop in ((base, {conftest: fixture}, ()),
+                                    (base, {test_api: fewer, "backend/tests/test_limits.py": helper[
+                                        "backend/tests/helpers.py"]}, ()),
+                                    (base, {"backend/tests/test_api_v2.py": api}, {test_api}),
+                                    (keep, {test_api: api.replace("120", "125")}, ())):
+            with self.subTest(change=sorted(change), drop=drop):
+                self.assertEqual(flagged(start, change, drop), set())
 
     def test_environment_guard_skip_is_not_a_hit(self):
         details = " ".join(h.detail for h in self.hits("flag-skip-python"))
