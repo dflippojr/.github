@@ -47,7 +47,10 @@ whatever the change:
   `test_*` or `extends` option it changes, when the guard can read both sides);
 - any change to a file in or under a test directory (`test`, `tests`,
   `__tests__`, `e2e`, `spec`, `specs`), in either tree, whatever its extension
-  (`removed-tests`);
+  (`removed-tests`), except a Python file in a test directory whose outermost
+  test directory holds no C/C++ source or header in either tree (a Python
+  backend's `backend/tests`), which is judged by removed tests and new skips as
+  in any repository;
 - an added, deleted or renamed C/C++ source or header anywhere, including
   `.c++`, `.cp`, `.h++`, `.tpp`, `.tcc`, `.inl`, `.ino`, `.pde`, `.s` and files
   with no extension, which can shadow or drop an include; and any changed

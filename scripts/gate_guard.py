@@ -545,7 +545,10 @@ def removed_test_hits(files):
 # what they include. Anything else is a hit, whatever its content:
 #
 #   - a change to any platformio.ini (skip-marker, see platformio_hits);
-#   - a change to any file in or under a test directory, in either tree;
+#   - a change to any file in or under a test directory, in either tree,
+#     except a Python file in a test directory that holds no C/C++ source or
+#     header in either tree (a Python backend's tests/), which the Python
+#     rules judge as in any repository;
 #   - an added, deleted or renamed C/C++ source or header anywhere, or a
 #     changed submodule;
 #   - every pull request, when a platformio.ini names extra_configs or test_dir
@@ -562,6 +565,17 @@ def _at_test_dir(path):
     return any(d in TEST_DIRS for d in path.lower().split("/"))
 
 
+def _test_root(path):
+    """The outermost test directory path is in, lower-cased, or None."""
+    parts = path.lower().split("/")[:-1]
+    return next(("/".join(parts[:i + 1]) for i, d in enumerate(parts) if d in TEST_DIRS), None)
+
+
+def _python_test(path, facts):
+    """Whether path is a Python file outside test directories, or in one that holds no C/C++ source or header."""
+    return _ext(path) in PY_EXTS and _test_root(path) not in facts.c_test_roots
+
+
 def c_cpp_hits(files, facts, flagged):
     """removed-tests hits for a C/C++ repository's changes that may change which tests run or what they include.
 
@@ -575,7 +589,8 @@ def c_cpp_hits(files, facts, flagged):
     for fd in files:
         if not _touched(fd) or fd.path in flagged or fd.path in facts.blind:
             continue
-        if any(_at_test_dir(p) for p in fd.paths):
+        # A Python test is judged by removed_test_hits and skip_hits, as in any repository.
+        if any(_at_test_dir(p) for p in fd.paths) and not all(_python_test(p, facts) for p in fd.paths):
             detail = f"{fd.status} a file in a test directory of a C/C++ repository"
         elif fd.modes & {"160000"}:
             detail = f"{fd.status} a submodule of a C/C++ repository, which may hold sources or headers"
@@ -988,8 +1003,9 @@ class GitTrees:
 # c_cpp: whether either tree has a platformio.ini or a C/C++ source or header;
 # open_configs: [(platformio.ini, why)] for those that name extra_configs or
 # test_dir, or that cannot be read; blind: symbolic links and submodules at or
-# in a test directory, in a C/C++ repository.
-TreeFacts = collections.namedtuple("TreeFacts", "c_cpp open_configs blind")
+# in a test directory, in a C/C++ repository; c_test_roots: the outermost test
+# directories (see _test_root) that hold a C/C++ source or header in either tree.
+TreeFacts = collections.namedtuple("TreeFacts", "c_cpp open_configs blind c_test_roots")
 PIO_OPEN_OPTION = re.compile(r"extra_configs|test_dir", re.IGNORECASE)
 
 
@@ -1010,7 +1026,8 @@ def tree_facts(trees):
             open_configs[path] = f"names {' and '.join(sorted({m.lower() for m in PIO_OPEN_OPTION.findall(text)}))}"
     links = dict.fromkeys(link for side in ("-", "+") for link in trees.links(side))
     blind = [link for link in links if _at_test_dir(link)] if c_cpp else []
-    return TreeFacts(c_cpp, sorted(open_configs.items()), blind)
+    c_test_roots = {_test_root(p) for _, p in paths if _ext(p) in C_FILE_EXTS - {""}} - {None}
+    return TreeFacts(c_cpp, sorted(open_configs.items()), blind, c_test_roots)
 
 
 def repo_hits(repo_dir, base, head):
