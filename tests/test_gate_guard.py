@@ -948,6 +948,62 @@ class RuleDetails(unittest.TestCase):
         self.assertEqual(judge_commits(dict(base, **{"src/a.c": "int a;\n"}), dict(base, **{"src/a.c": "int b;\n"})),
                          [])
 
+    def test_python_tests_in_a_c_cpp_repository_are_judged_as_python(self):
+        """Issue #40: desk-controller's backend/tests are Python, beside firmware Unity tests."""
+        unity = ('#include <unity.h>\n#include "logic.h"\nvoid test_clamp_low(void) {\n'
+                 '  TEST_ASSERT_EQUAL(0, clamp(-5, 0, 10));\n}\nint main() {\n  RUN_TEST(test_clamp_low);\n}\n')
+        api = ("from backend.app import create_app\n\n\ndef test_health():\n    assert create_app()\n\n\n"
+               "def test_height_limits():\n    assert create_app().max_height == 120\n")
+        base = {"firmware/platformio.ini": "[env:native]\nplatform = native\n",
+                "firmware/src/logic.cpp": "int clamp(int v, int lo, int hi) { return v; }\n",
+                "firmware/include/logic.h": "int clamp(int v, int lo, int hi);\n",
+                "firmware/test/test_logic/test_main.cpp": unity, "backend/app.py": "def create_app():\n    pass\n",
+                "backend/tests/conftest.py": "import pytest\n", "backend/tests/test_api.py": api}
+        edited = api.replace("120", "125")
+        # (a) An assertion fixed, a conftest edited or a test added: no hit.
+        for change in ({"backend/tests/test_api.py": edited},
+                       {"backend/tests/conftest.py": "import pytest\n\n\n@pytest.fixture\ndef app():\n    pass\n"},
+                       {"backend/tests/test_api.py": api + "\n\ndef test_reset():\n    assert create_app()\n"},
+                       {"backend/tests/test_api.py": edited, "firmware/src/logic.cpp": "int clamp(int v) { return v; }\n"}):
+            with self.subTest(change=sorted(change)):
+                self.assertEqual(judge_commits(base, dict(base, **change)), [])
+        # (b) A test removed, or the test file deleted.
+        fewer = api.split("\n\n\ndef test_height_limits")[0] + "\n"
+        [hit] = judge_commits(base, dict(base, **{"backend/tests/test_api.py": fewer}))
+        self.assertEqual((hit.rule, hit.path), ("removed-tests", "backend/tests/test_api.py"))
+        self.assertIn("test_height_limits", hit.detail)
+        head = dict(base)
+        del head["backend/tests/test_api.py"]
+        [hit] = judge_commits(base, head)
+        self.assertEqual((hit.rule, hit.path), ("removed-tests", "backend/tests/test_api.py"))
+        self.assertTrue(hit.detail.startswith("test file deleted"), hit)
+        # (c) A skip marker added, or an unconditional skip call.
+        for skipped in (api.replace("def test_height_limits", "@pytest.mark.skip\ndef test_height_limits"),
+                        api.replace("    assert create_app().max_height", "    pytest.skip('later')\n    assert create_app().max_height")):
+            with self.subTest(skipped=skipped):
+                [hit] = judge_commits(base, dict(base, **{"backend/tests/test_api.py": skipped}))
+                self.assertEqual((hit.rule, hit.path), ("skip-marker", "backend/tests/test_api.py"))
+        # (d) The C/C++ rules stand: a Unity test edit, a Python file in the firmware
+        # test directory, and a Python test directory that gains a C/C++ file.
+        cases = [({"firmware/test/test_logic/test_main.cpp": unity.replace("0, clamp", "1, clamp")},
+                  {("firmware/test/test_logic/test_main.cpp", TOUCHED)}),
+                 ({"firmware/test/test_logic/gen_cases.py": "CASES = 3\n"},
+                  {("firmware/test/test_logic/gen_cases.py", TOUCHED.replace("modified", "added"))}),
+                 ({"backend/tests/test_api.py": edited, "backend/tests/native.c": "int x;\n"},
+                  {("backend/tests/test_api.py", TOUCHED),
+                   ("backend/tests/native.c", TOUCHED.replace("modified", "added"))})]
+        for change, expected in cases:
+            with self.subTest(change=sorted(change)):
+                hits = judge_commits(base, dict(base, **change))
+                self.assertEqual({(h.path, h.detail) for h in hits}, expected)
+        base_py = dict(base, **{"firmware/test/test_logic/gen_cases.py": "CASES = 3\n"})
+        hits = judge_commits(base_py, dict(base_py, **{"firmware/test/test_logic/gen_cases.py": "CASES = 2\n"}))
+        self.assertEqual({(h.path, h.detail) for h in hits}, {("firmware/test/test_logic/gen_cases.py", TOUCHED)})
+        # Only Python files are judged as Python: other files in a test directory are still hits.
+        [hit] = judge_commits(dict(base, **{"backend/tests/data.json": "{}\n"}),
+                              dict(base, **{"backend/tests/data.json": "[]\n"}))
+        self.assertEqual((hit.path, hit.detail), ("backend/tests/data.json", TOUCHED))
+
     def test_environment_guard_skip_is_not_a_hit(self):
         details = " ".join(h.detail for h in self.hits("flag-skip-python"))
         self.assertIn("flaky", details)

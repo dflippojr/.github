@@ -1,0 +1,42 @@
+# gate-guard fixture: a Unity assertion changes next to a Python test fix; the C/C++ test directory change still needs approval
+# expect: removed-tests
+# hits: 1
+
+diff --git a/backend/tests/test_api.py b/backend/tests/test_api.py
+index 5d1e2f0..8a3c4b7 100644
+--- a/backend/tests/test_api.py
++++ b/backend/tests/test_api.py
+@@ -1,11 +1,11 @@
+ from backend.app import create_app
+ 
+ 
+ def test_health():
+     client = create_app().test_client()
+     assert client.get("/health").status_code == 200
+ 
+ 
+ def test_height_limits():
+     client = create_app().test_client()
+-    assert client.get("/height").json["max"] == 120
++    assert client.get("/height").json["max"] == 125
+diff --git a/firmware/test/test_logic/test_main.cpp b/firmware/test/test_logic/test_main.cpp
+index 8034f23..1c9d0e2 100644
+--- a/firmware/test/test_logic/test_main.cpp
++++ b/firmware/test/test_logic/test_main.cpp
+@@ -1,14 +1,14 @@
+ #include <unity.h>
+ #include "logic.h"
+ 
+ void setUp(void) {}
+ void tearDown(void) {}
+ 
+ void test_clamp_low(void) {
+-    TEST_ASSERT_EQUAL(0, clamp(-5, 0, 10));
++    TEST_ASSERT_EQUAL(1, clamp(-5, 1, 10));
+ }
+ 
+ int main(int argc, char **argv) {
+     UNITY_BEGIN();
+     RUN_TEST(test_clamp_low);
+     return UNITY_END();
+ }
