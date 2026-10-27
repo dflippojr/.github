@@ -55,8 +55,10 @@ whatever the change:
   change touches what pytest collects (`collect_ignore`, `__test__`,
   `pytestmark`, a `pytest_` hook, a constructor or a `Test` class), moves
   tests or the module to another name or directory, renames a `conftest.py`,
-  adds or rewires a skip or the conditions, loops and constants around it, or
-  is not shown whole or cannot be parsed. The guard compares such a file
+  adds or rewires a skip or what decides whether it runs (the branch, loop,
+  `try` or condition around it, and the constants, parameters, `parametrize`
+  values, fixtures and helpers of the same file it reads or calls), or is not
+  shown whole or cannot be parsed. The guard compares such a file
   statement by statement, so a change inside a multi-line list, condition or
   decorator counts;
 - an added, deleted or renamed C/C++ source or header anywhere, including

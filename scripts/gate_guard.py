@@ -598,15 +598,29 @@ PY_COLLECT = re.compile(r"\bcollect_ignore(?:_glob)?\b|\b__test__\b|\bpytestmark
 PY_SKIP_MARK = re.compile(r"\bmark\.(?:skip|skipif|xfail)\b|^(?:unittest\.)?(?:skip|skipIf|skipUnless|expectedFailure)\b")
 PY_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
 PY_BLOCKS = (ast.stmt, ast.excepthandler, ast.match_case)
+# Blocks whose other blocks decide whether one of them runs: a loop's body
+# (a break) for its else, a try's handlers and else for its body, the cases
+# before a match case.
+PY_SIBLING_BLOCKS = (ast.For, ast.AsyncFor, ast.While, ast.Try, getattr(ast, "TryStar", ast.Try), ast.Match)
 
 
-def _py_header(node):
-    """What node, an ancestor of a statement, says about whether the statement runs: all of it but its blocks."""
+def _py_header(node, field):
+    """What node, an ancestor of a statement through its field, says about whether the statement runs."""
     if isinstance(node, PY_DEFS):
         return ("def",)
     if isinstance(node, ast.ClassDef):
         return ("class", node.name)
-    return (type(node).__name__,) + tuple(ast.dump(v) if isinstance(v, ast.AST) else repr(v) for v in _py_fields(node))
+    header = (type(node).__name__, field) + tuple(_py_dump(v) for v in _py_fields(node))
+    if isinstance(node, PY_SIBLING_BLOCKS):
+        for other, value in ast.iter_fields(node):
+            if isinstance(value, list):
+                header += tuple(_py_dump(v) if other != field else repr([_py_dump(f) for f in _py_fields(v)])
+                                for v in value if isinstance(v, PY_BLOCKS))
+    return header
+
+
+def _py_dump(value):
+    return ast.dump(value) if isinstance(value, ast.AST) else repr(value)
 
 
 def _py_fields(node):
@@ -622,14 +636,23 @@ def _py_names(nodes):
             for n in ast.walk(node) if isinstance(n, (ast.Name, ast.Attribute))}
 
 
+def _py_simple(node):
+    """Whether node is a statement with no block of its own."""
+    return isinstance(node, ast.stmt) and not any(isinstance(v, list) and v and isinstance(v[0], PY_BLOCKS)
+                                                  for _, v in ast.iter_fields(node))
+
+
 def _python_items(text):
     """(collection, test classes, skips) of one side of a Python file, or None when it does not parse.
 
     Each is a multiset of ast.dump strings, which leave out line numbers, so a
     statement compares whole however it is laid out and wherever it moves. A
-    skip carries the headers of the blocks and expressions around it (an if,
-    a loop, a with, a try, a ternary) and what binds the names they read: the
-    parameters of the functions around it and every assignment in the file.
+    skip carries the headers of the blocks and expressions around it (an if
+    or its else, a loop, a with, a try, a ternary) and what binds the names
+    they read: the parameters and decorators of the functions around it, and
+    every assignment, import, function and class in the file. A call to a
+    function of the file that skips, and a parameter or usefixtures that names
+    one, is a skip too.
     """
     try:
         with warnings.catch_warnings():
@@ -637,31 +660,47 @@ def _python_items(text):
             tree = ast.parse(text.lstrip("﻿"))
     except (SyntaxError, ValueError):
         return None
-    assigned = collections.defaultdict(list)
+    skip_call = IMPERATIVE_SKIP_RULES[0][2]
+    assigned, skippers = collections.defaultdict(list), set()
+    defs = [n for n in ast.walk(tree) if isinstance(n, PY_DEFS)]
     for node in ast.walk(tree):
         targets = (node.targets if isinstance(node, ast.Assign)
                    else [node.target] if isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr, ast.For,
                                                            ast.AsyncFor))
                    else [n.optional_vars for n in node.items] if isinstance(node, (ast.With, ast.AsyncWith))
                    else node.names if isinstance(node, (ast.Import, ast.ImportFrom)) else [])
-        for name in {getattr(t, "asname", None) or getattr(t, "name", "").split(".")[0] for t in targets
-                     if isinstance(t, ast.alias)} | _py_names(t for t in targets if isinstance(t, ast.AST)):
+        names = {getattr(t, "asname", None) or getattr(t, "name", "").split(".")[0] for t in targets
+                 if isinstance(t, ast.alias)} | _py_names(t for t in targets if isinstance(t, ast.AST))
+        if isinstance(node, PY_DEFS + (ast.ClassDef,)):
+            names.add(node.name)
+        for name in names:
             assigned[name].append(ast.dump(node))
+    # Functions that skip, directly or through another function of the file.
+    while True:
+        more = {d.name for d in defs if d.name not in skippers and any(
+            _py_simple(s) and (skip_call.search(ast.unparse(s)) or _py_names([s]) & skippers)
+            for s in ast.walk(d))}
+        if not more:
+            break
+        skippers |= more
     collect, classes, skips = collections.Counter(), collections.Counter(), collections.Counter()
 
     def skip(item, ancestors, params):
-        names = _py_names([f for a in ancestors if not isinstance(a, (*PY_DEFS, ast.ClassDef))
+        names = _py_names([f for a, _ in ancestors if not isinstance(a, (*PY_DEFS, ast.ClassDef))
                            for f in _py_fields(a)] + [item])
-        binds = sorted(b for n in names for b in params.get(n, assigned.get(n, [])))
-        skips[repr(([_py_header(a) for a in ancestors], ast.dump(item), binds))] += 1
+        binds = sorted(b for n in names for b in params.get(n, []) + assigned.get(n, []))
+        skips[repr(([_py_header(*a) for a in ancestors], ast.dump(item), binds))] += 1
 
     def visit(node, ancestors, params):
-        context = repr([_py_header(a) for a in ancestors])
+        context = repr([_py_header(*a) for a in ancestors])
         if isinstance(node, PY_DEFS + (ast.ClassDef,)):
             if isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
                 classes[repr((context, node.name))] += 1
             for d in node.decorator_list:
-                if PY_SKIP_MARK.search(ast.unparse(d)):
+                source = ast.unparse(d)
+                if PY_SKIP_MARK.search(source) or skippers & {c.value for c in ast.walk(d)
+                                                             if isinstance(c, ast.Constant)
+                                                             and isinstance(c.value, str)}:
                     skip(d, ancestors, params)
             if isinstance(node, PY_DEFS):
                 if node.name.startswith("pytest_") or any("hookimpl" in ast.unparse(d) for d in node.decorator_list):
@@ -669,20 +708,24 @@ def _python_items(text):
                     return
                 if node.name == "__init__":
                     collect[repr((context, "__init__"))] += 1
-                params = dict(params, **{a.arg: [ast.dump(node.args)] for a in ast.walk(node.args)
-                                         if isinstance(a, ast.arg)})
-        elif isinstance(node, ast.stmt) and not any(isinstance(v, list) and v and isinstance(v[0], PY_BLOCKS)
-                                                    for _, v in ast.iter_fields(node)):
+                args = [a for a in ast.walk(node.args) if isinstance(a, ast.arg)]
+                for a in args:
+                    if a.arg in skippers:
+                        skip(a, ancestors, params)
+                binds = [ast.dump(node.args)] + [ast.dump(d) for d in node.decorator_list]
+                params = dict(params, **{a.arg: binds for a in args})
+        elif _py_simple(node):
             source = ast.unparse(node)
             if PY_COLLECT.search(source):
                 collect[repr((context, ast.dump(node)))] += 1
-            if IMPERATIVE_SKIP_RULES[0][2].search(source):
+            if skip_call.search(source) or _py_names([node]) & skippers:
                 skip(node, ancestors, params)
             return
-        for _, value in ast.iter_fields(node):
+        for field, value in ast.iter_fields(node):
             for child in value if isinstance(value, list) else [value]:
                 if isinstance(child, ast.AST) and not isinstance(child, (ast.expr_context, ast.arguments)):
-                    visit(child, ancestors + [node] if not isinstance(node, ast.Module) else ancestors, params)
+                    visit(child, ancestors + [(node, field)] if not isinstance(node, ast.Module) else ancestors,
+                          params)
 
     visit(tree, [], {})
     return collect, classes, skips
