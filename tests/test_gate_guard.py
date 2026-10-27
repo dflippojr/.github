@@ -1282,6 +1282,11 @@ class RuleDetails(unittest.TestCase):
             walrus = "    assert [os for v in [1] if (os := v)]\n"
             [hit] = judged(walrus, "    module = os\n    module.getcwd()\n", api.replace(limits, walrus + limits))
             self.assertIn("adds a use of os," if sys.version_info >= (3, 8) else "cannot parse", hit.detail)
+        # A for that assigns to an attribute or an item binds no name there; the guard does not follow it.
+        with self.subTest(change="for item target"):
+            loop = "    for app.limits[0] in [LIMIT]:\n        assert app\n"
+            [hit] = judged("        assert app\n", "        assert app.max_height\n", api.replace(limits, loop + limits))
+            self.assertIn("assigns to an attribute or an item", hit.detail)
         # A block moved between a try's clauses: finally runs always, else only without an exception.
         with self.subTest(change="finally to else"):
             guarded = "def test_hw():\n    try:\n        assert 1\n    except ValueError:\n        pass\n" \
