@@ -93,9 +93,10 @@ whatever the change:
   `importlib`, `modules`, `setattr`, `delattr`, `getattr`, `patch`, a frame's
   `f_globals`, `_getframe`, `getmodule`, `gc`, `ctypes`, or any dunder but
   `__name__`, `__main__`, `__init__`, `__file__` and `__doc__`. So an unchanged
-  `from os import getcwd as len` makes a new `len()` a hit. A builtin that
-  fails that test, or any other builtin, such as `exec`, is not exempt even
-  where the test already used it.
+  `from os import getcwd as len` makes a new `len()` a hit. Where the test
+  already used a builtin's name, that use counts only if no scope binds the
+  name, the file holds it only as a plain name and has no wildcard import, and
+  the builtin is one of the harmless ones (so not `exec`, `getattr` or `open`).
   Every changed line, even a comment or a blank line, must be
   inside a test body (indented deeper than its `def`) and hold only printable
   ASCII, so Python reads it as the guard does. Any other change is a hit: a

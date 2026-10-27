@@ -899,27 +899,26 @@ def _python_unexempt(fd):
     if skeletons[0] != skeletons[1]:
         return ("it changes code outside a test body: a def or class line, a decorator, an import, or module- or "
                 "class-level code")
-    real = _py_real_builtins(fd.path, texts, trees)
-    return (next(filter(None, (_python_test_change(old, new, real) for old, new in zip(*tests))), None)
+    builtin_names = _py_builtins(fd.path, texts, trees)
+    return (next(filter(None, (_python_test_change(old, new, *builtin_names) for old, new in zip(*tests))), None)
             or _python_scope_change(texts, trees, tests))
 
 
-def _py_real_builtins(path, texts, trees):
-    """The harmless builtins that are the builtins in both sides of the file at path, texts parsed as trees.
+def _py_builtins(path, texts, trees):
+    """(real, shadowed): what the file at path, texts parsed as trees, may make of the builtins' names.
 
-    Round b6: none if either side names what can reach a name at run time
-    (PY_DYNAMIC, or a dunder), has a wildcard import or imports a module
-    named as the file is, which may be the file itself. Else those that no
-    scope of either side binds, even another test's, and that each side
-    holds only as plain names: not as a string, a keyword, an attribute or
-    in a comment, which a route to a namespace the guard does not list may
-    use.
+    Round b6. shadowed holds the builtins' names that a scope of either side
+    binds, even another test's, or that either side holds otherwise than as
+    a plain name: in a string, a keyword, an attribute or a comment, which a
+    route to a namespace the guard does not list may use; after a wildcard
+    import, every builtin's name. real holds the harmless builtins that are
+    not shadowed, and none if either side names what can reach a name at run
+    time (PY_DYNAMIC, or a dunder) or imports a module named as the file is,
+    which may be the file itself.
     """
+    # Each side as written and as NFKC, which ast reads names as: [old, old NFKC, new, new NFKC].
     words = [collections.Counter(re.findall(r"\w+", t)) for text in texts
              for t in (text, unicodedata.normalize("NFKC", text))]
-    found = set().union(*words)
-    if found & PY_DYNAMIC or any(w[:2] == w[-2:] == "__" and len(w) > 4 and w not in PY_TEXT_DUNDERS for w in found):
-        return frozenset()
     bound, imported, names = set(), set(), []
     for tree in trees:
         bound |= _py_binds(tree)
@@ -927,19 +926,24 @@ def _py_real_builtins(path, texts, trees):
         for n in ast.walk(tree):
             if isinstance(n, (ast.Import, ast.ImportFrom)):
                 imported.update(".".join([getattr(n, "module", None) or ""] + [a.name for a in n.names]).split("."))
-    if "*" in bound or posixpath.basename(path)[:-len(".py")] in imported:
-        return frozenset()
-    # words holds each side as written and as NFKC, which ast reads names as: [old, old NFKC, new, new NFKC].
-    return frozenset(b for b in PY_BUILTINS - bound if words[1][b] == names[0][b] and words[3][b] == names[1][b])
+    every = set(dir(builtins))
+    shadowed = every if "*" in bound else {b for b in every if b in bound or words[1][b] != names[0][b]
+                                           or words[3][b] != names[1][b]}
+    found = set().union(*words)
+    if (found & PY_DYNAMIC or posixpath.basename(path)[:-len(".py")] in imported
+            or any(w[:2] == w[-2:] == "__" and len(w) > 4 and w not in PY_TEXT_DUNDERS for w in found)):
+        return frozenset(), frozenset(shadowed)
+    return PY_BUILTINS - shadowed, frozenset(shadowed)
 
 
-def _python_test_change(old, new, real):
+def _python_test_change(old, new, real, shadowed):
     """Why changing the test old to new is more than an edit of assertions and plain statements, or None.
 
-    real holds the harmless builtins that are the builtins in the file (_py_real_builtins). A builtin's name
-    not in real, such as exec or a shadowed print, is not exempt even where old used it, unless new binds it.
+    real holds the harmless builtins that are the builtins in the file, shadowed the builtins' names the file
+    may make another object (_py_builtins). Neither a shadowed name nor a builtin outside the harmless ones,
+    such as exec, is exempt where old used it, unless new binds it.
     """
-    unsure = set(dir(builtins)) - real
+    unsure = (set(dir(builtins)) - PY_BUILTINS) | shadowed
     # A name old binds anywhere, even in a nested def or a comprehension, is not one it used from outside.
     known, own = _py_reads(old, frozenset(_py_binds(old))), _py_locals(new)
     flow = (ast.Yield, ast.YieldFrom) + (() if isinstance(new, ast.AsyncFunctionDef) else (ast.Await,))
@@ -1218,11 +1222,17 @@ def _python_resolution_change(trees):
 
 
 def _py_bindings(node):
-    """What each comprehension and lambda inside node binds, in ast.walk's order: a comprehension's targets'
-    names, generator by generator, or a lambda's parameters, and the targets of each := inside it."""
-    return [(type(n).__name__, [sorted(_py_bound(g.target)) for g in n.generators] if isinstance(n, PY_COMPS)
-             else sorted(_py_params(n.args)), sorted(w.target.id for w in ast.walk(n) if isinstance(w, PY_WALRUS)))
-            for n in ast.walk(node) if isinstance(n, PY_COMPS + (ast.Lambda,))]
+    """What each comprehension and lambda inside node binds, in source order, each before those inside it: a
+    comprehension's targets' names, generator by generator, or a lambda's parameters, and the targets of each
+    := inside it."""
+    found = []
+    for n in ast.iter_child_nodes(node):
+        if isinstance(n, PY_COMPS + (ast.Lambda,)):
+            found.append((type(n).__name__, [sorted(_py_bound(g.target)) for g in n.generators]
+                          if isinstance(n, PY_COMPS) else sorted(_py_params(n.args)),
+                          sorted(w.target.id for w in ast.walk(n) if isinstance(w, PY_WALRUS))))
+        found += _py_bindings(n)
+    return found
 
 
 def _python_scope_change(texts, trees, tests):
