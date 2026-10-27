@@ -1287,6 +1287,27 @@ class RuleDetails(unittest.TestCase):
             loop = "    for app.limits[0] in [LIMIT]:\n        assert app\n"
             [hit] = judged("        assert app\n", "        assert app.max_height\n", api.replace(limits, loop + limits))
             self.assertIn("assigns to an attribute or an item", hit.detail)
+        # A def or a class inside a test has names of its own: a global there makes a name the test binds
+        # the module's, so any change inside one is a hit, even with its header unchanged. An edit at the
+        # test's own level is not.
+        nested = ("import os\n\n\ndef test_hw():\n    os = 1\n\n    def helper():\n        global os\n"
+                  "        assert True\n\n    helper()\n    assert os\n")
+        inner, getcwd = "        assert True\n", "        assert True\n        os.getcwd()\n"
+        guarded = nested.replace("\n    def helper():\n        global os\n        assert True\n\n    helper()\n",
+                                 "    if os:\n        def helper():\n            global os\n            assert True\n\n"
+                                 "        helper()\n")
+        for start_text, old, new in (
+                (nested, inner, inner + "        os.execv('/bin/true', ['true'])\n"), (nested, inner, getcwd),
+                (nested, inner, inner + "        (lambda: os.getcwd())()\n"),
+                (nested, inner, inner + "        [os.getcwd() for _ in [1]]\n"), (nested, inner, "        assert 1\n"),
+                (nested.replace("    def helper", "    async def helper"), inner, getcwd),
+                (nested.replace("    def helper():", "    class Helper:").replace("    helper()\n", ""), inner, getcwd),
+                (guarded, "            assert True\n", "            assert True\n            os.getcwd()\n")):
+            with self.subTest(start=start_text, new=new):
+                [hit] = judged(old, new, start_text)
+                self.assertIn("defined inside test_hw", hit.detail)
+        with self.subTest(change="nested helper, test's own assertion"):
+            self.assertEqual(judged("    assert os\n", "    assert os == 1\n", nested), [])
         # A block moved between a try's clauses: finally runs always, else only without an exception.
         with self.subTest(change="finally to else"):
             guarded = "def test_hw():\n    try:\n        assert 1\n    except ValueError:\n        pass\n" \
