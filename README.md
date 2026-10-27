@@ -61,8 +61,9 @@ whatever the change:
   dotted names its test already used, its test's own names and harmless
   builtins (a name the test binds anywhere, even in a nested `def` or `class`,
   a lambda, a comprehension or a `:=`, is not one it used; a lambda binds only
-  its parameters, a comprehension only plain names, and a comprehension that
-  assigns to an attribute or an item in its `for` is a hit). Every changed line, even a comment or a blank line, must be
+  its parameters, a comprehension only plain names, and any change to a test
+  whose `for` or comprehension assigns to an attribute or an item is a hit).
+  Every changed line, even a comment or a blank line, must be
   inside a test body (indented deeper than its `def`) and hold only printable
   ASCII, so Python reads it as the guard does. Any other change is a hit: a
   `conftest.py` or helper, a rename, addition or deletion, an import, a

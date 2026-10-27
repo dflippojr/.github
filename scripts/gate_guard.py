@@ -893,15 +893,19 @@ def _python_test_change(old, new):
                         if isinstance(n, ast.Attribute) and PY_REFLECT.match(n.attr)), None)
         if reflect:
             return f"it adds a use of .{reflect}, which reaches a module's globals or a frame"
-        if any(isinstance(n, ast.comprehension) and any(isinstance(t, (ast.Attribute, ast.Subscript))
-                                                         for t in ast.walk(n.target)) for n in ast.walk(statement)):
-            return "it assigns to an attribute or an item in a comprehension's for, which the guard does not follow"
         for chain in sorted(_py_reads(statement)):
             parts = chain.split(".")
             if PY_REFLECT.match(parts[0]) or not (parts[0] in own or chain in known or chain in PY_BUILTINS):
                 return f"it adds a use of {chain}, which {new.name} did not have"
         return None
 
+    # A for or a comprehension that assigns to an attribute or an item binds no name there and may
+    # change what any statement reads, so the guard does not follow a test that holds one.
+    if ast.dump(old) != ast.dump(new) and any(
+            isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension))
+            and any(isinstance(t, (ast.Attribute, ast.Subscript)) for t in ast.walk(n.target)) for n in ast.walk(new)):
+        return (f"it changes {new.name}, which assigns to an attribute or an item in a for or a comprehension's "
+                "for; the guard does not follow that")
     why = _py_unplain(old.body, new.body, plain, uses)
     if why == "flow":
         return (f"it changes a statement in {new.name} that is not an assertion or plain statement: an if, for, "
