@@ -52,10 +52,13 @@ whatever the change:
   extension counts, except `.gitignore`, `.gitattributes`, `.gitkeep` and
   `.keep`), as in a Python backend's `backend/tests`. Such a file is judged by
   removed tests and new skips as in any repository, but is still a hit when its
-  change touches what pytest collects (`collect_ignore`, `__test__`, a
-  `pytest_` hook, a constructor or a `Test` class), moves tests or the module
-  to a name or directory pytest does not collect, adds or rewires a
-  conditional skip, or is not shown whole;
+  change touches what pytest collects (`collect_ignore`, `__test__`,
+  `pytestmark`, a `pytest_` hook, a constructor or a `Test` class), moves
+  tests or the module to another name or directory, renames a `conftest.py`,
+  adds or rewires a skip or the conditions, loops and constants around it, or
+  is not shown whole or cannot be parsed. The guard compares such a file
+  statement by statement, so a change inside a multi-line list, condition or
+  decorator counts;
 - an added, deleted or renamed C/C++ source or header anywhere, including
   `.c++`, `.cp`, `.h++`, `.tpp`, `.tcc`, `.inl`, `.ino`, `.pde`, `.s` and files
   with no extension, which can shadow or drop an include; and any changed

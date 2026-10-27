@@ -1112,6 +1112,19 @@ class RuleDetails(unittest.TestCase):
         old = "LATER = False\n" + api.replace(limits, "    if LATER:\n        pytest.skip('later')\n" + limits)
         with self.subTest(change="constant"):
             self.assertTrue(flipped(old, old.replace("LATER = False", "LATER = True")))
+        # Siblings: a parameter's default, a loop, a condition inside the expression.
+        for old in (api.replace("def test_height_limits():\n" + limits, "def test_height_limits(later=False):\n"
+                                "    if later:\n        pytest.skip('later')\n" + limits),
+                    api.replace(limits, "    for _ in range(False):\n        pytest.skip('later')\n" + limits),
+                    api.replace(limits, "    (\n        False\n        and pytest.skip('later')\n    )\n" + limits)):
+            with self.subTest(old=old):
+                self.assertTrue(flipped(old, old.replace("False", "True")), old)
+        # A module renamed to conftest.py, whose ignore list then applies.
+        hooks = "collect_ignore = ['test_api.py']\n"
+        with self.subTest(change="renamed to conftest.py"):
+            self.assertEqual(flagged(dict(base, **{"backend/tests/sub/hooks.py": hooks}),
+                                     {"backend/tests/sub/conftest.py": hooks}, drop={"backend/tests/sub/hooks.py"}),
+                             {"backend/tests/sub/conftest.py"})
         # Still no hit: an ignore list reformatted, and an assertion edited under an environment guard.
         empty = dict(base, **{conftest: "import pytest\n\ncollect_ignore = [\n]\n"})
         node = dict(base, **{test_api: api.replace(limits, "    if not shutil.which('node'):\n"

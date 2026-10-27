@@ -36,6 +36,7 @@ one notice annotation states the verdict for pr_body_lint.py.
     python3 gate_guard.py --pull-request-target --guard-sha "$GUARD_SHA"
 """
 import argparse
+import ast
 import base64
 import bisect
 import collections
@@ -53,6 +54,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+import warnings
 
 APPROVAL_LABEL = "gate-change-approved"
 FINDINGS_LABEL = "findings-accepted"
@@ -554,10 +556,14 @@ def removed_test_hits(files, into=None):
 #     header in either tree (a Python backend's tests/), which the Python
 #     rules judge as in any repository. They count test functions and skips,
 #     not what pytest collects, so such a file is still a hit when its change
-#     touches collection (collect_ignore, __test__, a pytest_ hook, a Test
-#     class), moves tests or the module where pytest does not collect them,
-#     or adds or rewires a conditional skip (a constant condition passes for
-#     an environment check), or when the diff does not show the whole file;
+#     touches collection (collect_ignore, __test__, pytestmark, a pytest_
+#     hook, a constructor, a Test class), moves tests or the module to
+#     another name or directory, renames a conftest.py, or adds or rewires a
+#     skip or anything around it (a constant condition passes for an
+#     environment check), or when the diff does not show the whole file or
+#     the guard cannot parse it. Both sides are compared statement by
+#     statement (see _python_items), so a change inside a multi-line list,
+#     condition or decorator counts;
 #   - an added, deleted or renamed C/C++ source or header anywhere, or a
 #     changed submodule;
 #   - every pull request, when a platformio.ini names extra_configs or test_dir
@@ -585,80 +591,146 @@ def _python_test(path, facts):
     return _ext(path) in PY_EXTS and _test_root(path) not in facts.c_test_roots
 
 
-# Lines of a Python test file that can change what pytest collects: an ignore
-# list, __test__, a hook or plugin, a constructor (pytest skips a test class
-# that has one), and every line of a pytest_ hook's body.
-PY_COLLECT = re.compile(r"\bcollect_ignore(?:_glob)?\b|\b__test__\b|\bpytest_\w+|\bhookimpl\b|\bdef\s+__init__\s*\(")
-PY_TEST_CLASS = re.compile(r"^\s*class\s+Test")
-PY_FUNC = re.compile(r"^(\s*)(?:async\s+)?def\s+(\w+)")
+# Statements of a Python test file that can change what pytest collects: an
+# ignore list, __test__, pytestmark, a hook or plugin, and a constructor
+# (pytest skips a test class that has one).
+PY_COLLECT = re.compile(r"\bcollect_ignore(?:_glob)?\b|\b__test__\b|\bpytestmark\b|\bpytest_\w+|\bhookimpl\b")
+PY_SKIP_MARK = re.compile(r"\bmark\.(?:skip|skipif|xfail)\b|^(?:unittest\.)?(?:skip|skipIf|skipUnless|expectedFailure)\b")
+PY_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
+PY_BLOCKS = (ast.stmt, ast.excepthandler, ast.match_case)
 
 
-def _python_side_items(fd, side):
-    """Changed lines on one side of fd, a whole Python file, that the Python rules cannot judge.
+def _py_header(node):
+    """What node, an ancestor of a statement, says about whether the statement runs: all of it but its blocks."""
+    if isinstance(node, PY_DEFS):
+        return ("def",)
+    if isinstance(node, ast.ClassDef):
+        return ("class", node.name)
+    return (type(node).__name__,) + tuple(ast.dump(v) if isinstance(v, ast.AST) else repr(v) for v in _py_fields(node))
 
-    Each item is ("collect", line), ("class", line) or ("skip", condition, skip):
-    a test class line, and a conditional skip whose condition or call changed.
+
+def _py_fields(node):
+    """The fields of node that are not blocks of statements, list items as fields of their own."""
+    for _, value in ast.iter_fields(node):
+        if not (isinstance(value, list) and value and isinstance(value[0], PY_BLOCKS)):
+            yield from value if isinstance(value, list) else [value]
+
+
+def _py_names(nodes):
+    return {n.id if isinstance(n, ast.Name) else n.attr
+            for node in nodes if isinstance(node, ast.AST)
+            for n in ast.walk(node) if isinstance(n, (ast.Name, ast.Attribute))}
+
+
+def _python_items(text):
+    """(collection, test classes, skips) of one side of a Python file, or None when it does not parse.
+
+    Each is a multiset of ast.dump strings, which leave out line numbers, so a
+    statement compares whole however it is laid out and wherever it moves. A
+    skip carries the headers of the blocks and expressions around it (an if,
+    a loop, a with, a try, a ternary) and what binds the names they read: the
+    parameters of the functions around it and every assignment in the file.
     """
-    items, funcs, previous = [], [], None
-    skip = IMPERATIVE_SKIP_RULES[0][2]
-    for l in fd.lines:
-        if l.kind not in (" ", side) or not l.text.strip() or l.text.strip().startswith("#"):
-            continue
-        indent = len(l.text) - len(l.text.lstrip())
-        while funcs and funcs[-1][0] >= indent:
-            funcs.pop()
-        m = PY_FUNC.match(l.text)
-        if m:
-            funcs.append((len(m.group(1)), m.group(2)))
-        condition = l if CONDITION_LINE.match(l.text) else previous
-        if skip.search(l.text) and condition is not None and CONDITION_LINE.match(condition.text) and (
-                l.kind == side or condition.kind == side):
-            items.append(("skip", condition.text.strip(), l.text.strip()))
-        if l.kind == side:
-            if PY_COLLECT.search(l.text) or any(name.startswith("pytest_") for _, name in funcs):
-                items.append(("collect", l.text.strip()))
-            elif PY_TEST_CLASS.match(l.text):
-                items.append(("class", l.text.strip()))
-        previous = l
-    return items
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            tree = ast.parse(text.lstrip("﻿"))
+    except (SyntaxError, ValueError):
+        return None
+    assigned = collections.defaultdict(list)
+    for node in ast.walk(tree):
+        targets = (node.targets if isinstance(node, ast.Assign)
+                   else [node.target] if isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr, ast.For,
+                                                           ast.AsyncFor))
+                   else [n.optional_vars for n in node.items] if isinstance(node, (ast.With, ast.AsyncWith))
+                   else node.names if isinstance(node, (ast.Import, ast.ImportFrom)) else [])
+        for name in {getattr(t, "asname", None) or getattr(t, "name", "").split(".")[0] for t in targets
+                     if isinstance(t, ast.alias)} | _py_names(t for t in targets if isinstance(t, ast.AST)):
+            assigned[name].append(ast.dump(node))
+    collect, classes, skips = collections.Counter(), collections.Counter(), collections.Counter()
+
+    def skip(item, ancestors, params):
+        names = _py_names([f for a in ancestors if not isinstance(a, (*PY_DEFS, ast.ClassDef))
+                           for f in _py_fields(a)] + [item])
+        binds = sorted(b for n in names for b in params.get(n, assigned.get(n, [])))
+        skips[repr(([_py_header(a) for a in ancestors], ast.dump(item), binds))] += 1
+
+    def visit(node, ancestors, params):
+        context = repr([_py_header(a) for a in ancestors])
+        if isinstance(node, PY_DEFS + (ast.ClassDef,)):
+            if isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+                classes[repr((context, node.name))] += 1
+            for d in node.decorator_list:
+                if PY_SKIP_MARK.search(ast.unparse(d)):
+                    skip(d, ancestors, params)
+            if isinstance(node, PY_DEFS):
+                if node.name.startswith("pytest_") or any("hookimpl" in ast.unparse(d) for d in node.decorator_list):
+                    collect[repr((context, ast.dump(node)))] += 1
+                    return
+                if node.name == "__init__":
+                    collect[repr((context, "__init__"))] += 1
+                params = dict(params, **{a.arg: [ast.dump(node.args)] for a in ast.walk(node.args)
+                                         if isinstance(a, ast.arg)})
+        elif isinstance(node, ast.stmt) and not any(isinstance(v, list) and v and isinstance(v[0], PY_BLOCKS)
+                                                    for _, v in ast.iter_fields(node)):
+            source = ast.unparse(node)
+            if PY_COLLECT.search(source):
+                collect[repr((context, ast.dump(node)))] += 1
+            if IMPERATIVE_SKIP_RULES[0][2].search(source):
+                skip(node, ancestors, params)
+            return
+        for _, value in ast.iter_fields(node):
+            for child in value if isinstance(value, list) else [value]:
+                if isinstance(child, ast.AST) and not isinstance(child, (ast.expr_context, ast.arguments)):
+                    visit(child, ancestors + [node] if not isinstance(node, ast.Module) else ancestors, params)
+
+    visit(tree, [], {})
+    return collect, classes, skips
 
 
-def _python_unjudged(fd, moved_out):
+def _python_unjudged(fd, moved_out, skipped):
     """Why the Python rules cannot judge fd, a Python file in a Python test directory of a C/C++ repository, or None.
 
-    moved_out holds the paths that lose tests when moves count only into files pytest collects.
+    moved_out holds the paths that lose tests when moves count only into files
+    pytest collects, skipped the paths that already have a skip-marker hit.
     """
     old, new = fd.old_path, fd.new_path
     if fd.status == "renamed" and is_test_module(old) and not (
-            is_test_module(new) and _test_root(old) == _test_root(new)):
-        return "renamed a Python test module to a name or directory where pytest may not collect it"
+            is_test_module(new) and posixpath.dirname(old) == posixpath.dirname(new)):
+        return "renamed a Python test module to another name or directory, where pytest may not collect it"
+    if fd.status == "renamed" and "conftest.py" in {_name(old), _name(new)}:
+        return "renamed a conftest.py, which changes what its hooks and settings apply to"
     if fd.path in moved_out:
-        return f"{fd.status} a Python test file whose tests moved to a file pytest does not collect"
+        return f"{fd.status} a Python test file whose tests moved to a file pytest may not collect"
     if not fd.changed():
         return None
-    if _whole_sides(fd) is None:
+    sides = _whole_sides(fd)
+    if sides is None:
         return f"{fd.status} a Python test file the diff does not show whole"
-    removed, added = _cancel_pairs(_python_side_items(fd, "-"), _python_side_items(fd, "+"), key=lambda i: i)
-    if any(i[0] == "collect" for i in removed + added):
-        return f"{fd.status} a Python test file's collection (collect_ignore, __test__ or a pytest_ hook)"
-    if any(i[0] == "class" for i in removed):
+    items = [_python_items(text) for text in sides]
+    if None in items:
+        return f"{fd.status} a Python test file the guard cannot parse"
+    (old_collect, old_classes, old_skips), (new_collect, new_classes, new_skips) = items
+    if old_collect != new_collect:
+        return f"{fd.status} a Python test file's collection (collect_ignore, __test__, pytestmark or a pytest_ hook)"
+    if old_classes - new_classes:
         return f"{fd.status} a Python test file's test class, which may take its tests out of collection"
-    if any(i[0] == "skip" for i in added):
-        return (f"{fd.status} a conditional skip in a Python test file; the guard cannot tell an environment check "
-                "from a condition that always holds")
+    if new_skips - old_skips and fd.path not in skipped:
+        return (f"{fd.status} a skip in a Python test file or the condition around it; the guard cannot tell an "
+                "environment check from a condition that always holds")
     return None
 
 
 def _collected_move(source, destination):
-    """Whether a test moved from source to destination still runs: pytest collects it in the same test directory."""
+    """Whether a test moved from source to destination still runs: pytest collects it in the same directory."""
     return (destination.status != "deleted" and is_test_module(destination.new_path)
-            and _test_root(destination.new_path) == _test_root(source.path))
+            and posixpath.dirname(destination.new_path) == posixpath.dirname(source.path))
 
 
-def c_cpp_hits(files, facts, flagged):
+def c_cpp_hits(files, facts, flagged, skipped=frozenset()):
     """removed-tests hits for a C/C++ repository's changes that may change which tests run or what they include.
 
-    flagged holds the paths that already have a removed-tests hit.
+    flagged holds the paths that already have a removed-tests hit, skipped those that have a skip-marker hit.
     """
     if not facts.c_cpp:
         return []
@@ -675,7 +747,7 @@ def c_cpp_hits(files, facts, flagged):
             if not all(_python_test(p, facts) for p in fd.paths):
                 detail = f"{fd.status} a file in a test directory of a C/C++ repository"
             else:
-                why = _python_unjudged(fd, moved_out)
+                why = _python_unjudged(fd, moved_out, skipped)
                 if why:
                     hits.append(Hit("removed-tests", fd.path, None, why + "; in a C/C++ repository the guard judges "
                                     "Python tests only by removed tests and skips, so this needs approval"))
@@ -1130,8 +1202,8 @@ def repo_hits(repo_dir, base, head):
 def analyze(files, facts=None):
     """The hits of a diff. facts come from the base and head trees; without them, from the files the diff shows."""
     facts = facts or tree_facts(DiffTrees(files))
-    removed = removed_test_hits(files)
-    hits = (removed + c_cpp_hits(files, facts, {h.path for h in removed}) + skip_hits(files, facts)
+    removed, skipped = removed_test_hits(files), skip_hits(files, facts)
+    hits = (removed + c_cpp_hits(files, facts, {h.path for h in removed}, {h.path for h in skipped}) + skipped
             + retry_hits(files) + gate_config_hits(files))
     seen = set()
     unique = []
