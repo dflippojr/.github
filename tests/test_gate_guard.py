@@ -1269,6 +1269,11 @@ class RuleDetails(unittest.TestCase):
                 self.assertTrue(hits)
                 self.assertEqual({h.path for h in hits}, {test_api})
                 self.assertTrue(any(h.rule == "removed-tests" and why in h.detail for h in hits), hits)
+        # A fixture pulled in by name from a conftest.py the guard does not read, which may skip.
+        with self.subTest(change="getfixturevalue"):
+            hw = "def test_hw(request):\n    assert request\n"
+            [hit] = judged("    assert request\n", "    request.getfixturevalue('hw')\n    assert request\n", hw)
+            self.assertIn("names getfixturevalue", hit.detail)
         # Only a test_ function, or a test_ method of a Test class with no constructor, has a body that
         # can change; anything else in the file counts as code outside a test body.
         for start_text in ("def testheight():\n    assert 120\n", "class Motor:\n    def test_speed(self):\n"
