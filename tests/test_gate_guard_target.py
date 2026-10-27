@@ -532,6 +532,19 @@ class OwnerLabel(unittest.TestCase):
     def test_unparseable_label_time_fails_closed(self):
         self.assertFalse(self.verdict([self.event("labeled", "owner", "yesterday")])[0])
 
+    def test_approve_gate_reapproval_counts_until_the_next_push(self):
+        """approve_gate.py removes and re-adds the owner's label after a push, so the newest event postdates it;
+        the push after that makes the approval stale again."""
+        events = [self.event("labeled", "owner", "2026-10-16T11:00:00Z", i=1),
+                  self.event("unlabeled", "owner", "2026-10-16T12:30:00Z", i=2),
+                  self.event("labeled", "owner", "2026-10-16T12:30:01Z", i=3)]
+        self.assertFalse(self.verdict(events[:1])[0], "the label from before the push")
+        self.assertTrue(self.verdict(events)[0])
+        later = gate_guard.parse_time("2026-10-16T13:00:00Z")
+        counts, why = self.verdict(events, pushed=later)
+        self.assertFalse(counts)
+        self.assertIn("re-applies it after reviewing the new commits", why)
+
 
 class HeadPushedAt(unittest.TestCase):
     def test_newest_push_of_the_sha_to_the_ref(self):

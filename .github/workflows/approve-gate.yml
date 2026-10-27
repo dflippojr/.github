@@ -1,0 +1,72 @@
+name: Approve gate (owner comment)
+
+# Reusable workflow for issue_comment callers. That event runs the workflow as
+# defined on the repository's default branch, so a pull request cannot change
+# the job that labels it. The job never checks out or runs pull request code:
+# it loads scripts/approve_gate.py from dflippojr/.github at approve-ref.
+#
+# The owner comments `/approve-gate <full head sha>` on a pull request. The
+# script reads the comment and the pull request again from the API, refuses
+# anything but the owner's own unedited comment naming the current head of an
+# open same-repository pull request, then applies gate-change-approved and
+# posts the head record `ao ready` reads, label first. It acts through
+# OWNER_GATE_TOKEN, the owner's fine-grained token, so GitHub records the owner
+# as the actor, and the labeled event re-runs the gate guard (events made with
+# GITHUB_TOKEN start no workflow). The job runs on a GitHub-hosted runner only:
+# the self-hosted runners keep state between jobs and run pull request code.
+# See README.md, "Approve a gate change by comment".
+on:
+  workflow_call:
+    inputs:
+      approve-ref:
+        description: >-
+          Full 40-character commit SHA of dflippojr/.github to load the script
+          from. Use the SHA in the caller's uses: line.
+        type: string
+        required: true
+    secrets:
+      OWNER_GATE_TOKEN:
+        description: >-
+          The repository owner's fine-grained token with Pull requests: Read
+          and write on this repository. The caller passes its own OWNER_GATE_TOKEN
+          secret.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  approve:
+    name: approve-gate
+    # A filter that keeps every other comment off a runner; the script checks all of it again.
+    if: >-
+      github.event_name == 'issue_comment' && github.event.action == 'created'
+      && github.event.issue.pull_request
+      && github.event.comment.user.id == github.repository_owner_id
+      && startsWith(github.event.comment.body, '/approve-gate ')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require a full commit SHA for the script
+        env:
+          APPROVE_REF: ${{ inputs.approve-ref }}
+        run: |
+          if ! printf '%s' "$APPROVE_REF" | grep -Eqx '[0-9a-f]{40}'; then
+            echo "::error::approve-ref must be a full 40-character commit SHA of dflippojr/.github, not '$APPROVE_REF'."
+            exit 1
+          fi
+
+      - name: Check out the script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dflippojr/.github
+          ref: ${{ inputs.approve-ref }}
+          path: approve-gate
+          persist-credentials: false
+          sparse-checkout: scripts/approve_gate.py
+          sparse-checkout-cone-mode: false
+
+      - name: Apply the owner's approval
+        env:
+          OWNER_GATE_TOKEN: ${{ secrets.OWNER_GATE_TOKEN }}
+        run: python3 approve-gate/scripts/approve_gate.py

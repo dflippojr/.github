@@ -1,0 +1,32 @@
+# Copy to .github/workflows/approve-gate.yml in each repository, then replace
+# both <full-sha> placeholders with the same full commit SHA of
+# dflippojr/.github main:
+#
+#   git ls-remote https://github.com/dflippojr/.github refs/heads/main
+#
+# The owner adds the OWNER_GATE_TOKEN repository secret first. issue_comment
+# runs this file as it is on the default branch, so a pull request that edits
+# it cannot change what approves it. See README.md in dflippojr/.github,
+# "Approve a gate change by comment".
+name: Approve gate (owner comment)
+
+on:
+  issue_comment:
+    # Only new comments: an edited comment never approves.
+    types: [created]
+
+permissions:
+  contents: read
+
+# One approval at a time per pull request, none dropped.
+concurrency:
+  group: approve-gate-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  approve-gate:
+    uses: dflippojr/.github/.github/workflows/approve-gate.yml@<full-sha>
+    with:
+      approve-ref: <full-sha>
+    secrets:
+      OWNER_GATE_TOKEN: ${{ secrets.OWNER_GATE_TOKEN }}

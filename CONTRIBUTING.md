@@ -21,6 +21,8 @@ Feature work and fixes go through GitHub issues and pull requests, so plans and 
 
 `gate-change-approved` and `findings-accepted` are owner-only. The default-branch gate guard counts one only when the owner applied it after the newest push. A label a worker applies, or re-applies, doesn't count, and a push voids the owner's label until the owner applies it again.
 
+The owner approves a gate change with one pull request comment, `/approve-gate <full head SHA>`; a workflow then applies `gate-change-approved` and records the head as the owner (README.md, "Approve a gate change by comment"). Agents never post that comment.
+
 The remaining labels are GitHub's defaults plus one for accessibility:
 
 | Label | Meaning |
