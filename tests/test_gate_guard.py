@@ -1255,6 +1255,8 @@ class RuleDetails(unittest.TestCase):
                  (limits, "    g = (x for x in [1])\n    g.gi_frame.f_globals\n" + limits,
                   "adds a use of g.gi_frame.f_globals"),
                  (limits, "    getattr(app, 'move')\n" + limits, "adds a use of getattr"),
+                 (limits, "    [c.__globals__ for c in [create_app]]\n" + limits, "adds a use of .__globals__"),
+                 (limits, "    [create_app][0].__globals__\n" + limits, "adds a use of .__globals__"),
                  (limits, "    os._exit(0)\n" + limits, "names _exit"),
                  (limits, "    pytest.exit('done')\n" + limits, "names exit"),
                  (limits, "    pytest.skip('later')\n" + limits, "names skip"),
