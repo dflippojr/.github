@@ -286,8 +286,9 @@ only when all of these hold:
   doesn't count, and neither does a collaborator saying "approved".
 - The comment was never edited (`updated_at` equals `created_at`). Callers
   listen for `created` only, and the script refuses any other action.
-- The body, without surrounding whitespace, is exactly `/approve-gate` and the
-  full lowercase SHA. A short SHA or any extra text is refused.
+- The body is exactly `/approve-gate`, one space and the full lowercase SHA;
+  trailing whitespace is ignored. A short SHA or any extra text is refused,
+  and the job's `if:` skips a body that does not start with `/approve-gate `.
 - The comment is on a pull request, not an issue. The pull request is open,
   its base is this repository, and its head branch is in this repository, so
   fork pull requests (and ones whose fork was deleted) are refused.
@@ -373,6 +374,9 @@ default branch's newest commit.
 - **A leaked `OWNER_GATE_TOKEN`.** It can label and comment as the owner on
   the repositories it covers, as `ao owner-label apply` can. Keep its
   repository list short and its expiry near.
+- **`gate-guard.yml` callers.** The `pull_request` gate guard checks only who
+  applied the label, not when, so in a repository still on it a push does not
+  void an approval there; `ao ready` still does, through the head record.
 
 ## Workflow lint
 

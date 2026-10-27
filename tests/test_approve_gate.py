@@ -96,8 +96,9 @@ class Acceptance(unittest.TestCase):
         self.assertEqual(RECORD.findall(record), [(LABEL, HEAD)])
         self.assertIn(LABEL, github.labels)
 
-    def test_surrounding_whitespace_is_not_extra_text(self):
-        self.assertEqual(run(FakeGitHub(body=f"\n/approve-gate {HEAD}\r\n"))[0], 0)
+    def test_trailing_whitespace_is_not_extra_text(self):
+        """The job's if: needs the body to start with `/approve-gate `; the editor may add a trailing newline."""
+        self.assertEqual(run(FakeGitHub(body=f"/approve-gate {HEAD}\r\n"))[0], 0)
 
     def test_reapproval_removes_the_old_label_first_so_github_dates_a_new_one(self):
         """Adding a label already on the PR records no event; the guard would date the old one, before the push."""

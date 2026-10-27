@@ -8,7 +8,7 @@ only when all of these hold:
 
     the comment's author is the repository owner, by login and by user id
     the comment was never edited, and the event is `created`
-    the body is exactly `/approve-gate <sha>`, a full 40-character lowercase SHA
+    the body is exactly `/approve-gate <sha>`, a full 40-character lowercase SHA (trailing whitespace aside)
     the comment is on a pull request, open, whose head branch is in this repository
     the SHA is the pull request's current head
 
