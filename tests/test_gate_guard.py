@@ -70,7 +70,10 @@ def git_commit(root, files, message):
         if isinstance(text, Link):
             sha = git("hash-object", "-w", "--stdin", input=text.encode("utf-8")).decode("ascii").strip()
             git("update-index", "--add", "--cacheinfo", f"120000,{sha},{rel}")
-    git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", message)
+    # No auto maintenance: git commit starts it detached, and it can write to .git/objects while the caller's
+    # temporary directory is removed.
+    git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "maintenance.auto=false", "commit", "-qm",
+        message)
 
 
 def judge_commits(base, head):
