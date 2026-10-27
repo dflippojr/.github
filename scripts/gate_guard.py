@@ -51,6 +51,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import symtable
 import sys
 import tempfile
 import unicodedata
@@ -611,6 +612,9 @@ PY_BUILTINS = frozenset(
     "frozenset hasattr hash hex id int isinstance issubclass iter len list map max min next object oct ord pow "
     "print range repr reversed round set slice sorted str sum super tuple type zip".split()
 ) | frozenset(n for n in dir(builtins) if n.endswith(("Error", "Exception", "Warning")))
+# What symtable says of a name in a scope, as the is_ methods of its Symbol (is_nonlocal is from Python 3.8).
+PY_SYMBOL = ("local", "global", "declared_global", "free", "nonlocal", "parameter", "imported", "assigned",
+             "referenced", "annotated", "namespace")
 # Names that reach a module's globals or a frame from any value.
 PY_REFLECT = re.compile(r"^__\w*__$|^(?:f_globals|f_locals|f_builtins|f_back|f_code|gi_frame|gi_code|cr_frame|"
                         r"ag_frame|tb_frame|tb_next)$")
@@ -837,7 +841,8 @@ def _python_unexempt(fd):
     and a changed statement may use only the names and dotted names its test
     already used, its test's own names and harmless builtins. A change inside
     a def or a class nested in a test is not exempt: a global there can make a
-    name the test binds the module's.
+    name the test binds the module's. Nor is one that changes how a name
+    resolves in a changed test or any scope inside it (_python_scope_change).
     """
     if not is_test_module(fd.path):
         return "it is not a test_*.py or *_test.py module (a conftest.py or a helper can change any test)"
@@ -863,7 +868,8 @@ def _python_unexempt(fd):
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            trees = [ast.parse(text.lstrip("﻿")) for text in sides]
+            texts = [text.lstrip("﻿") for text in sides]
+            trees = [ast.parse(text) for text in texts]
     except (SyntaxError, ValueError):
         return "the guard cannot parse it"
     tests, skeletons = [_python_tests(tree) for tree in trees], []
@@ -882,7 +888,8 @@ def _python_unexempt(fd):
     if skeletons[0] != skeletons[1]:
         return ("it changes code outside a test body: a def or class line, a decorator, an import, or module- or "
                 "class-level code")
-    return next(filter(None, (_python_test_change(old, new) for old, new in zip(*tests))), None)
+    return (next(filter(None, (_python_test_change(old, new) for old, new in zip(*tests))), None)
+            or _python_scope_change(texts, trees, tests))
 
 
 def _python_test_change(old, new):
@@ -921,6 +928,107 @@ def _python_test_change(old, new):
         return (f"it changes the body of a function or class defined inside {new.name}, whose names may not be "
                 f"{new.name}'s; the guard does not follow a nested scope")
     return why
+
+
+def _py_scopes(node):
+    """The defs, classes, lambdas and comprehensions inside node, each before those inside it, in source order."""
+    found = []
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, PY_DEFS + (ast.ClassDef,) + PY_SCOPES):
+            found.append((type(child).__name__, getattr(child, "name", None)))
+        found += _py_scopes(child)
+    return found
+
+
+def _py_table(module, tree, test):
+    """The symbol table of test, a test of tree, in module, tree's table, or None when no one table is test's.
+
+    A table is matched by its type, name and line, which symtable takes from
+    the same parse as the ast, so Python 3.7's decorator line matches too.
+    """
+    path = next([n] if n is test else [n, test] for n in tree.body
+                if n is test or (isinstance(n, ast.ClassDef) and test in n.body))
+    table = module
+    for node in path:
+        kind = "class" if isinstance(node, ast.ClassDef) else "function"
+        found = [t for t in table.get_children()
+                 if t.get_type() == kind and t.get_name() == node.name and t.get_lineno() == node.lineno]
+        if len(found) != 1:
+            return None
+        table = found[0]
+    return table
+
+
+def _py_symbol(symbols, name):
+    """(what symtable says of name in symbols, a scope's symbols by name, in words; its flags and scope).
+
+    The flags and scope are private to symtable, so a Python without them
+    gives None for both, which the caller treats as unknown.
+    """
+    if name not in symbols:
+        return "not a name there", -1, -1
+    symbol = symbols[name]
+    flags, scope = (getattr(symbol, "_Symbol__" + f, None) for f in ("flags", "scope"))
+    if None in (flags, scope):
+        return "unknown", None, None
+    words =[w for w in PY_SYMBOL if getattr(symbol, "is_" + w, lambda: False)()]
+    return " ".join(words + ["cell"] * (scope == symtable.CELL)) or "unused", flags, scope
+
+
+def _py_resolve(old, new, where, own):
+    """Why the symbol table new resolves a name otherwise than old, in its scope where or one inside it, or None.
+
+    own says the tables are a test's own. There only names on both sides are
+    compared: a name the change adds or removes there is one the changed
+    statements alone use, which the other rules judge. Inside, every name is.
+    """
+    sides = [{s.get_name(): s for s in t.get_symbols()} for t in (old, new)]
+    names = sides[0].keys() & sides[1].keys() if own else sides[0].keys() | sides[1].keys()
+    for name in sorted(names):
+        (before, *a), (after, *b) = (_py_symbol(side, name) for side in sides)
+        if None in a + b:
+            return f"symtable on this Python does not give the flags of {name} in {where}"
+        if a != b:
+            return (f"it changes how the name {name} resolves in {where} ({before} before, {after} after), so "
+                    "code the change leaves alone may read another object")
+    children = [t.get_children() for t in (old, new)]
+    kinds = [[(str(t.get_type()), t.get_name()) for t in side] for side in children]
+    if kinds[0] != kinds[1]:
+        return f"it adds, removes, renames or reorders a scope inside {where}"
+    return next(filter(None, (_py_resolve(a, b, f"{where}.{a.get_name()}", False) for a, b in zip(*children))),
+                None)
+
+
+def _python_scope_change(texts, trees, tests):
+    """Why a change to tests, the tests of trees parsed from texts, makes a name resolve otherwise, or None.
+
+    Round b5 of PR #41, the owner's structural rule: in each changed test, a
+    def, class, lambda or comprehension added, removed, renamed or reordered,
+    or a name whose symtable classification changes in the test or in any
+    scope inside it, is a hit, even with the changed lines outside that
+    scope. So is a module symtable cannot build. The nested scopes are
+    compared as the ast has them too, since from Python 3.12 symtable puts a
+    list, set or dict comprehension's names in its enclosing scope.
+    """
+    pairs = [(old, new) for old, new in zip(*tests) if ast.dump(old) != ast.dump(new)]
+    if not pairs:
+        return None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            modules = [symtable.symtable(text, "test.py", "exec") for text in texts]
+    except Exception:  # anything symtable raises, even on code ast.parse accepts, fails closed
+        return "the guard cannot build its symbol table"
+    for old, new in pairs:
+        if _py_scopes(old) != _py_scopes(new):
+            return f"it adds, removes, renames or reorders a def, class, lambda or comprehension inside {new.name}"
+        tables = [_py_table(module, tree, test) for module, tree, test in zip(modules, trees, (old, new))]
+        if None in tables:
+            return f"the guard cannot tell which symbol table is {new.name}'s"
+        why = _py_resolve(*tables, new.name, True)
+        if why:
+            return why
+    return None
 
 
 def c_cpp_hits(files, facts, flagged):

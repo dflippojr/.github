@@ -63,6 +63,15 @@ whatever the change:
   a lambda, a comprehension or a `:=`, is not one it used; a lambda binds only
   its parameters, a comprehension only plain names, and any change to a test
   whose `for` or comprehension assigns to an attribute or an item is a hit).
+  In each changed test, the guard also compares Python's own symbol tables
+  (`symtable`) of both sides. A nested `def`, `class`, lambda, comprehension or
+  generator expression added, removed, renamed or reordered is a hit. So is a
+  name whose classification changes (local, global, free, cell, nonlocal,
+  parameter, imported, assigned, referenced) in any scope inside the test, or
+  in the test itself for a name both sides have. This holds even when the
+  changed lines are outside that scope, as when deleting the test's
+  `os = Mock()` makes an unchanged nested helper's `os` the module's. A file
+  `symtable` cannot read is a hit too.
   Every changed line, even a comment or a blank line, must be
   inside a test body (indented deeper than its `def`) and hold only printable
   ASCII, so Python reads it as the guard does. Any other change is a hit: a

@@ -1,4 +1,5 @@
 import ast
+import contextlib
 import io
 import json
 import os
@@ -6,6 +7,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import symtable
 import sys
 import tempfile
 import unittest
@@ -1341,8 +1343,8 @@ class RuleDetails(unittest.TestCase):
             self.assertEqual(judged("    assert value\n", "    assert value == 1\n",
                                     "def test_hw():\n    value = 1\n    assert value\n"), [])
         # A def, class, lambda or comprehension added, removed or reordered in a test is a hit.
-        reordered = test_hw + readers["lambda"] + readers["list comprehension"]
-        for old, new, start_text in (("    assert True\n", "    assert [v for v in [1]]\n", test_hw + "    assert True\n"),
+        reordered, bare = test_hw + readers["lambda"] + readers["list comprehension"], test_hw + "    assert True\n"
+        for old, new, start_text in (("    assert True\n", "    assert [v for v in [1]]\n", bare),
                                      (readers["lambda"], "", reordered + "    assert True\n"),
                                      (reordered, test_hw + readers["list comprehension"] + readers["lambda"],
                                       reordered + "    assert True\n"),
@@ -1351,6 +1353,27 @@ class RuleDetails(unittest.TestCase):
                 [hit] = judged(old, new, start_text)
                 self.assertIn("adds, removes, renames or reorders a def, class, lambda or comprehension inside "
                               "test_hw", hit.detail)
+        # Whatever the guard cannot read from symtable fails closed: a module it cannot build (a nonlocal
+        # left with no binding parses, but symtable rejects it), a test whose table it cannot find, a
+        # symbol without the private flags, and nested tables that differ where the ast's scopes do not.
+        unread = test_hw + binding + "    def helper():\n        nonlocal os\n        return os\n    assert True\n"
+        real_init = symtable.Symbol.__init__
+
+        def flagless(symbol, *args, **kwargs):
+            real_init(symbol, *args, **kwargs)
+            del symbol._Symbol__flags
+
+        for patch, old, new, start_text, why in (
+                (None, binding, "", unread, "cannot build its symbol table"),
+                (mock.patch.object(gate_guard, "_py_table", return_value=None), "    assert True\n",
+                 "    assert 1\n", bare, "cannot tell which symbol table is test_hw's"),
+                (mock.patch.object(symtable.Symbol, "__init__", flagless), "    assert os\n", "    assert os == 1\n",
+                 test_hw + readers["no nested scope"], "does not give the flags of os in test_hw"),
+                (mock.patch.object(gate_guard, "_py_scopes", return_value=[]), "    assert True\n",
+                 "    run = lambda: 1\n", bare, "adds, removes, renames or reorders a scope inside test_hw")):
+            with self.subTest(why=why), patch or contextlib.nullcontext():
+                [hit] = judged(old, new, start_text)
+                self.assertIn(why, hit.detail)
         # A block moved between a try's clauses: finally runs always, else only without an exception.
         with self.subTest(change="finally to else"):
             guarded = "def test_hw():\n    try:\n        assert 1\n    except ValueError:\n        pass\n" \
