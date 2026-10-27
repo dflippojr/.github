@@ -615,10 +615,15 @@ def _py_dump(value):
 
 
 def _py_split(node):
-    """(header, blocks) of a statement: the text of all it says but its statements, and its lists of statements."""
+    """(header, blocks) of a statement: the text of all it says but its statements, and its lists of statements.
+
+    The header names the field of each block, so a try's finally does not
+    compare equal to its else.
+    """
     header, blocks = [type(node).__name__], []
-    for _, value in ast.iter_fields(node):
+    for field, value in ast.iter_fields(node):
         if isinstance(value, list) and value and isinstance(value[0], ast.stmt):
+            header.append(field)
             blocks.append(value)
         elif isinstance(value, list) and value and isinstance(value[0], PY_CLAUSES):
             for clause in value:
@@ -626,7 +631,7 @@ def _py_split(node):
                 header.append(clause_header)
                 blocks += clause_blocks
         else:
-            header.append(_py_dump(value))
+            header.append(f"{field}={_py_dump(value)}")
     return repr(header), blocks
 
 
