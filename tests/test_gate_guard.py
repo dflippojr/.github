@@ -1119,6 +1119,28 @@ class RuleDetails(unittest.TestCase):
                     api.replace(limits, "    (\n        False\n        and pytest.skip('later')\n    )\n" + limits)):
             with self.subTest(old=old):
                 self.assertTrue(flipped(old, old.replace("False", "True")), old)
+        # A skip moved to the branch that runs, or out from under the handler that catches it.
+        for old, new in (("    if True:\n        pass\n    else:\n        pytest.skip('later')\n",
+                          "    if True:\n        pytest.skip('later')\n    else:\n        pass\n"),
+                         ("    for _ in range(0):\n        pytest.skip('later')\n",
+                          "    for _ in range(0):\n        pass\n    else:\n        pytest.skip('later')\n"),
+                         ("    try:\n        pytest.skip('later')\n    except BaseException:\n        pass\n",
+                          "    try:\n        pytest.skip('later')\n    except ValueError:\n        pass\n")):
+            with self.subTest(old=old, new=new):
+                self.assertTrue(flipped(api.replace(limits, old + limits), api.replace(limits, new + limits)), new)
+        # A condition that reads a parameter set by parametrize or a fixture of the same file,
+        # and a call to a helper of the same file that skips.
+        later = api.replace("def test_height_limits():\n" + limits,
+                            "def test_height_limits(later):\n    if later:\n        pytest.skip('later')\n" + limits)
+        for old in (later.replace("def test_height_limits", "@pytest.mark.parametrize('later', [False])\n"
+                                  "def test_height_limits"),
+                    later.replace("def test_height_limits", "@pytest.fixture\ndef later():\n    return False\n\n\n"
+                                  "def test_height_limits", 1)):
+            with self.subTest(old=old):
+                self.assertTrue(flipped(old, old.replace("False", "True")), old)
+        helper = "def require_later():\n    pytest.skip('later')\n\n\n" + api
+        with self.subTest(change="helper call"):
+            self.assertTrue(flipped(helper, helper.replace(limits, "    require_later()\n" + limits)))
         # A module renamed to conftest.py, whose ignore list then applies.
         hooks = "collect_ignore = ['test_api.py']\n"
         with self.subTest(change="renamed to conftest.py"):
