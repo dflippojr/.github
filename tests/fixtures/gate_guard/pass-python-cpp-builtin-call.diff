@@ -1,0 +1,25 @@
+# gate-guard fixture: a new call of the real builtins len and print in a test, which nothing in the file shadows
+# expect: 
+# hits: 0
+
+diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
+--- a/firmware/src/logic.cpp
++++ b/firmware/src/logic.cpp
+@@ -1 +1 @@
+-int limit = 120;
++int limit = 125;
+diff --git a/backend/tests/test_environment.py b/backend/tests/test_environment.py
+--- a/backend/tests/test_environment.py
++++ b/backend/tests/test_environment.py
+@@ -1,9 +1,10 @@
+ import os
+ 
+ 
+ def test_environment():
+-    assert os.sep
++    print(len(os.sep))
++    assert len(os.sep) == 1
+ 
+ 
+ def test_later():
+     assert False

@@ -1410,6 +1410,109 @@ class RuleDetails(unittest.TestCase):
                 self.assertEqual((hit.rule, hit.path), ("removed-tests", sorted(change)[0]))
                 self.assertIn(why, hit.detail)
 
+    def test_python_tests_in_a_c_cpp_repository_resolve_every_name_as_before(self):
+        """PR #41 b6: a changed Python test is exempt only if every name it had resolves as before, and a new
+        builtin only if nothing in the file can make it another object."""
+        test_env = "backend/tests/test_environment.py"
+
+        def judged(start_text, *edits):
+            head = start_text
+            for old, new in edits:
+                self.assertIn(old, head)
+                head = head.replace(old, new, 1)
+            start = dict(DESK_TREE, **{test_env: start_text})
+            return judge_commits(start, dict(start, **{test_env: head}))
+
+        # (1) A comprehension's own names, read from the ast: from Python 3.12 symtable puts a list, set or dict
+        # comprehension's names in its test's table. Targets swapped between two comprehensions, one renamed
+        # so that its unchanged element reads the test's probe, nested targets swapped, a := moved to another
+        # comprehension, a target renamed throughout.
+        top = "import os\nfrom unittest.mock import Mock\n\n\ndef test_environment():\n    probe = os\n"
+        opens = {"list": ("[", "", "]"), "set": ("{", "", "}"), "dict": ("{", ": 1", "}"),
+                 "generator": ("list(", "", ")")}
+        for kind, (start, value, end) in opens.items():
+            two = (top + f"    first = {start}probe.getcwd(){value} for probe in [Mock()]{end}\n"
+                   f"    second = {start}probe{value} for item in [None]{end}\n    assert True\n")
+            for change, start_text, edits in (
+                    ("targets swapped", two, [("for probe in [Mock()]", "for item in [Mock()]"),
+                                              ("for item in [None]", "for probe in [None]")]),
+                    ("target renamed", top + f"    first = {start}probe.getcwd(){value} for probe in [Mock()]{end}\n"
+                     "    assert True\n", [("for probe in [Mock()]", "for item in [Mock()]")])):
+                with self.subTest(comprehension=kind, change=change):
+                    [hit] = judged(start_text, *edits)
+                    self.assertEqual(hit.rule, "removed-tests")
+                    self.assertIn("resolves in test_environment", hit.detail)
+        nested = top + "    first = [[probe.getcwd() for item in [1]] for probe in [Mock()]]\n    assert True\n"
+        walrus = top + "    first = [(probe := v) for v in [Mock()]]\n    second = [v for v in [None]]\n" \
+                       "    assert probe\n"
+        renamed = "def test_environment():\n    assert [v for v in [1]]\n    assert True\n"
+        for change, start_text, edits in (
+                ("nested targets swapped", nested, [("for item in [1]", "for probe in [1]"),
+                                                    ("for probe in [Mock()]", "for item in [Mock()]")]),
+                (":= moved", walrus, [("(probe := v) for v in [Mock()]", "v for v in [Mock()]"),
+                                      ("v for v in [None]", "(probe := v) for v in [None]")]),
+                ("target renamed throughout", renamed, [("[v for v in [1]]", "[w for w in [1]]")])):
+            with self.subTest(change=change):
+                [hit] = judged(start_text, *edits)
+                self.assertEqual(hit.rule, "removed-tests")
+                self.assertIn("cannot parse" if ":=" in start_text and sys.version_info < (3, 8)
+                              else "test_environment", hit.detail)
+                self.assertRegex(hit.detail, r"cannot parse|resolves in test_environment|binds inside test_envir")
+        # (2) A builtin added to a test is exempt only if it is the builtin: bound nowhere in the file, in
+        # any scope (a test class's attribute and another test's local too), with no wildcard import and
+        # no word that can bind a module's or the builtins' names at run time. Each hit names the use.
+        shadows = {"assignment": "len = os.getcwd\n", "from-import": "from os import getcwd as len\n",
+                   "import as": "import posixpath as len\n", "def": "def len():\n    return os.getcwd()\n",
+                   "class": "class len:\n    pass\n", "for": "for len in [os.getcwd]:\n    pass\n",
+                   "except as": "try:\n    pass\nexcept Exception as len:\n    pass\n",
+                   "global in a function": "def setup_module():\n    global len\n    len = os.getcwd\n",
+                   "another test's local": "def test_other():\n    len = os.getcwd\n    assert len\n",
+                   "wildcard import": "from os import *\n", "globals()": "globals()['len'] = os.getcwd\n",
+                   "vars()": "vars()['len'] = os.getcwd\n", "exec": "exec('len = os.getcwd')\n",
+                   "builtins module": "import builtins\nbuiltins.len = os.getcwd\n",
+                   "patch string": "from unittest import mock\nmock.patch('builtins.len', os.getcwd).start()\n",
+                   "setattr": "import sys\nsetattr(sys.modules[__name__], 'len', os.getcwd)\n",
+                   "attribute of a module": "import backend.tests.test_environment as me\nme.len = os.getcwd\n",
+                   "frame globals": "import sys\nsys._getframe().f_globals['len'] = os.getcwd\n",
+                   "function globals": "(lambda: 0).__globals__['len'] = os.getcwd\n",
+                   "computed getattr": "f = lambda: 0\ngetattr(f, '__glo' + 'bals__')['len'] = os.getcwd\n",
+                   "module imported by itself": "import gc\nfrom backend.tests import test_environment as me\n"
+                                                "gc.get_referents(me)[0]['len'] = os.getcwd\n",
+                   "module of a function": "import gc\nimport inspect\n"
+                                           "gc.get_referents(inspect.getmodule(os.sep))[0]['len'] = os.getcwd\n"}
+        call = ("    assert True\n", "    len()\n    assert True\n")
+        for kind, shadow in shadows.items():
+            with self.subTest(shadow=kind):
+                [hit] = judged("import os\n" + shadow + "\n\ndef test_environment():\n    assert True\n", call)
+                self.assertEqual(hit.rule, "removed-tests")
+                self.assertIn("adds a use of len, which test_environment did not have", hit.detail)
+        with self.subTest(shadow="a test class's attribute"):
+            [hit] = judged("import os\n\n\nclass TestEnvironment:\n    len = os.getcwd\n\n"
+                           "    def test_environment(self):\n        assert True\n",
+                           ("        assert True\n", "        len()\n        assert True\n"))
+            self.assertIn("adds a use of len", hit.detail)
+        # The real builtins stay exempt where nothing shadows them, and a test's own len is its own.
+        for start_text, edits in (("import os\n\n\ndef test_environment():\n    assert True\n", [call]),
+                                  ("def test_environment():\n    assert True\n",
+                                   [("    assert True\n", "    print(len([1]), min(1, 2))\n    assert True\n")]),
+                                  ("import os\n\n\ndef test_environment():\n    len = os.getcwd\n    assert len\n    assert True\n",
+                                   [call])):
+            with self.subTest(control=start_text, edits=edits):
+                self.assertEqual(judged(start_text, *edits), [])
+        # (3) Any name a changed test had, in any of its scopes, must resolve to the same binding in every
+        # scope from its own up to the module's, a module import's module and name included. A changed
+        # module-level binding is code outside a test body, a hit before b6 too.
+        for change, start_text, edits, why in (
+                ("module import changed", "from os import getcwd as probe\n\n\ndef test_environment():\n"
+                 "    assert probe\n", [("from os import getcwd", "from os import getpid"),
+                                        ("assert probe\n", "assert probe is not None\n")], "outside a test body"),
+                ("method's comprehension", "import os\nfrom unittest.mock import Mock\n\n\nclass TestEnv:\n"
+                 "    def test_environment(self):\n        probe = os\n        assert [probe.getcwd() for probe in "
+                 "[Mock()]]\n", [("for probe in", "for item in")], "resolves in")):
+            with self.subTest(change=change):
+                [hit] = judged(start_text, *edits)
+                self.assertIn(why, hit.detail)
+
     def test_environment_guard_skip_is_not_a_hit(self):
         details = " ".join(h.detail for h in self.hits("flag-skip-python"))
         self.assertIn("flaky", details)
