@@ -53,6 +53,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -583,11 +584,18 @@ def _python_test(path, facts):
 
 
 # A skip, an exit, __test__ or getfixturevalue named anywhere in a Python test
-# file, even in a comment or a string: an unchanged condition, helper or
-# fixture of the file can read what a plain statement changes, and
+# file, even in a comment or a string, as written or as Python reads a name
+# (NFKC, so fullwidth letters are ASCII ones): an unchanged condition, helper
+# or fixture of the file can read what a plain statement changes, and
 # getfixturevalue pulls in, by name, a fixture of a conftest.py that may skip.
 PY_HIDE = re.compile(r"\b(?:skip|skipif|skipIf|skipUnless|skipTest|SkipTest|xfail|importorskip|expectedFailure|"
                      r"exit|_exit|__test__|getfixturevalue)\b")
+# A source encoding declaration (PEP 263). The guard reads a file as UTF-8, so a
+# file that may declare another, on any line, is not exempt.
+PY_CODING = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
+# What a changed line may hold: printable ASCII. Python reads some other letters
+# as ASCII ones, and tabs and form feeds as indentation.
+PY_PRINTABLE = re.compile(r"[ -~]*")
 PY_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
 PY_PLAIN = (ast.Assert, ast.Expr, ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Pass, ast.Delete)
 # Clauses that hold statements of their own: except handlers and, from Python
@@ -724,6 +732,40 @@ def _python_tests(tree):
     return tests
 
 
+def _py_coding(lines):
+    """The encoding a line of lines declares that is not UTF-8, or None."""
+    names = (m.group(1) for m in map(PY_CODING.match, lines) if m)
+    return next((n for n in names if n.lower().replace("_", "-") not in ("utf-8", "utf8")), None)
+
+
+def _py_start(node):
+    """A statement's first line: its first decorator's, if it has any (Python 3.7 gives that line, later
+    versions the def or class line)."""
+    return min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+
+
+def _py_body_lines(tree, tests, lines):
+    """The numbers of the lines of lines, the text of tree, inside the body of one of tests.
+
+    A test reaches from its first line to the line before the next statement
+    outside it. Its body's lines are those indented deeper than its def, and
+    blank lines between two of them: indentation, not the line numbers of the
+    body's statements, which Python 3.7 gives as a multi-line string's last.
+    """
+    statements = [n for n in ast.walk(tree) if isinstance(n, ast.stmt)]
+    inside = set()
+    for test in tests:
+        own, start = set(ast.walk(test)), _py_start(test)
+        end = min((_py_start(n) for n in statements if n not in own and _py_start(n) > start),
+                  default=len(lines) + 1)
+        deeper = [i for i in range(start, end) if lines[i - 1].strip(" \t\f")
+                  and len(lines[i - 1]) - len(lines[i - 1].lstrip(" \t\f")) > test.col_offset]
+        if deeper:
+            inside.update(i for i in range(deeper[0], deeper[-1] + 1)
+                          if i in deeper or not lines[i - 1].strip(" \t\f"))
+    return inside
+
+
 def _py_unplain(old, new, plain, uses):
     """Why changing the statements old to new is more than an edit of assertions and plain statements, or None.
 
@@ -760,10 +802,12 @@ def _python_unexempt(fd):
 
     Issue #40: only an edit in place of a test_*.py or *_test.py module that
     changes assertions and plain statements inside its existing tests is
-    exempt. Its other code, outside those bodies, must stay the same
-    statement for statement, and a changed statement may use only the names
-    and dotted names its test already used, its test's own names and harmless
-    builtins.
+    exempt. Every changed line, even a comment or a blank line, must be inside
+    a test body and hold only printable ASCII, and the file must be UTF-8 as
+    Python reads it, so the text the guard compares is the code Python runs.
+    The code outside those bodies must stay the same statement for statement,
+    and a changed statement may use only the names and dotted names its test
+    already used, its test's own names and harmless builtins.
     """
     if not is_test_module(fd.path):
         return "it is not a test_*.py or *_test.py module (a conftest.py or a helper can change any test)"
@@ -772,7 +816,18 @@ def _python_unexempt(fd):
     sides = _whole_sides(fd)
     if sides is None:
         return "the diff does not show the whole file"
-    hide = next(filter(None, map(PY_HIDE.search, sides)), None)
+    if any("\r" in text for text in sides):
+        return ("it holds a carriage return inside a line, which Python reads as a line break and git does not, "
+                "so the guard cannot tell which lines are inside a test")
+    lines = [text.split("\n")[:-1] for text in sides]
+    coding = _py_coding(lines[0] + lines[1])
+    if coding:
+        return f"it declares the source encoding {coding}; the guard reads only UTF-8"
+    if not all(PY_PRINTABLE.fullmatch(l.text) for l in fd.lines if l.kind != " "):
+        return ("a changed line holds a character that is not printable ASCII, such as a tab, a form feed or a "
+                "letter Python reads as an ASCII one")
+    hide = next(filter(None, (PY_HIDE.search(t) for text in sides
+                              for t in (text, unicodedata.normalize("NFKC", text)))), None)
     if hide:
         return f"it names {hide.group()}, which can skip, hide or stop tests"
     try:
@@ -782,6 +837,11 @@ def _python_unexempt(fd):
     except (SyntaxError, ValueError):
         return "the guard cannot parse it"
     tests, skeletons = [_python_tests(tree) for tree in trees], []
+    changed = [{l.old for l in fd.lines if l.kind == "-"}, {l.new for l in fd.lines if l.kind == "+"}]
+    if any(side - _py_body_lines(tree, side_tests, side_lines)
+           for side, tree, side_tests, side_lines in zip(changed, trees, tests, lines)):
+        return ("it changes a line outside a test body: a def or class line, a decorator, an import, a comment, "
+                "a blank line, or module- or class-level code")
     for tree, side in zip(trees, tests):
         bodies = [t.body for t in side]
         for t in side:
