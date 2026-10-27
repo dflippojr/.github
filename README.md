@@ -72,6 +72,27 @@ whatever the change:
   changed lines are outside that scope, as when deleting the test's
   `os = Mock()` makes an unchanged nested helper's `os` the module's. A file
   `symtable` cannot read is a hit too.
+  From Python 3.12, `symtable` puts a list, set or dict comprehension's names in
+  its enclosing table, so the guard also reads every scope of the file from the
+  ast, with each comprehension its own scope, on every Python. For each name in
+  each scope that both sides have, the way that scope and every scope around it,
+  out to the module, bind or declare the name must stay the same: a parameter,
+  an assignment, a `del`, a `def` or `class`, an import (of which module, and
+  which name from it), a `:=` (and in which comprehension), a `global` or a
+  `nonlocal` (and where). Comprehensions that swap their targets, so that an
+  unchanged `probe.getcwd()` reads the test's `probe` instead of a `Mock`, are a
+  hit. So is a renamed target, a lambda parameter or a `:=` target moved between
+  comprehensions, and a type parameter or type alias anywhere in the file.
+  A builtin the test did not use (`len`, `print` and the other harmless ones)
+  is exempt only when it is the builtin. No scope of either side may bind the
+  name, even another test's, and nothing may set it as an attribute. The file
+  may have no wildcard import and no import of a module named as the file is.
+  It may also name nothing that can reach a module's or the builtins' names at
+  run time: `builtins`, `globals`, `locals`, `vars`, `exec`, `eval`, `compile`,
+  `importlib`, `modules`, `setattr`, `delattr`, `getattr`, `patch`, a frame's
+  `f_globals`, `_getframe`, `getmodule`, `get_referents`, or any dunder but
+  `__name__`, `__main__`, `__init__`, `__file__` and `__doc__`. So an unchanged
+  `from os import getcwd as len` makes a new `len()` a hit.
   Every changed line, even a comment or a blank line, must be
   inside a test body (indented deeper than its `def`) and hold only printable
   ASCII, so Python reads it as the guard does. Any other change is a hit: a

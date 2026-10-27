@@ -615,6 +615,17 @@ PY_BUILTINS = frozenset(
 # What symtable says of a name in a scope, as the is_ methods of its Symbol (is_nonlocal is from Python 3.8).
 PY_SYMBOL = ("local", "global", "declared_global", "free", "nonlocal", "parameter", "imported", "assigned",
              "referenced", "annotated", "namespace")
+# Words that can reach a module's or the builtins' names at run time, as written or as Python reads a name
+# (NFKC), anywhere in a file: a builtin a changed test adds there may not be the builtin (round b6). Any
+# dunder but a few that give only text or a constructor counts, as do a frame's or a module's finders and
+# getattr, whose attribute name can be computed.
+PY_DYNAMIC = re.compile(r"\b(?:builtins|globals|locals|vars|exec|eval|compile|importlib|import_module|modules|"
+                        r"setattr|delattr|getattr|attrgetter|patch|f_globals|f_builtins|f_locals|_getframe|"
+                        r"currentframe|getmodule|get_referents|get_referrers|"
+                        r"(?!__(?:name|main|init|file|doc)__\b)__\w+__)\b")
+PY_COMPS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+# Nodes the guard runs on 3.7, which has neither: := is from Python 3.8, a type alias from 3.12.
+PY_WALRUS, PY_ALIAS = (getattr(ast, n, ()) for n in ("NamedExpr", "TypeAlias"))
 # Names that reach a module's globals or a frame from any value.
 PY_REFLECT = re.compile(r"^__\w*__$|^(?:f_globals|f_locals|f_builtins|f_back|f_code|gi_frame|gi_code|cr_frame|"
                         r"ag_frame|tb_frame|tb_next)$")
@@ -888,12 +899,40 @@ def _python_unexempt(fd):
     if skeletons[0] != skeletons[1]:
         return ("it changes code outside a test body: a def or class line, a decorator, an import, or module- or "
                 "class-level code")
-    return (next(filter(None, (_python_test_change(old, new) for old, new in zip(*tests))), None)
+    real = _py_real_builtins(fd.path, texts, trees)
+    return (next(filter(None, (_python_test_change(old, new, real) for old, new in zip(*tests))), None)
             or _python_scope_change(texts, trees, tests))
 
 
-def _python_test_change(old, new):
-    """Why changing the test old to new is more than an edit of assertions and plain statements, or None."""
+def _py_real_builtins(path, texts, trees):
+    """The harmless builtins that are the builtins in both sides of the file at path, texts parsed as trees.
+
+    Round b6: none if either side names what can reach a name at run time
+    (PY_DYNAMIC), has a wildcard import or imports a module named as the
+    file is, which may be the file itself; else those that no scope of
+    either side binds, even another test's, nor sets as an attribute of
+    anything.
+    """
+    if any(PY_DYNAMIC.search(t) for text in texts for t in (text, unicodedata.normalize("NFKC", text))):
+        return frozenset()
+    bound, imported = set(), set()
+    for tree in trees:
+        bound |= _py_binds(tree)
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Attribute) and not isinstance(n.ctx, ast.Load):
+                bound.add(n.attr)
+            elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                imported.update(".".join([getattr(n, "module", None) or ""] + [a.name for a in n.names]).split("."))
+    if "*" in bound or posixpath.basename(path)[:-len(".py")] in imported:
+        return frozenset()
+    return PY_BUILTINS - bound
+
+
+def _python_test_change(old, new, real):
+    """Why changing the test old to new is more than an edit of assertions and plain statements, or None.
+
+    real holds the harmless builtins that are the builtins in the file (_py_real_builtins).
+    """
     # A name old binds anywhere, even in a nested def or a comprehension, is not one it used from outside.
     known, own = _py_reads(old, frozenset(_py_binds(old))), _py_locals(new)
     flow = (ast.Yield, ast.YieldFrom) + (() if isinstance(new, ast.AsyncFunctionDef) else (ast.Await,))
@@ -909,7 +948,7 @@ def _python_test_change(old, new):
             return f"it adds a use of .{reflect}, which reaches a module's globals or a frame"
         for chain in sorted(_py_reads(statement)):
             parts = chain.split(".")
-            if PY_REFLECT.match(parts[0]) or not (parts[0] in own or chain in known or chain in PY_BUILTINS):
+            if PY_REFLECT.match(parts[0]) or not (parts[0] in own or chain in known or chain in real):
                 return f"it adds a use of {chain}, which {new.name} did not have"
         return None
 
@@ -999,6 +1038,185 @@ def _py_resolve(old, new, where, own):
                 None)
 
 
+class _PyScope:
+    """A scope of a module as the guard reads it from the ast: its label, the scope around it, the names that
+    occur in it, and the roles it gives each name it binds or declares."""
+
+    def __init__(self, label, parent, kind):
+        self.label, self.parent, self.kind = label, parent, kind
+        self.names, self.roles = set(), collections.defaultdict(set)
+
+    def add(self, name, role=None):
+        self.names.add(name)
+        if role:
+            self.roles[name].add(role)
+
+
+def _py_new_scope(scopes, parent, name, kind):
+    """A new scope of kind (function, class or comprehension) named name inside parent, added to scopes,
+    with a label no other scope has. A lambda's or a comprehension's name, such as <ListComp>, is numbered."""
+    prefix, taken = "" if parent.parent is None else parent.label + ".", {s.label for s in scopes}
+    numbered = (f"{prefix}{name[:-1]} {i}>" if name.startswith("<") else f"{prefix}{name} {i}"
+                for i in range(1, len(scopes) + 2))
+    label = next(l for l in ([] if name.startswith("<") else [prefix + name]) + list(numbered) if l not in taken)
+    scopes.append(_PyScope(label, parent, kind))
+    return scopes[-1]
+
+
+def _py_import(node, alias):
+    """(the name an alias of the import node binds, its role: the module and the name it imports)."""
+    if isinstance(node, ast.Import):
+        return alias.asname or alias.name.split(".")[0], f"import {alias.name}"
+    return alias.asname or alias.name, f"from {'.' * (node.level or 0)}{node.module or ''} import {alias.name}"
+
+
+def _py_walrus(node, scope, scopes):
+    """Record a :=, whose target the nearest scope that is not a comprehension binds; each comprehension
+    on the way reads it from there."""
+    _py_visit(node.value, scope, scopes)
+    name, target = node.target.id, scope
+    while target.kind == "comprehension":
+        target.add(name, "assigned by := here, bound outside")
+        target = target.parent
+    target.add(name, f"assigned by := in {scope.label}")
+
+
+def _py_visit_scope(node, scope, scopes):
+    """Record a def, class, lambda or comprehension: what scope evaluates and binds of it (decorators,
+    defaults, annotations, bases, a comprehension's first iterable), then what its own scope binds and reads."""
+    kind = type(node).__name__
+    if isinstance(node, PY_COMPS):
+        inner = _py_new_scope(scopes, scope, f"<{kind}>", "comprehension")
+        for i, g in enumerate(node.generators):
+            _py_visit(g.iter, inner if i else scope, scopes)
+            for part in [g.target] + g.ifs:
+                _py_visit(part, inner, scopes)
+        parts = [getattr(node, f) for f in ("elt", "key", "value") if hasattr(node, f)]
+    else:
+        outer = list(node.decorator_list) if hasattr(node, "decorator_list") else []
+        if isinstance(node, ast.ClassDef):
+            outer += node.bases + [k.value for k in node.keywords]
+        else:
+            args = node.args
+            params = getattr(args, "posonlyargs", []) + args.args + args.kwonlyargs + [args.vararg, args.kwarg]
+            outer += args.defaults + [d for d in args.kw_defaults if d]
+            outer += [p.annotation for p in params if p and p.annotation] + [getattr(node, "returns", None)]
+        for part in filter(None, outer):
+            _py_visit(part, scope, scopes)
+        if hasattr(node, "name"):
+            scope.add(node.name, "def" if isinstance(node, PY_DEFS) else "class")
+        inner = _py_new_scope(scopes, scope, getattr(node, "name", "<lambda>"),
+                              "class" if isinstance(node, ast.ClassDef) else "function")
+        for name in set() if isinstance(node, ast.ClassDef) else _py_params(node.args):
+            inner.add(name, "parameter")
+        parts = node.body if isinstance(node.body, list) else [node.body]
+    for part in parts:
+        _py_visit(part, inner, scopes)
+
+
+def _py_visit(node, scope, scopes):
+    """Record in scope, and in a new scope for each def, class, lambda and comprehension inside node, the
+    names node binds, declares and reads."""
+    if isinstance(node, PY_DEFS + (ast.ClassDef, ast.Lambda) + PY_COMPS):
+        return _py_visit_scope(node, scope, scopes)
+    if isinstance(node, PY_WALRUS):
+        return _py_walrus(node, scope, scopes)
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        for alias in node.names:
+            scope.add(*_py_import(node, alias))
+        return None
+    if isinstance(node, ast.Name):
+        scope.add(node.id, {ast.Load: None, ast.Del: "deleted"}.get(type(node.ctx), "assigned"))
+    elif isinstance(node, (ast.Global, ast.Nonlocal)):
+        for name in node.names:
+            scope.add(name, f"declared {type(node).__name__.lower()}")
+    else:  # an except ... as, and a match's capture
+        for field in ("name", "rest"):
+            if isinstance(getattr(node, field, None), str):
+                scope.add(getattr(node, field), f"bound by {type(node).__name__}")
+    for child in ast.iter_child_nodes(node):
+        _py_visit(child, scope, scopes)
+    return None
+
+
+def _py_nonlocal(scope, name):
+    """The function scope around scope whose name a nonlocal name in scope is, or None."""
+    target = scope.parent
+    while target is not None and target.kind != "module":
+        roles = target.roles.get(name, ())
+        if target.kind == "function" and roles and "declared nonlocal" not in roles:
+            return target
+        target = target.parent
+    return None
+
+
+def _py_declared(scopes):
+    """Give the scope whose name a global or nonlocal declares the roles the declaring scope gives it, so
+    a scope that reads the name there sees each place that binds it."""
+    for scope in scopes[1:]:
+        for name, roles in list(scope.roles.items()):
+            target = scopes[0] if "declared global" in roles else None
+            target = _py_nonlocal(scope, name) if "declared nonlocal" in roles else target
+            if target is not None:
+                target.roles[name].add(f"bound in {scope.label} as {', '.join(sorted(roles))}")
+
+
+def _py_model(tree):
+    """Every scope of the module tree, the module's first and each before those inside it, as _PyScope."""
+    scopes = [_PyScope("the module", None, "module")]
+    for statement in tree.body:
+        _py_visit(statement, scopes[0], scopes)
+    _py_declared(scopes)
+    return scopes
+
+
+def _py_lookup(scope, name):
+    """[(label, roles)] of each scope from scope out to the module: the roles each gives name."""
+    chain = []
+    while scope:
+        chain.append((scope.label, frozenset(scope.roles.get(name, ()))))
+        scope = scope.parent
+    return chain
+
+
+def _python_resolution_change(trees):
+    """Why a name that occurs in the same scope of both trees is bound otherwise there or around it, or None.
+
+    Round b6 of PR #41, the owner's last structural round: the ast, not
+    symtable, gives each comprehension its own scope on every Python. For
+    each name in each scope of the file, a test's or any inside or around
+    it, the roles that scope and every scope around it, out to the module,
+    give the name must stay the same: parameter, assigned, deleted, def,
+    class, import of a module or of a name from one, := (and in which
+    comprehension), global or nonlocal (and where). A name in only one side
+    of a scope is one the changed statements alone use or bind, which the
+    new-use rule judges. A type parameter or a type alias fails closed.
+    """
+    if any(getattr(n, "type_params", None) or isinstance(n, PY_ALIAS) for tree in trees for n in ast.walk(tree)):
+        return "it holds a type parameter or a type alias, whose scopes the guard does not follow"
+    models = [_py_model(tree) for tree in trees]
+    shapes = [[(s.label, s.parent and s.parent.label) for s in model] for model in models]
+    if shapes[0] != shapes[1]:
+        return "it adds, removes, renames or reorders a def, class, lambda or comprehension in the file"
+    for old, new in zip(*models):
+        for name in sorted(old.names & new.names):
+            for (where, before), (_, after) in zip(_py_lookup(old, name), _py_lookup(new, name)):
+                if before != after:
+                    return (f"it changes how the name {name} resolves in {old.label} ({where}: "
+                            f"{', '.join(sorted(before)) or 'not bound'} before, "
+                            f"{', '.join(sorted(after)) or 'not bound'} after), so code the change leaves alone "
+                            "may read another object")
+    return None
+
+
+def _py_bindings(node):
+    """What each comprehension and lambda inside node binds, in ast.walk's order: a comprehension's targets'
+    names, generator by generator, or a lambda's parameters, and the targets of each := inside it."""
+    return [(type(n).__name__, [sorted(_py_bound(g.target)) for g in n.generators] if isinstance(n, PY_COMPS)
+             else sorted(_py_params(n.args)), sorted(w.target.id for w in ast.walk(n) if isinstance(w, PY_WALRUS)))
+            for n in ast.walk(node) if isinstance(n, PY_COMPS + (ast.Lambda,))]
+
+
 def _python_scope_change(texts, trees, tests):
     """Why a change to tests, the tests of trees parsed from texts, makes a name resolve otherwise, or None.
 
@@ -1009,6 +1227,10 @@ def _python_scope_change(texts, trees, tests):
     scope. So is a module symtable cannot build. The nested scopes are
     compared as the ast has them too, since from Python 3.12 symtable puts a
     list, set or dict comprehension's names in its enclosing scope.
+
+    Round b6 adds, after those: every scope of the file read from the ast
+    (_python_resolution_change), and what each comprehension and lambda in a
+    changed test binds, so a renamed target is a hit on every Python.
     """
     pairs = [(old, new) for old, new in zip(*tests) if ast.dump(old) != ast.dump(new)]
     if not pairs:
@@ -1028,7 +1250,11 @@ def _python_scope_change(texts, trees, tests):
         why = _py_resolve(*tables, new.name, True)
         if why:
             return why
-    return None
+    why = _python_resolution_change(trees)
+    if why:
+        return why
+    return next((f"it changes the names a comprehension or lambda binds inside {new.name}: a target, a parameter "
+                 "or a := target" for old, new in pairs if _py_bindings(old) != _py_bindings(new)), None)
 
 
 def c_cpp_hits(files, facts, flagged):
