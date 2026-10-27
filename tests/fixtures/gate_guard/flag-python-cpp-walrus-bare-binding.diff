@@ -1,7 +1,7 @@
 # gate-guard fixture: a name a comprehension's := bound is the test's own, not a use of the module of that name
+# (no detail line: Python 3.7 has no :=, so there the hit says the guard cannot parse it)
 # expect: removed-tests
 # hits: 1
-# detail: adds a use of os,
 
 diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
 --- a/firmware/src/logic.cpp

@@ -1276,6 +1276,12 @@ class RuleDetails(unittest.TestCase):
                 self.assertTrue(hits)
                 self.assertEqual({h.path for h in hits}, {test_api})
                 self.assertTrue(any(h.rule == "removed-tests" and why in h.detail for h in hits), hits)
+        # A name a comprehension's := bound was the test's own; with that statement gone, it is the module.
+        # Python 3.7 has no :=, so there the guard cannot parse the file.
+        with self.subTest(change=":= removed"):
+            walrus = "    assert [os for v in [1] if (os := v)]\n"
+            [hit] = judged(walrus, "    module = os\n    module.getcwd()\n", api.replace(limits, walrus + limits))
+            self.assertIn("adds a use of os," if sys.version_info >= (3, 8) else "cannot parse", hit.detail)
         # A block moved between a try's clauses: finally runs always, else only without an exception.
         with self.subTest(change="finally to else"):
             guarded = "def test_hw():\n    try:\n        assert 1\n    except ValueError:\n        pass\n" \
