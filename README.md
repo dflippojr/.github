@@ -53,8 +53,9 @@ whatever the change:
   `.keep`), as in a Python backend's `backend/tests`. Such a file is judged by
   removed tests and new skips as in any repository, but is still a hit when its
   change touches what pytest collects (`collect_ignore`, `__test__`,
-  `pytestmark`, a `pytest_` hook, a constructor or a `Test` class), moves
-  tests or the module to another name or directory, renames a `conftest.py`,
+  `pytestmark`, a `pytest_` hook, a constructor, or a `Test` class or its
+  bases or decorators), moves tests or the module to another name or
+  directory, renames a `conftest.py`,
   adds or rewires a skip or what decides whether it runs (the branch, loop,
   `try` or condition around it, and the constants, parameters, `parametrize`
   values, fixtures and helpers of the same file it reads or calls), or is not

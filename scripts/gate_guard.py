@@ -695,7 +695,9 @@ def _python_items(text):
         context = repr([_py_header(*a) for a in ancestors])
         if isinstance(node, PY_DEFS + (ast.ClassDef,)):
             if isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
-                classes[repr((context, node.name))] += 1
+                # A base, a metaclass or a decorator can take the class out of collection.
+                classes[repr((context, node.name, [ast.dump(n) for n in node.bases + node.keywords
+                                                   + node.decorator_list]))] += 1
             for d in node.decorator_list:
                 source = ast.unparse(d)
                 if PY_SKIP_MARK.search(source) or skippers & {c.value for c in ast.walk(d)
@@ -757,7 +759,8 @@ def _python_unjudged(fd, moved_out, skipped):
     if old_collect != new_collect:
         return f"{fd.status} a Python test file's collection (collect_ignore, __test__, pytestmark or a pytest_ hook)"
     if old_classes - new_classes:
-        return f"{fd.status} a Python test file's test class, which may take its tests out of collection"
+        return (f"{fd.status} a Python test file's test class, its name, bases or decorators, which may take its "
+                "tests out of collection")
     if new_skips - old_skips and fd.path not in skipped:
         return (f"{fd.status} a skip in a Python test file or the condition around it; the guard cannot tell an "
                 "environment check from a condition that always holds")
