@@ -1320,6 +1320,24 @@ class RuleDetails(unittest.TestCase):
             with self.subTest(start=start_text):
                 [hit] = judged("approx(1)", "approx(0)", start_text)
                 self.assertIn(shape, hit.detail)
+        # Review a1: a unary minus counts as part of a literal only on an int or float constant (the owner's
+        # a2 decision); any other unary operator or operand changes the assertion's shape.
+        signs = ("import os\n\nimport pytest\n\n\ndef test_hw():\n    x = 2\n    assert x == 1\n"
+                 "    assert x != 0.5\n    assert [x] == [60, 120]\n    assert x == pytest.approx(0.5)\n")
+        for old, new in (("== 1\n", "== -1\n"), ("!= 0.5", "!= -0.5"), ("[60, 120]", "[60, -120]"),
+                         ("approx(0.5)", "approx(-0.5)")):
+            with self.subTest(old=old, new=new):
+                self.assertEqual(judged(old, new, signs), [])
+        for old, new in (("== 1\n", "== -None\n"), ("== 1\n", "== -x\n"), ("== 1\n", "== ~1\n"),
+                         ("== 1\n", "== +1\n"), ("== 1\n", "== (not 1)\n"), ("== 1\n", "== -True\n"),
+                         ("== 1\n", "== -'s'\n"), ("== 1\n", "== -1j\n"), ("== 1\n", "== - -1\n"),
+                         ("[60, 120]", "[60, -None]"), ("approx(0.5)", "approx(-None)")):
+            with self.subTest(old=old, new=new):
+                [hit] = judged(old, new, signs)
+                self.assertIn(shape, hit.detail)
+        with self.subTest(change="from a unary minus on None to a number"):
+            [hit] = judged("== 1\n", "== -1\n", signs.replace("== 1\n", "== -None\n"))
+            self.assertIn(shape, hit.detail)
         # Since the assert-only rule, a file that names a skip elsewhere no longer taints an assertion's fix
         # (the b6 review's advisory): no file-wide words are read.
         skipif = ("import os\n\nimport pytest\n\n\n@pytest.mark.skipif(os.name == 'nt', reason='posix')\n"

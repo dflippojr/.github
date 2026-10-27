@@ -1,0 +1,31 @@
+# gate-guard fixture: a compared literal wrapped in a unary minus that raises under an unchanged xfail
+# expect: removed-tests
+# hits: 1
+# detail: outside a comparison's literal operands
+
+diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
+--- a/firmware/src/logic.cpp
++++ b/firmware/src/logic.cpp
+@@ -1 +1 @@
+-int limit = 120;
++int limit = 125;
+diff --git a/backend/tests/test_guard.py b/backend/tests/test_guard.py
+--- a/backend/tests/test_guard.py
++++ b/backend/tests/test_guard.py
+@@ -1,15 +1,15 @@
+ import os
+ 
+ import pytest
+ 
+ from backend.app import create_app
+ 
+ 
+ @pytest.mark.xfail(raises=TypeError)
+ def test_guard():
+-    assert 1 == 1
++    assert 1 == -None
+     raise ValueError("real regression that must run")
+ 
+ 
+ def test_later():
+     assert False
