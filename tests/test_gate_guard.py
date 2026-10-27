@@ -1073,7 +1073,7 @@ class RuleDetails(unittest.TestCase):
                 self.assertTrue(flagged(base, change, drop={test_api}), change)
         helper = {test_api: fewer, "backend/tests/helpers.py": "def test_height_limits():\n    assert True\n"}
         with self.subTest(change=helper):
-            self.assertEqual(flagged(base, helper), {test_api})
+            self.assertEqual(flagged(base, helper), set(helper))
         # (3) A skip behind a constant condition, in each imperative form.
         for skip in ("pytest.skip('later')", "self.skipTest('later')", "raise unittest.SkipTest('later')"):
             for condition in ("if True:", "if 1:", "if not False:", "if os.environ or True:"):
@@ -1224,7 +1224,7 @@ class RuleDetails(unittest.TestCase):
         for old, new in (("== LIMIT\n", "== LIMIT - 1\n"), ("    assert os.environ\n", ""),
                          (limits, "    height = app.max_height\n    assert height\n" + limits),
                          ("        app.move(LIMIT + 1)\n", "        app.move(LIMIT + 2)\n        app.move(-1)\n"),
-                         ("== self.speed", "== self.speed * 1"), ("status()", "status(len([1]))"),
+                         ("== self.speed", "== self.speed * 1"), ("().status()", "().status(len([1]))"),
                          ("stops at its limits", "stops at both limits"), ("# Height checks.", "# Limit checks.")):
             with self.subTest(new=new):
                 self.assertEqual(judged(old, new), [])
@@ -1441,7 +1441,8 @@ class Approval(unittest.TestCase):
         with mock.patch.object(gate_guard.urllib.request, "urlopen", side_effect=pages) as urlopen:
             items = gate_guard.api_pages("https://api.test", "/repos/o/r/issues/7/labels", "tok")
         self.assertEqual(items, [1, 2, 3])
-        first, second = (c.args[0] for c in urlopen.call_args_list)
+        # c[0] is the positional arguments; mock calls gained .args only in Python 3.8.
+        first, second = (c[0][0] for c in urlopen.call_args_list)
         self.assertEqual(first.full_url, "https://api.test/repos/o/r/issues/7/labels?per_page=100")
         self.assertEqual(first.get_header("Authorization"), "Bearer tok")
         self.assertEqual(second.full_url, "https://api.test/next?page=2")

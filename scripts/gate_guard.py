@@ -39,9 +39,11 @@ import argparse
 import ast
 import base64
 import bisect
+import builtins
 import collections
 import configparser
 import datetime
+import difflib
 import json
 import os
 import posixpath
@@ -495,11 +497,8 @@ def _decrease(removed, added):
     return max(fewer("run"), fewer("def"), 0)
 
 
-def removed_test_hits(files, into=None):
-    """Deleted test files and per-file decreases, after pairing renames and moves.
-
-    into(source, destination), when given, says which files a test may move to.
-    """
+def removed_test_hits(files):
+    """Deleted test files and per-file decreases, after pairing renames and moves."""
     left = {}
     for fd in files:
         removed, added = test_defs(fd)
@@ -510,18 +509,17 @@ def removed_test_hits(files, into=None):
     for fd in files:
         for d in left[id(fd)][1]:
             if d[0] is not None:
-                pool[_def_key(d)].append((fd, d))
+                pool[_def_key(d)].append((id(fd), d))
     for fd in files:
         removed = left[id(fd)][0]
         kept = []
         for d in removed:
-            match = next((i for i, (owner, _) in enumerate(pool.get(_def_key(d), []))
-                          if owner is not fd and (into is None or into(fd, owner))), None)
+            match = next((i for i, (owner, _) in enumerate(pool.get(_def_key(d), [])) if owner != id(fd)), None)
             if match is None:
                 kept.append(d)
                 continue
             owner, added = pool[_def_key(d)].pop(match)
-            left[id(owner)][1].remove(added)
+            left[owner][1].remove(added)
         left[id(fd)][0] = kept
 
     hits = []
@@ -553,17 +551,10 @@ def removed_test_hits(files, into=None):
 #   - a change to any platformio.ini (skip-marker, see platformio_hits);
 #   - a change to any file in or under a test directory, in either tree,
 #     except a Python file in a test directory that holds no C/C++ source or
-#     header in either tree (a Python backend's tests/), which the Python
-#     rules judge as in any repository. They count test functions and skips,
-#     not what pytest collects, so such a file is still a hit when its change
-#     touches collection (collect_ignore, __test__, pytestmark, a pytest_
-#     hook, a constructor, a Test class), moves tests or the module to
-#     another name or directory, renames a conftest.py, or adds or rewires a
-#     skip or anything around it (a constant condition passes for an
-#     environment check), or when the diff does not show the whole file or
-#     the guard cannot parse it. Both sides are compared statement by
-#     statement (see _python_items), so a change inside a multi-line list,
-#     condition or decorator counts;
+#     header in either tree (a Python backend's tests/), when its change only
+#     edits assertions and plain statements inside its existing tests (issue
+#     #40, see _python_unexempt). The guard does not model what pytest
+#     collects or skips, so any other change to such a file is a hit;
 #   - an added, deleted or renamed C/C++ source or header anywhere, or a
 #     changed submodule;
 #   - every pull request, when a platformio.ini names extra_configs or test_dir
@@ -591,212 +582,255 @@ def _python_test(path, facts):
     return _ext(path) in PY_EXTS and _test_root(path) not in facts.c_test_roots
 
 
-# Statements of a Python test file that can change what pytest collects: an
-# ignore list, __test__, pytestmark, a hook or plugin, and a constructor
-# (pytest skips a test class that has one).
-PY_COLLECT = re.compile(r"\bcollect_ignore(?:_glob)?\b|\b__test__\b|\bpytestmark\b|\bpytest_\w+|\bhookimpl\b")
-PY_SKIP_MARK = re.compile(r"\bmark\.(?:skip|skipif|xfail)\b|^(?:unittest\.)?(?:skip|skipIf|skipUnless|expectedFailure)\b")
+# A skip, an exit or __test__ named anywhere in a Python test file, even in a
+# comment or a string: an unchanged condition, helper or fixture of the file
+# can read what a plain statement changes.
+PY_HIDE = re.compile(r"\b(?:skip|skipif|skipIf|skipUnless|skipTest|SkipTest|xfail|importorskip|expectedFailure|"
+                     r"exit|_exit|__test__)\b")
 PY_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
-PY_BLOCKS = (ast.stmt, ast.excepthandler, ast.match_case)
-# Blocks whose other blocks decide whether one of them runs: a loop's body
-# (a break) for its else, a try's handlers and else for its body, the cases
-# before a match case.
-PY_SIBLING_BLOCKS = (ast.For, ast.AsyncFor, ast.While, ast.Try, getattr(ast, "TryStar", ast.Try), ast.Match)
-
-
-def _py_header(node, field):
-    """What node, an ancestor of a statement through its field, says about whether the statement runs."""
-    if isinstance(node, PY_DEFS):
-        return ("def",)
-    if isinstance(node, ast.ClassDef):
-        return ("class", node.name)
-    header = (type(node).__name__, field) + tuple(_py_dump(v) for v in _py_fields(node))
-    if isinstance(node, PY_SIBLING_BLOCKS):
-        for other, value in ast.iter_fields(node):
-            if isinstance(value, list):
-                header += tuple(_py_dump(v) if other != field else repr([_py_dump(f) for f in _py_fields(v)])
-                                for v in value if isinstance(v, PY_BLOCKS))
-    return header
+PY_PLAIN = (ast.Assert, ast.Expr, ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Pass, ast.Delete)
+# Clauses that hold statements of their own: except handlers and, from Python
+# 3.10, match cases (the guard runs on 3.7, which has none).
+PY_CLAUSES = tuple(c for c in (ast.excepthandler, getattr(ast, "match_case", None)) if c)
+# Expressions with names of their own: comprehensions and lambdas.
+PY_SCOPES = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp, ast.Lambda)
+# Builtins a changed statement may use though its test did not: none reaches a
+# module, a frame or an attribute by name, or runs code from a string.
+PY_BUILTINS = frozenset(
+    "abs all any ascii bin bool bytearray bytes callable chr complex dict divmod enumerate filter float format "
+    "frozenset hasattr hash hex id int isinstance issubclass iter len list map max min next object oct ord pow "
+    "print range repr reversed round set slice sorted str sum super tuple type zip".split()
+) | frozenset(n for n in dir(builtins) if n.endswith(("Error", "Exception", "Warning")))
+# Names that reach a module's globals or a frame from any value.
+PY_REFLECT = re.compile(r"^__\w*__$|^(?:f_globals|f_locals|f_builtins|f_back|f_code|gi_frame|gi_code|cr_frame|"
+                        r"ag_frame|tb_frame|tb_next)$")
 
 
 def _py_dump(value):
+    """A field of an ast node as text that leaves out line numbers."""
+    if isinstance(value, list):
+        return "[" + ", ".join(_py_dump(v) for v in value) + "]"
     return ast.dump(value) if isinstance(value, ast.AST) else repr(value)
 
 
-def _py_fields(node):
-    """The fields of node that are not blocks of statements, list items as fields of their own."""
+def _py_split(node):
+    """(header, blocks) of a statement: the text of all it says but its statements, and its lists of statements."""
+    header, blocks = [type(node).__name__], []
     for _, value in ast.iter_fields(node):
-        if not (isinstance(value, list) and value and isinstance(value[0], PY_BLOCKS)):
-            yield from value if isinstance(value, list) else [value]
+        if isinstance(value, list) and value and isinstance(value[0], ast.stmt):
+            blocks.append(value)
+        elif isinstance(value, list) and value and isinstance(value[0], PY_CLAUSES):
+            for clause in value:
+                clause_header, clause_blocks = _py_split(clause)
+                header.append(clause_header)
+                blocks += clause_blocks
+        else:
+            header.append(_py_dump(value))
+    return repr(header), blocks
 
 
-def _py_names(nodes):
-    return {n.id if isinstance(n, ast.Name) else n.attr
-            for node in nodes if isinstance(node, ast.AST)
-            for n in ast.walk(node) if isinstance(n, (ast.Name, ast.Attribute))}
+def _py_chain(node):
+    """node as a dotted name, such as os.path.join, or None when it is not one."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    return ".".join([node.id] + parts[::-1]) if isinstance(node, ast.Name) else None
 
 
-def _py_simple(node):
-    """Whether node is a statement with no block of its own."""
-    return isinstance(node, ast.stmt) and not any(isinstance(v, list) and v and isinstance(v[0], PY_BLOCKS)
-                                                  for _, v in ast.iter_fields(node))
+def _py_bound(node):
+    """The names a target, a comprehension's targets or a parameter list binds."""
+    return {n.id if isinstance(n, ast.Name) else n.arg for n in ast.walk(node) if isinstance(n, (ast.Name, ast.arg))}
 
 
-def _python_items(text):
-    """(collection, test classes, skips) of one side of a Python file, or None when it does not parse.
+def _py_reads(node, bound=frozenset()):
+    """The names and dotted names node uses, each whole (os.path.join, not os), but for those in bound.
 
-    Each is a multiset of ast.dump strings, which leave out line numbers, so a
-    statement compares whole however it is laid out and wherever it moves. A
-    skip carries the headers of the blocks and expressions around it (an if
-    or its else, a loop, a with, a try, a ternary) and what binds the names
-    they read: the parameters and decorators of the functions around it, and
-    every assignment, import, function and class in the file. A call to a
-    function of the file that skips, and a parameter or usefixtures that names
-    one, is a skip too.
+    A comprehension's and a lambda's own names count as bound inside them; the
+    first iterable of a comprehension and a lambda's defaults are outside.
     """
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            tree = ast.parse(text.lstrip("﻿"))
-    except (SyntaxError, ValueError):
-        return None
-    skip_call = IMPERATIVE_SKIP_RULES[0][2]
-    assigned, skippers = collections.defaultdict(list), set()
-    defs = [n for n in ast.walk(tree) if isinstance(n, PY_DEFS)]
-    for node in ast.walk(tree):
-        targets = (node.targets if isinstance(node, ast.Assign)
-                   else [node.target] if isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr, ast.For,
-                                                           ast.AsyncFor))
-                   else [n.optional_vars for n in node.items] if isinstance(node, (ast.With, ast.AsyncWith))
-                   else node.names if isinstance(node, (ast.Import, ast.ImportFrom)) else [])
-        names = {getattr(t, "asname", None) or getattr(t, "name", "").split(".")[0] for t in targets
-                 if isinstance(t, ast.alias)} | _py_names(t for t in targets if isinstance(t, ast.AST))
+    chain = _py_chain(node)
+    if chain:
+        return set() if chain.split(".")[0] in bound else {chain}
+    reads = set()
+    if isinstance(node, ast.Lambda):
+        for default in node.args.defaults + node.args.kw_defaults:
+            reads |= _py_reads(default, bound) if default else set()
+        return reads | _py_reads(node.body, bound | _py_bound(node.args))
+    if isinstance(node, PY_SCOPES):
+        inner = bound | set().union(*(_py_bound(g.target) for g in node.generators))
+        for i, g in enumerate(node.generators):
+            reads |= _py_reads(g.iter, inner if i else bound)
+            for condition in g.ifs:
+                reads |= _py_reads(condition, inner)
+        for field in ("elt", "key", "value"):
+            reads |= _py_reads(getattr(node, field), inner) if hasattr(node, field) else set()
+        return reads
+    for child in ast.iter_child_nodes(node):
+        reads |= _py_reads(child, bound)
+    return reads
+
+
+def _py_locals(test):
+    """The names a test binds as its own: its parameters, and what its statements assign, import or define."""
+    names, declared = {a.arg for a in ast.walk(test.args) if isinstance(a, ast.arg)}, set()
+
+    def visit(node):
+        if isinstance(node, (ast.Global, ast.Nonlocal)):
+            declared.update(node.names)
+        elif isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            names.add(node.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update((a.asname or a.name).split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            names.add(node.name)
         if isinstance(node, PY_DEFS + (ast.ClassDef,)):
             names.add(node.name)
-        for name in names:
-            assigned[name].append(ast.dump(node))
-    # Functions that skip, directly or through another function of the file.
-    while True:
-        more = {d.name for d in defs if d.name not in skippers and any(
-            _py_simple(s) and (skip_call.search(ast.unparse(s)) or _py_names([s]) & skippers)
-            for s in ast.walk(d))}
-        if not more:
-            break
-        skippers |= more
-    collect, classes, skips = collections.Counter(), collections.Counter(), collections.Counter()
+        elif not isinstance(node, PY_SCOPES):
+            for child in ast.iter_child_nodes(node):
+                visit(child)
 
-    def skip(item, ancestors, params):
-        names = _py_names([f for a, _ in ancestors if not isinstance(a, (*PY_DEFS, ast.ClassDef))
-                           for f in _py_fields(a)] + [item])
-        binds = sorted(b for n in names for b in params.get(n, []) + assigned.get(n, []))
-        skips[repr(([_py_header(*a) for a in ancestors], ast.dump(item), binds))] += 1
-
-    def visit(node, ancestors, params):
-        context = repr([_py_header(*a) for a in ancestors])
-        if isinstance(node, PY_DEFS + (ast.ClassDef,)):
-            if isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
-                # A base, a metaclass or a decorator can take the class out of collection.
-                classes[repr((context, node.name, [ast.dump(n) for n in node.bases + node.keywords
-                                                   + node.decorator_list]))] += 1
-            for d in node.decorator_list:
-                source = ast.unparse(d)
-                if PY_SKIP_MARK.search(source) or skippers & {c.value for c in ast.walk(d)
-                                                             if isinstance(c, ast.Constant)
-                                                             and isinstance(c.value, str)}:
-                    skip(d, ancestors, params)
-            if isinstance(node, PY_DEFS):
-                if node.name.startswith("pytest_") or any("hookimpl" in ast.unparse(d) for d in node.decorator_list):
-                    collect[repr((context, ast.dump(node)))] += 1
-                    return
-                if node.name == "__init__":
-                    collect[repr((context, "__init__"))] += 1
-                args = [a for a in ast.walk(node.args) if isinstance(a, ast.arg)]
-                for a in args:
-                    if a.arg in skippers:
-                        skip(a, ancestors, params)
-                binds = [ast.dump(node.args)] + [ast.dump(d) for d in node.decorator_list]
-                params = dict(params, **{a.arg: binds for a in args})
-        elif _py_simple(node):
-            source = ast.unparse(node)
-            if PY_COLLECT.search(source):
-                collect[repr((context, ast.dump(node)))] += 1
-            if skip_call.search(source) or _py_names([node]) & skippers:
-                skip(node, ancestors, params)
-            return
-        for field, value in ast.iter_fields(node):
-            for child in value if isinstance(value, list) else [value]:
-                if isinstance(child, ast.AST) and not isinstance(child, (ast.expr_context, ast.arguments)):
-                    visit(child, ancestors + [(node, field)] if not isinstance(node, ast.Module) else ancestors,
-                          params)
-
-    visit(tree, [], {})
-    return collect, classes, skips
+    for statement in test.body:
+        visit(statement)
+    return names - declared
 
 
-def _python_unjudged(fd, moved_out, skipped):
-    """Why the Python rules cannot judge fd, a Python file in a Python test directory of a C/C++ repository, or None.
+def _py_marks_only(node):
+    """Whether every decorator of node is a pytest mark, which leaves it collected."""
+    return all((_py_chain(d.func if isinstance(d, ast.Call) else d) or "").startswith(("pytest.mark.", "mark."))
+               for d in node.decorator_list)
 
-    moved_out holds the paths that lose tests when moves count only into files
-    pytest collects, skipped the paths that already have a skip-marker hit.
+
+def _python_tests(tree):
+    """The tests pytest collects from a module, by name: top-level test_ functions, and test_ methods of
+    top-level Test classes that have no constructor, with no decorator but pytest marks."""
+    tests = []
+    for node in tree.body:
+        if isinstance(node, PY_DEFS) and node.name.startswith("test_") and _py_marks_only(node):
+            tests.append(node)
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test") and _py_marks_only(node):
+            methods = [n for n in node.body if isinstance(n, PY_DEFS) and n.name.startswith("test_")
+                       and _py_marks_only(n)]
+            rest = [n for n in node.body if n not in methods]
+            if not any(getattr(n, "name", getattr(n, "id", None)) in ("__init__", "__new__")
+                       for statement in rest for n in ast.walk(statement)):
+                tests += methods
+    return tests
+
+
+def _py_unplain(old, new, plain, uses):
+    """Why changing the statements old to new is more than an edit of assertions and plain statements, or None.
+
+    plain(statement) says whether a statement is one, uses(statement) why a new
+    one uses what it may not. A statement whose header stays, such as a with
+    or an if, is compared block by block.
     """
-    old, new = fd.old_path, fd.new_path
-    if fd.status == "renamed" and is_test_module(old) and not (
-            is_test_module(new) and posixpath.dirname(old) == posixpath.dirname(new)):
-        return "renamed a Python test module to another name or directory, where pytest may not collect it"
-    if fd.status == "renamed" and "conftest.py" in {_name(old), _name(new)}:
-        return "renamed a conftest.py, which changes what its hooks and settings apply to"
-    if fd.path in moved_out:
-        return f"{fd.status} a Python test file whose tests moved to a file pytest may not collect"
-    if not fd.changed():
-        return None
-    sides = _whole_sides(fd)
-    if sides is None:
-        return f"{fd.status} a Python test file the diff does not show whole"
-    items = [_python_items(text) for text in sides]
-    if None in items:
-        return f"{fd.status} a Python test file the guard cannot parse"
-    (old_collect, old_classes, old_skips), (new_collect, new_classes, new_skips) = items
-    if old_collect != new_collect:
-        return f"{fd.status} a Python test file's collection (collect_ignore, __test__, pytestmark or a pytest_ hook)"
-    if old_classes - new_classes:
-        return (f"{fd.status} a Python test file's test class, its name, bases or decorators, which may take its "
-                "tests out of collection")
-    if new_skips - old_skips and fd.path not in skipped:
-        return (f"{fd.status} a skip in a Python test file or the condition around it; the guard cannot tell an "
-                "environment check from a condition that always holds")
+    dumps = [[ast.dump(s) for s in side] for side in (old, new)]
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, *dumps, autojunk=False).get_opcodes():
+        removed, added = old[i1:i2], new[j1:j2]
+        if op == "equal":
+            continue
+        if len(removed) == len(added):
+            pairs = [(a, b) for a, b in zip(removed, added) if not (plain(a) and plain(b))]
+            for a, b in pairs:
+                (header_a, blocks_a), (header_b, blocks_b) = _py_split(a), _py_split(b)
+                if header_a != header_b or plain(a) or plain(b):
+                    return "flow"
+                why = next(filter(None, (_py_unplain(x, y, plain, uses) for x, y in zip(blocks_a, blocks_b))), None)
+                if why:
+                    return why
+            added = [b for a, b in zip(removed, added) if (a, b) not in pairs]
+            removed = []
+        if not all(plain(s) for s in removed + added):
+            return "flow"
+        why = next(filter(None, map(uses, added)), None)
+        if why:
+            return why
     return None
 
 
-def _collected_move(source, destination):
-    """Whether a test moved from source to destination still runs: pytest collects it in the same directory."""
-    return (destination.status != "deleted" and is_test_module(destination.new_path)
-            and posixpath.dirname(destination.new_path) == posixpath.dirname(source.path))
+def _python_unexempt(fd):
+    """Why fd, a Python file in a Python test directory of a C/C++ repository, is not exempt, or None.
+
+    Issue #40: only an edit in place of a test_*.py module that changes
+    assertions and plain statements inside its existing tests is exempt. Its
+    other code, outside those bodies, must stay the same statement for
+    statement, and a changed statement may use only the names and dotted names
+    its test already used, its test's own names and harmless builtins.
+    """
+    if not is_test_module(fd.path):
+        return "it is not a test_*.py module (a conftest.py or a helper can change any test)"
+    if fd.status != "modified" or fd.mode_changed:
+        return "only an edit in place can be exempt, not a rename, an addition, a deletion or a mode change"
+    sides = _whole_sides(fd)
+    if sides is None:
+        return "the diff does not show the whole file"
+    hide = next(filter(None, map(PY_HIDE.search, sides)), None)
+    if hide:
+        return f"it names {hide.group()}, which can skip, hide or stop tests"
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            trees = [ast.parse(text.lstrip("﻿")) for text in sides]
+    except (SyntaxError, ValueError):
+        return "the guard cannot parse it"
+    tests, skeletons = [_python_tests(tree) for tree in trees], []
+    for tree, side in zip(trees, tests):
+        bodies = [t.body for t in side]
+        for t in side:
+            t.body = []
+        skeletons.append(ast.dump(tree))
+        for t, body in zip(side, bodies):
+            t.body = body
+    if skeletons[0] != skeletons[1]:
+        return ("it changes code outside a test body: a def or class line, a decorator, an import, or module- or "
+                "class-level code")
+    for old, new in zip(*tests):
+        known, own = _py_reads(old, frozenset(_py_locals(old))), _py_locals(new)
+        flow = (ast.Yield, ast.YieldFrom) + (() if isinstance(new, ast.AsyncFunctionDef) else (ast.Await,))
+
+        def plain(statement):
+            return isinstance(statement, PY_PLAIN) and not any(isinstance(n, flow) for n in ast.walk(statement))
+
+        def uses(statement, name=new.name):
+            for chain in sorted(_py_reads(statement)):
+                parts = chain.split(".")
+                if any(map(PY_REFLECT.match, parts)) or not (parts[0] in own or chain in known
+                                                             or chain in PY_BUILTINS):
+                    return f"it adds a use of {chain}, which {name} did not have"
+            return None
+
+        why = _py_unplain(old.body, new.body, plain, uses)
+        if why == "flow":
+            return (f"it changes a statement in {new.name} that is not an assertion or plain statement: an if, for, "
+                    "while, with, try, match, return, raise, yield, await, global or definition")
+        if why:
+            return why
+    return None
 
 
-def c_cpp_hits(files, facts, flagged, skipped=frozenset()):
+def c_cpp_hits(files, facts, flagged):
     """removed-tests hits for a C/C++ repository's changes that may change which tests run or what they include.
 
-    flagged holds the paths that already have a removed-tests hit, skipped those that have a skip-marker hit.
+    flagged holds the paths that already have a removed-tests hit.
     """
     if not facts.c_cpp:
         return []
     hits = [Hit("removed-tests", path, None, "a symbolic link or submodule at or in a test directory; the guard "
                 "does not follow it, so any change may change the tests it holds")
             for path in facts.blind] if any(_touched(fd) for fd in files) else []
-    moved_out = {h.path for h in removed_test_hits(files, into=_collected_move)}
     for fd in files:
         if not _touched(fd) or fd.path in flagged or fd.path in facts.blind:
             continue
-        # A Python test is judged by removed_test_hits and skip_hits, as in any
-        # repository, unless its change is one they cannot judge.
         if any(_at_test_dir(p) for p in fd.paths):
             if not all(_python_test(p, facts) for p in fd.paths):
                 detail = f"{fd.status} a file in a test directory of a C/C++ repository"
             else:
-                why = _python_unjudged(fd, moved_out, skipped)
+                why = _python_unexempt(fd)
                 if why:
-                    hits.append(Hit("removed-tests", fd.path, None, why + "; in a C/C++ repository the guard judges "
-                                    "Python tests only by removed tests and skips, so this needs approval"))
+                    hits.append(Hit("removed-tests", fd.path, None, f"{fd.status} a Python test file of a C/C++ "
+                                    f"repository: {why}; only an edit of assertions and plain statements inside "
+                                    "existing tests is exempt, so this needs approval"))
                 continue
         elif fd.modes & {"160000"}:
             detail = f"{fd.status} a submodule of a C/C++ repository, which may hold sources or headers"
@@ -1248,8 +1282,8 @@ def repo_hits(repo_dir, base, head):
 def analyze(files, facts=None):
     """The hits of a diff. facts come from the base and head trees; without them, from the files the diff shows."""
     facts = facts or tree_facts(DiffTrees(files))
-    removed, skipped = removed_test_hits(files), skip_hits(files, facts)
-    hits = (removed + c_cpp_hits(files, facts, {h.path for h in removed}, {h.path for h in skipped}) + skipped
+    removed = removed_test_hits(files)
+    hits = (removed + c_cpp_hits(files, facts, {h.path for h in removed}) + skip_hits(files, facts)
             + retry_hits(files) + gate_config_hits(files))
     seen = set()
     unique = []
