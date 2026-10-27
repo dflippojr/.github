@@ -1299,6 +1299,16 @@ class RuleDetails(unittest.TestCase):
             with self.subTest(start=start_text):
                 [hit] = judged(old, new, start_text)
                 self.assertIn(why, hit.detail)
+        # A dict of literals keeps its keys' and values' count; a line Python reads the same is still a changed
+        # line outside an assert.
+        stops = "def test_hw():\n    stops = dict(low=60)\n    assert stops == {'low': 60}\n"
+        with self.subTest(change="dict literal"):
+            self.assertEqual(judged("{'low': 60}\n", "{'low': 65}\n", stops), [])
+            [hit] = judged("{'low': 60}\n", "{'low': 60, 'high': 120}\n", stops)
+            self.assertIn(shape, hit.detail)
+        with self.subTest(change="reformatted statement"):
+            [hit] = judged("app.move(LIMIT + 1)", "app.move(LIMIT+1)")
+            self.assertIn("it changes a line outside an assert statement of a test's own body", hit.detail)
         # pytest.approx counts only where a top-level import pytest is all that binds pytest.
         approx = "    assert os.sep == pytest.approx(1)\n"
         for start_text in ("import os\nimport types\n\npytest = types.SimpleNamespace(approx=os._exit)\n\n\n"
