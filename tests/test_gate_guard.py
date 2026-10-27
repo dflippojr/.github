@@ -1285,7 +1285,7 @@ class RuleDetails(unittest.TestCase):
                 self.assertIn(outside, hit.detail)
         # Other Python files in the test directory, and a test module renamed, added or deleted.
         start = dict(DESK_TREE, **{"backend/tests/helpers.py": "LIMIT = 120\n"})
-        for change, drop, why in (({"backend/tests/helpers.py": "LIMIT = 125\n"}, (), "not a test_*.py module"),
+        for change, drop, why in (({"backend/tests/helpers.py": "LIMIT = 125\n"}, (), "not a test_*.py or *_test.py module"),
                                   ({"backend/tests/test_api_v2.py": DESK_API}, {test_api}, "only an edit in place"),
                                   ({"backend/tests/test_new.py": DESK_API}, (), "only an edit in place")):
             with self.subTest(change=sorted(change)):

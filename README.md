@@ -51,20 +51,21 @@ whatever the change:
   test directory holds no C/C++ source or header in either tree (a file with no
   extension counts, except `.gitignore`, `.gitattributes`, `.gitkeep` and
   `.keep`), as in a Python backend's `backend/tests`. Such a file is exempt
-  only when its change edits a `test_*.py` module in place and changes nothing
-  but assertions and plain statements (an assignment, an expression, `pass`,
-  `del`) inside its existing tests: top-level `test_` functions, and `test_`
-  methods of top-level `Test` classes with no constructor, with no decorator
-  but pytest marks. Everything else in it stays the same statement for
-  statement, a block whose header stays (a `with` or an `if`) is compared
-  inside, and a changed statement may use only names and dotted names its test
-  already used, its test's own names and harmless builtins. Any other change is
-  a hit: a `conftest.py` or helper, a rename, addition or deletion, an import,
-  a decorator, a `def` or `class` line, module- or class-level code, control
-  flow (`if`, `for`, `while`, `with`, `try`, `match`, `return`, `raise`,
-  `yield`), and any change to a file that names a skip, `xfail`, an exit or
-  `__test__` anywhere, even in a comment or a string. Removed tests and new
-  skips are hits as in any repository;
+  only when its change edits a `test_*.py` or `*_test.py` module in place and
+  changes nothing but assertions and plain statements (an assignment, an
+  expression, `pass`, `del`) inside its existing tests: top-level `test_`
+  functions, and `test_` methods of top-level `Test` classes with no
+  constructor, with no decorator but pytest marks. Everything else in it stays
+  the same statement for statement, a block whose header stays (a `with` or an
+  `if`) is compared inside, and a changed statement may use only names and
+  dotted names its test already used, its test's own names and harmless
+  builtins. Any other change is a hit: a `conftest.py` or helper, a rename,
+  addition or deletion, an import, a decorator, a `def` or `class` line,
+  module- or class-level code, control flow (`if`, `for`, `while`, `with`,
+  `try`, `match`, `return`, `raise`, `yield`), and any change to a file that
+  names a skip, `xfail`, an exit, `__test__` or `getfixturevalue` anywhere,
+  even in a comment or a string. Removed tests and new skips are hits as in
+  any repository;
 - an added, deleted or renamed C/C++ source or header anywhere, including
   `.c++`, `.cp`, `.h++`, `.tpp`, `.tcc`, `.inl`, `.ino`, `.pde`, `.s` and files
   with no extension, which can shadow or drop an include; and any changed

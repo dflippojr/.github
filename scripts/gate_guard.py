@@ -582,11 +582,12 @@ def _python_test(path, facts):
     return _ext(path) in PY_EXTS and _test_root(path) not in facts.c_test_roots
 
 
-# A skip, an exit or __test__ named anywhere in a Python test file, even in a
-# comment or a string: an unchanged condition, helper or fixture of the file
-# can read what a plain statement changes.
+# A skip, an exit, __test__ or getfixturevalue named anywhere in a Python test
+# file, even in a comment or a string: an unchanged condition, helper or
+# fixture of the file can read what a plain statement changes, and
+# getfixturevalue pulls in, by name, a fixture of a conftest.py that may skip.
 PY_HIDE = re.compile(r"\b(?:skip|skipif|skipIf|skipUnless|skipTest|SkipTest|xfail|importorskip|expectedFailure|"
-                     r"exit|_exit|__test__)\b")
+                     r"exit|_exit|__test__|getfixturevalue)\b")
 PY_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
 PY_PLAIN = (ast.Assert, ast.Expr, ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Pass, ast.Delete)
 # Clauses that hold statements of their own: except handlers and, from Python
@@ -752,14 +753,15 @@ def _py_unplain(old, new, plain, uses):
 def _python_unexempt(fd):
     """Why fd, a Python file in a Python test directory of a C/C++ repository, is not exempt, or None.
 
-    Issue #40: only an edit in place of a test_*.py module that changes
-    assertions and plain statements inside its existing tests is exempt. Its
-    other code, outside those bodies, must stay the same statement for
-    statement, and a changed statement may use only the names and dotted names
-    its test already used, its test's own names and harmless builtins.
+    Issue #40: only an edit in place of a test_*.py or *_test.py module that
+    changes assertions and plain statements inside its existing tests is
+    exempt. Its other code, outside those bodies, must stay the same
+    statement for statement, and a changed statement may use only the names
+    and dotted names its test already used, its test's own names and harmless
+    builtins.
     """
     if not is_test_module(fd.path):
-        return "it is not a test_*.py module (a conftest.py or a helper can change any test)"
+        return "it is not a test_*.py or *_test.py module (a conftest.py or a helper can change any test)"
     if fd.status != "modified" or fd.mode_changed:
         return "only an edit in place can be exempt, not a rename, an addition, a deletion or a mode change"
     sides = _whole_sides(fd)
@@ -785,32 +787,34 @@ def _python_unexempt(fd):
     if skeletons[0] != skeletons[1]:
         return ("it changes code outside a test body: a def or class line, a decorator, an import, or module- or "
                 "class-level code")
-    for old, new in zip(*tests):
-        known, own = _py_reads(old, frozenset(_py_locals(old))), _py_locals(new)
-        flow = (ast.Yield, ast.YieldFrom) + (() if isinstance(new, ast.AsyncFunctionDef) else (ast.Await,))
+    return next(filter(None, (_python_test_change(old, new) for old, new in zip(*tests))), None)
 
-        def plain(statement):
-            return isinstance(statement, PY_PLAIN) and not any(isinstance(n, flow) for n in ast.walk(statement))
 
-        def uses(statement, name=new.name):
-            # On any value: a comprehension's or a lambda's name, or an item of a list.
-            reflect = next((n.attr for n in ast.walk(statement)
-                            if isinstance(n, ast.Attribute) and PY_REFLECT.match(n.attr)), None)
-            if reflect:
-                return f"it adds a use of .{reflect}, which reaches a module's globals or a frame"
-            for chain in sorted(_py_reads(statement)):
-                parts = chain.split(".")
-                if PY_REFLECT.match(parts[0]) or not (parts[0] in own or chain in known or chain in PY_BUILTINS):
-                    return f"it adds a use of {chain}, which {name} did not have"
-            return None
+def _python_test_change(old, new):
+    """Why changing the test old to new is more than an edit of assertions and plain statements, or None."""
+    known, own = _py_reads(old, frozenset(_py_locals(old))), _py_locals(new)
+    flow = (ast.Yield, ast.YieldFrom) + (() if isinstance(new, ast.AsyncFunctionDef) else (ast.Await,))
 
-        why = _py_unplain(old.body, new.body, plain, uses)
-        if why == "flow":
-            return (f"it changes a statement in {new.name} that is not an assertion or plain statement: an if, for, "
-                    "while, with, try, match, return, raise, yield, await, global or definition")
-        if why:
-            return why
-    return None
+    def plain(statement):
+        return isinstance(statement, PY_PLAIN) and not any(isinstance(n, flow) for n in ast.walk(statement))
+
+    def uses(statement):
+        # On any value: a comprehension's or a lambda's name, or an item of a list.
+        reflect = next((n.attr for n in ast.walk(statement)
+                        if isinstance(n, ast.Attribute) and PY_REFLECT.match(n.attr)), None)
+        if reflect:
+            return f"it adds a use of .{reflect}, which reaches a module's globals or a frame"
+        for chain in sorted(_py_reads(statement)):
+            parts = chain.split(".")
+            if PY_REFLECT.match(parts[0]) or not (parts[0] in own or chain in known or chain in PY_BUILTINS):
+                return f"it adds a use of {chain}, which {new.name} did not have"
+        return None
+
+    why = _py_unplain(old.body, new.body, plain, uses)
+    if why == "flow":
+        return (f"it changes a statement in {new.name} that is not an assertion or plain statement: an if, for, "
+                "while, with, try, match, return, raise, yield, await, global or definition")
+    return why
 
 
 def c_cpp_hits(files, facts, flagged):
