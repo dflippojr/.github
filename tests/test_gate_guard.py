@@ -1520,7 +1520,15 @@ class RuleDetails(unittest.TestCase):
                                   ("import os\n\n\ndef test_environment():\n    len = os.getcwd\n    assert len\n    assert True\n",
                                    [call]),
                                   ("def test_environment():\n    print('x')\n    assert True\n",
-                                   [("    assert True\n", "    print('y')\n    assert True\n")])):
+                                   [("    assert True\n", "    print('y')\n    assert True\n")]),
+                                  # desk-controller's usual fix: an assertion that already calls len, in a
+                                  # file whose other test monkeypatches, which no longer makes len exempt anew.
+                                  ("def test_environment(monkeypatch):\n    monkeypatch.setattr('os.sep', '/')\n"
+                                   "    assert len([1]) == 1\n", [("== 1\n", "== 1 or False\n")]),
+                                  # A comprehension in an assertion edited beside a lambda in a nested class:
+                                  # the guard compares them in source order, not by depth.
+                                  ("def test_environment():\n    class Fake:\n        value = property(lambda self: 1)\n"
+                                   "    assert [a for a in [1]] == [1]\n", [("== [1]\n", "== [1] or False\n")])):
             with self.subTest(control=start_text, edits=edits):
                 self.assertEqual(judged(start_text, *edits), [])
         # (3) Any name a changed test had, in any of its scopes, must resolve to the same binding in every
