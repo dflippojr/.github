@@ -1219,13 +1219,13 @@ class RuleDetails(unittest.TestCase):
 
         # No hit: an assertion or plain statement edited, added or removed in a test, inside a
         # with block whose header stays, in a test class's method or an async test; a docstring
-        # or a comment.
+        # or a comment inside a test.
         limits = "    assert app.max_height"
         for old, new in (("== LIMIT\n", "== LIMIT - 1\n"), ("    assert os.environ\n", ""),
                          (limits, "    height = app.max_height\n    assert height\n" + limits),
                          ("        app.move(LIMIT + 1)\n", "        app.move(LIMIT + 2)\n        app.move(-1)\n"),
                          ("== self.speed", "== self.speed * 1"), ("().status()", "().status(len([1]))"),
-                         ("stops at its limits", "stops at both limits"), ("# Height checks.", "# Limit checks.")):
+                         ("stops at its limits", "stops at both limits"), (limits, "    # The upper limit.\n" + limits)):
             with self.subTest(new=new):
                 self.assertEqual(judged(old, new), [])
         # A hit, with the reason in its detail: code outside a test body, a statement that is not
@@ -1233,6 +1233,7 @@ class RuleDetails(unittest.TestCase):
         outside, flow = "outside a test body", "not an assertion or plain statement"
         tail = "    assert await create_app().status()\n"
         cases = [("import os\n", "import os\nimport sys\n", outside), ("LIMIT = 120", "LIMIT = 125", outside),
+                 ("# Height checks.", "# Limit checks.", outside), ("import os\n", "import os\n\n", outside),
                  ("def test_height_limits():", "@pytest.mark.slow\ndef test_height_limits():", outside),
                  ("def test_height_limits():", "def test_height_limits(app=None):", outside),
                  ("    speed = 3\n", "    speed = 4\n", outside),
@@ -1275,6 +1276,11 @@ class RuleDetails(unittest.TestCase):
                       "    finally:\n        assert 2\n"
             [hit] = judged("    finally:\n", "    else:\n", guarded)
             self.assertIn(flow, hit.detail)
+        # A carriage return inside a line, even an unchanged one: Python reads it as a line break and git does
+        # not, so the guard cannot tell which lines Python reads as inside a test.
+        with self.subTest(change="carriage return"):
+            [hit] = judged("== LIMIT\n", "== LIMIT - 1\n", api.replace("# Height checks.", "# Height\r# checks."))
+            self.assertIn("carriage return", hit.detail)
         # A fixture pulled in by name from a conftest.py the guard does not read, which may skip.
         with self.subTest(change="getfixturevalue"):
             hw = "def test_hw(request):\n    assert request\n"

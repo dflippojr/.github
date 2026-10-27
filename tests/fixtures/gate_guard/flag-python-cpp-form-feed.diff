@@ -1,0 +1,31 @@
+# gate-guard fixture: in a C/C++ repository, a form feed, which Python reads as indentation, in a changed line of a test
+# expect: removed-tests
+# hits: 1
+# detail: not printable ASCII
+
+diff --git a/backend/tests/test_api.py b/backend/tests/test_api.py
+index 087045b..cf96160 100644
+--- a/backend/tests/test_api.py
++++ b/backend/tests/test_api.py
+@@ -1,10 +1,10 @@
+ from backend.app import create_app
+ 
+ 
+ def test_health():
+     assert create_app()
+ 
+ 
+ def test_height_limits():
+-    limit = 120
+-    assert create_app().max_height == limit
++    limit = 121
++    assert create_app().max_height == limit
+diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
+index b384dce..3925a03 100644
+--- a/firmware/src/logic.cpp
++++ b/firmware/src/logic.cpp
+@@ -1,3 +1,3 @@
+ int clamp(int v, int lo, int hi) {
+-  return v < lo ? lo : v;
++  return v < lo ? lo : (v > hi ? hi : v);
+ }
