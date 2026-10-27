@@ -23,7 +23,10 @@ script checks that the token is the owner's before it writes.
 Last it reads the head again. A push that landed between the first read and
 the label would be dated before the label, and the gate guard would count the
 label for a commit the owner never named, so when the head has moved the label
-is removed again.
+is removed again. For the same reason the label is removed again whenever the
+run fails once the label request is sent (the label write itself, the record,
+the final read). If that removal fails too, the run says so in an error line
+naming the pull request and exits 2: the owner removes the label by hand.
 
 Exit status: 0 applied, 1 refused, 2 when the API could not be read or written.
 A refusal of the owner's own comment is answered with a reply on the pull
@@ -46,6 +49,10 @@ SHA = re.compile(r"[0-9a-f]{40}")
 
 class Refused(Exception):
     """The comment does not approve anything; the message says why."""
+
+
+class LabelLeft(Exception):
+    """The label may be on a pull request the run did not approve, and removing it failed."""
 
 
 class GitHub:
@@ -113,18 +120,38 @@ def head_record(sha, comment_url):
             f"it.\n\n<!-- owner-label {LABEL} head={sha} -->")
 
 
+def remove_label(github, issue):
+    """Take the label off; one already gone (GitHub's 404) is off."""
+    try:
+        github.delete(f"{issue}/labels/{urllib.parse.quote(LABEL)}")
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+
+
 def apply(github, repo, number, sha, comment_url):
-    """Label, then record, then make sure the head did not move meanwhile. (code, message)."""
+    """Label, then record, then make sure the head did not move meanwhile. (code, message). Unless the head is
+    still sha at the end, the label comes off again, whatever failed; LabelLeft when that removal fails."""
     issue = f"/repos/{repo}/issues/{number}"
     names = {(label.get("name") or "").lower() for label in github.get(f"{issue}/labels?per_page=100")}
     if LABEL in names:
         # Adding a label the pull request has records no event, and the gate guard dates the label by its event.
         github.delete(f"{issue}/labels/{urllib.parse.quote(LABEL)}")
-    github.post(f"{issue}/labels", {"labels": [LABEL]})
-    github.post(f"{issue}/comments", {"body": head_record(sha, comment_url)})
-    now = (github.get(f"/repos/{repo}/pulls/{number}").get("head") or {}).get("sha")
+    now = None
+    try:
+        # A push can land between the check and the label, so the label is the owner's only once the head is
+        # read back unchanged; until then any failure (even of the label request: GitHub may have done it) undoes it.
+        github.post(f"{issue}/labels", {"labels": [LABEL]})
+        github.post(f"{issue}/comments", {"body": head_record(sha, comment_url)})
+        now = (github.get(f"/repos/{repo}/pulls/{number}").get("head") or {}).get("sha")
+    finally:
+        if now != sha:
+            try:
+                remove_label(github, issue)
+            except Exception as e:
+                raise LabelLeft(f"{LABEL} is still on {repo}#{number}, which this run did not approve, and removing "
+                                f"it failed ({e}); remove it by hand before anything merges") from e
     if now != sha:
-        github.delete(f"{issue}/labels/{urllib.parse.quote(LABEL)}")
         github.post(f"{issue}/comments", {"body": (
             f"`{LABEL}` removed again: the head moved from {sha} to {now} while it was applied. Review the "
             "new commits and approve that head.")})
@@ -190,6 +217,8 @@ def main():
     github = GitHub(os.environ.get("GITHUB_API_URL", "https://api.github.com"), token)
     try:
         code, message = run(github, os.environ.get("GITHUB_EVENT_NAME"), event, repo, owner, int(owner_id))
+    except LabelLeft as e:
+        code, message = 2, str(e)
     except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError, AttributeError) as e:
         code, message = 2, f"could not read or write the pull request ({e})"
     print(("::notice::" if code == 0 else "::error::") + escape(message))

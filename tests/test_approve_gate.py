@@ -29,11 +29,14 @@ class FakeGitHub:
     """Answers approve_gate's API calls from a small model of one pull request, and logs every write.
 
     heads: the PR head each successive GET of the pull request returns (the last one repeats), so a push
-    between the check and the label can be simulated.
+    between the check and the label can be simulated. faults: (method, path) -> {n: when}, the nth such call
+    raises URLError; a write with when "after" takes effect first (GitHub did it, the response was lost), one with
+    "before" does not. Removing a label the issue does not have is a 404, as on GitHub.
     """
 
     def __init__(self, body=None, login=OWNER, uid=OWNER_ID, updated=CREATED, is_pr=True, head_repo=REPO,
-                 state="open", labels=(), heads=(HEAD,), token_login=OWNER, token_id=OWNER_ID, kind="User"):
+                 state="open", labels=(), heads=(HEAD,), token_login=OWNER, token_id=OWNER_ID, kind="User",
+                 faults=None):
         self.comment = {"id": 55, "user": {"login": login, "id": uid, "type": kind},
                         "body": f"/approve-gate {HEAD}" if body is None else body,
                         "created_at": CREATED, "updated_at": updated,
@@ -43,8 +46,19 @@ class FakeGitHub:
         self.labels, self.heads = list(labels), list(heads)
         self.me = {"login": token_login, "id": token_id}
         self.writes = []
+        self.faults, self.calls = faults or {}, {}
+
+    def call(self, method, path):
+        """Counts the call; the time this call fails ("before", "after" or None)."""
+        n = self.calls[method, path] = self.calls.get((method, path), 0) + 1
+        return self.faults.get((method, path), {}).get(n)
+
+    def fail(self, method, path, when, now):
+        if when == now:
+            raise approve_gate.urllib.error.URLError(f"{method} {path} failed {when} GitHub acted")
 
     def get(self, path):
+        self.fail("GET", path, self.call("GET", path), "before")
         if path == f"/repos/{REPO}/issues/comments/55":
             return self.comment
         if path == "/user":
@@ -61,14 +75,22 @@ class FakeGitHub:
         raise AssertionError(f"unexpected GET {path}")
 
     def post(self, path, body):
+        when = self.call("POST", path)
+        self.fail("POST", path, when, "before")
         self.writes.append(("POST", path, body))
         if path.endswith("/labels"):
             self.labels += [n for n in body["labels"] if n not in self.labels]
+        self.fail("POST", path, when, "after")
         return {}
 
     def delete(self, path):
+        when = self.call("DELETE", path)
+        self.fail("DELETE", path, when, "before")
         self.writes.append(("DELETE", path, None))
+        if not any(path.endswith("/labels/" + n) for n in self.labels):
+            raise approve_gate.urllib.error.HTTPError(path, 404, "Label does not exist", {}, None)
         self.labels = [n for n in self.labels if not path.endswith("/labels/" + n)]
+        self.fail("DELETE", path, when, "after")
         return {}
 
     def comments(self):
@@ -204,6 +226,79 @@ class HeadMovesDuringApply(unittest.TestCase):
         self.assertNotIn(LABEL, github.labels)
         self.assertEqual(github.writes[-2][0], "DELETE")
         self.assertIn("removed again", github.comments()[-1])
+
+
+ISSUE = f"/repos/{REPO}/issues/{NUMBER}"
+PULL = f"/repos/{REPO}/pulls/{NUMBER}"
+LABEL_POST, RECORD_POST = ("POST", f"{ISSUE}/labels"), ("POST", f"{ISSUE}/comments")
+HEAD_GET, LABEL_DELETE = ("GET", PULL), ("DELETE", f"{ISSUE}/labels/{LABEL}")
+
+
+class FailureAfterTheLabel(unittest.TestCase):
+    """Review of f8baa01, finding 1: once the label is on, every way the run can fail takes it off again. The gate
+    guard dates the label against the newest push, so a label left on after a push between the check and the
+    label approves a head the owner never named."""
+
+    FAILURES = {
+        "the label POST, applied but the response lost": {LABEL_POST: {1: "after"}},
+        "the label POST, not applied": {LABEL_POST: {1: "before"}},
+        "the record POST": {RECORD_POST: {1: "before"}},
+        "the record POST, posted but the response lost": {RECORD_POST: {1: "after"}},
+        "the final head GET": {HEAD_GET: {2: "before"}},
+    }
+
+    def test_each_failure_removes_the_label(self):
+        for pushed in (False, True):
+            for failure, faults in self.FAILURES.items():
+                for labels in ((), (LABEL,)):
+                    with self.subTest(failure=failure, push_before_label=pushed, already_labeled=bool(labels)):
+                        github = FakeGitHub(heads=(HEAD, NEWER) if pushed else (HEAD,), faults=faults,
+                                            labels=labels)
+                        with self.assertRaises(approve_gate.urllib.error.URLError):
+                            run(github)
+                        self.assertNotIn(LABEL, github.labels)
+
+    def test_head_moved_after_a_push_between_check_and_label(self):
+        github = FakeGitHub(heads=(HEAD, NEWER), labels=(LABEL,))
+        code, message = run(github)
+        self.assertEqual(code, 1, message)
+        self.assertNotIn(LABEL, github.labels)
+
+    def test_a_failure_after_the_label_exits_2_with_the_label_off(self):
+        for failure, faults in self.FAILURES.items():
+            with self.subTest(failure=failure):
+                github = FakeGitHub(heads=(HEAD, NEWER), faults=faults)
+                code, out = main_with(self, github)
+                self.assertEqual(code, 2, out)
+                self.assertIn("::error::could not read or write", out)
+                self.assertNotIn(LABEL, github.labels)
+
+    def test_a_failed_removal_is_loud_and_exits_2(self):
+        stuck = {LABEL_DELETE: {1: "before"}}
+        failures = {k: v for k, v in self.FAILURES.items() if k != "the label POST, not applied"}
+        for failure, faults in list(failures.items()) + [("the head moved", {})]:
+            with self.subTest(failure=failure):
+                github = FakeGitHub(heads=(HEAD, NEWER), faults={**faults, **stuck})
+                code, out = main_with(self, github)
+                self.assertEqual(code, 2, out)
+                self.assertIn(LABEL, github.labels, "the fake's label really is still on")
+                self.assertRegex(out, rf"(?m)^::error::{LABEL} is still on {re.escape(REPO)}#{NUMBER}")
+                self.assertIn("remove it by hand", out)
+
+
+def main_with(test, github):
+    """approve_gate.main() against github, with the workflow's environment; (exit code, stdout)."""
+    tmp = tempfile.TemporaryDirectory()
+    test.addCleanup(tmp.cleanup)
+    event_path = pathlib.Path(tmp.name, "event.json")
+    event_path.write_text(json.dumps(event()), encoding="utf-8")
+    env = {"OWNER_GATE_TOKEN": "t", "GITHUB_REPOSITORY": REPO, "GITHUB_REPOSITORY_OWNER": OWNER,
+           "GITHUB_REPOSITORY_OWNER_ID": str(OWNER_ID), "GITHUB_EVENT_NAME": "issue_comment",
+           "GITHUB_EVENT_PATH": str(event_path)}
+    out = io.StringIO()
+    with mock.patch.dict(os.environ, env, clear=True), \
+            mock.patch.object(approve_gate, "GitHub", return_value=github), redirect_stdout(out):
+        return approve_gate.main(), out.getvalue()
 
 
 class Main(unittest.TestCase):

@@ -302,7 +302,12 @@ gate guard dates the label by its newest event: a re-approval after a push
 would still look older than the push. Then it posts the head record. Last, it
 reads the head again. If a push landed meanwhile, it removes the label again,
 because the gate guard would date the label after that push and count it for
-a commit the owner never named. A refused comment from the owner gets a reply
+a commit the owner never named. For the same reason it removes the label
+again when anything fails once the label request is sent: the label write
+itself (GitHub may have applied it), the record, or the final read. If that
+removal fails too, the run fails with an error line saying the label is still
+on the pull request, and the owner removes it by hand before anything merges.
+A refused comment from the owner gets a reply
 saying why. Anyone else's gets nothing. The job fails on a refusal, so the
 owner also sees a failed run.
 
