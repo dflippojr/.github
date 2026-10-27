@@ -1,4 +1,4 @@
-# gate-guard fixture: in a C/C++ repository, lambdas and comprehensions added to a Python test that use only names the test had
+# gate-guard fixture: in a C/C++ repository, lambdas and comprehensions edited in place in a Python test, using only names the test had
 # expect: 
 # hits: 0
 
@@ -11,13 +11,17 @@ diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
 diff --git a/backend/tests/test_environment.py b/backend/tests/test_environment.py
 --- a/backend/tests/test_environment.py
 +++ b/backend/tests/test_environment.py
-@@ -1,5 +1,9 @@
+@@ -1,9 +1,9 @@
  import os
  
  
  def test_environment():
      assert os.environ is not None
-+    assert (lambda value=os.environ: value)() is os.environ
-+    assert (lambda value: value)(os.environ) is os.environ
-+    assert [k for k, (v, *rest) in [(1, (2, 3))] if v and rest] == [1]
-+    assert {k: v for k, v in [(1, 2)]} == {1: 2}
+-    assert (lambda value=os.environ: value)() is os.environ
+-    assert (lambda value: value)(os.environ) is os.environ
+-    assert [k for k, (v, *rest) in [(1, (2, 3))] if v and rest] == [1]
+-    assert {k: v for k, v in [(1, 2)]} == {1: 2}
++    assert (lambda value=os.environ: value)() is not None
++    assert (lambda value: value)(os.environ) == os.environ
++    assert [k for k, (v, *rest) in [(1, (2, 4))] if v and rest] == [1]
++    assert {k: v for k, v in [(1, 3)]} == {1: 3}

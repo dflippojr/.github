@@ -1308,6 +1308,49 @@ class RuleDetails(unittest.TestCase):
                 self.assertIn("defined inside test_hw", hit.detail)
         with self.subTest(change="nested helper, test's own assertion"):
             self.assertEqual(judged("    assert os\n", "    assert os == 1\n", nested), [])
+        # Round b5: a change that makes unchanged code, at the test's level or in any scope inside it,
+        # resolve a name another way is a hit: the test's last binding of os removed or a first one
+        # added, or a comprehension's := binding os added or removed. Python 3.7 has no :=, so there
+        # the guard cannot parse those files.
+        readers = {"no nested scope": "    assert os\n", "def": "    def helper():\n        return os\n",
+                   "async def": "    async def helper():\n        return os\n",
+                   "class": "    class Helper:\n        value = os\n", "lambda": "    run = lambda: os\n",
+                   "list comprehension": "    assert [os for _ in [1]]\n",
+                   "set comprehension": "    assert {os for _ in [1]}\n",
+                   "dict comprehension": "    assert {os: 1 for _ in [1]}\n",
+                   "generator expression": "    assert list(os for _ in [1])\n"}
+        test_hw, binding = "import os\n\n\ndef test_hw():\n", "    os = 1\n"
+        plain_comp, walrus_comp = "    assert [v for v in [1]]\n", "    assert [(os := v) for v in [1]]\n"
+        for kind, reader in readers.items():
+            for change, start_text, old, new in (
+                    ("binding removed", test_hw + binding + reader, binding, ""),
+                    ("binding added", test_hw + reader, test_hw, test_hw + binding),
+                    (":= added", test_hw + plain_comp + reader, plain_comp, walrus_comp),
+                    (":= removed", test_hw + walrus_comp + reader, walrus_comp, plain_comp)):
+                with self.subTest(reader=kind, change=change):
+                    [hit] = judged(old, new, start_text + "    assert True\n")
+                    self.assertEqual(hit.rule, "removed-tests")
+                    self.assertIn("cannot parse" if ":=" in start_text + new and sys.version_info < (3, 8)
+                                  else "how the name os resolves in test_hw", hit.detail)
+        # An edit at the test's own level that changes how no name resolves is not a hit, beside every
+        # kind of nested scope or with none.
+        with self.subTest(change="assertion beside nested scopes"):
+            start_text = test_hw + binding + "".join(readers.values()) + "    assert True\n"
+            self.assertEqual(judged("    assert True\n", "    assert 1\n", start_text), [])
+        with self.subTest(change="assertion, no nested scope"):
+            self.assertEqual(judged("    assert value\n", "    assert value == 1\n",
+                                    "def test_hw():\n    value = 1\n    assert value\n"), [])
+        # A def, class, lambda or comprehension added, removed or reordered in a test is a hit.
+        reordered = test_hw + readers["lambda"] + readers["list comprehension"]
+        for old, new, start_text in (("    assert True\n", "    assert [v for v in [1]]\n", test_hw + "    assert True\n"),
+                                     (readers["lambda"], "", reordered + "    assert True\n"),
+                                     (reordered, test_hw + readers["list comprehension"] + readers["lambda"],
+                                      reordered + "    assert True\n"),
+                                     ("[os for _ in [1]]", "{os for _ in [1]}", reordered + "    assert True\n")):
+            with self.subTest(start=start_text, new=new):
+                [hit] = judged(old, new, start_text)
+                self.assertIn("adds, removes, renames or reorders a def, class, lambda or comprehension inside "
+                              "test_hw", hit.detail)
         # A block moved between a try's clauses: finally runs always, else only without an exception.
         with self.subTest(change="finally to else"):
             guarded = "def test_hw():\n    try:\n        assert 1\n    except ValueError:\n        pass\n" \
