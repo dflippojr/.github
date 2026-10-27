@@ -1730,7 +1730,8 @@ class GitEndToEnd(unittest.TestCase):
                      "flag-python-cpp-test-under-if-false", "flag-python-cpp-rename-disabled-dir",
                      "flag-python-cpp-collect-ignore-multiline", "pass-python-cpp-assert-approx-tolerance",
                      "pass-python-cpp-assert-beside-skipif", "flag-python-cpp-computed-globals-key",
-                     "flag-python-cpp-assert-in-with"]:
+                     "flag-python-cpp-assert-in-with", "flag-python-cpp-assert-unary-none",
+                     "pass-python-cpp-assert-negative-literal"]:
             with self.subTest(fixture=name), tempfile.TemporaryDirectory() as tmp:
                 subprocess.run(["git", "init", "-q", tmp], check=True, capture_output=True)
                 text = (FIXTURES / f"{name}.diff").read_text(encoding="utf-8")
