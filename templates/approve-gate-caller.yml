@@ -4,10 +4,14 @@
 #
 #   git ls-remote https://github.com/dflippojr/.github refs/heads/main
 #
-# The owner adds the OWNER_GATE_TOKEN repository secret first. issue_comment
-# runs this file as it is on the default branch, so a pull request that edits
-# it cannot change what approves it. See README.md in dflippojr/.github,
-# "Approve a gate change by comment".
+# The owner first creates the repository's approve-gate environment (deployment
+# branches: the default branch only) and adds OWNER_GATE_TOKEN to it as an
+# environment secret, never as a repository secret. A job that calls a reusable
+# workflow can't declare an environment, so approve-gate.yml's job declares it;
+# this caller passes the secret by name. issue_comment runs this file as it is
+# on the default branch, so a pull request that edits it cannot change what
+# approves it. See README.md in dflippojr/.github, "Approve a gate change by
+# comment".
 name: Approve gate (owner comment)
 
 on:

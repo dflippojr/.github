@@ -15,6 +15,21 @@ name: Approve gate (owner comment)
 # GITHUB_TOKEN start no workflow). The job runs on a GitHub-hosted runner only:
 # the self-hosted runners keep state between jobs and run pull request code.
 # See README.md, "Approve a gate change by comment".
+#
+# The token is a secret of the caller repository's `approve-gate` environment,
+# not a repository secret, and the approve job below declares that environment.
+# GitHub's documented wiring for an environment secret in a reusable workflow:
+# - The job that calls a reusable workflow can't use `environment`, so the
+#   called job declares it.
+# - The caller must still pass the secret, by name (never by inheriting all).
+#   It may pass a name that exists only in the environment. The job that
+#   declares the environment receives the environment's value.
+# - The github context, and so the environment, is the caller repository's.
+# - The deployment branch policy matches the run's GITHUB_REF. For
+#   issue_comment that is the default branch. A pull_request run has
+#   refs/pull/N/merge and a push to a branch has that branch, so with a policy
+#   of the default branch only, no workflow a pull request adds or edits can
+#   reach the token.
 on:
   workflow_call:
     inputs:
@@ -28,8 +43,8 @@ on:
       OWNER_GATE_TOKEN:
         description: >-
           The repository owner's fine-grained token with Pull requests: Read
-          and write on this repository. The caller passes its own OWNER_GATE_TOKEN
-          secret.
+          and write on this repository, stored as a secret of the caller
+          repository's approve-gate environment. The caller passes it by name.
         required: true
 
 permissions:
@@ -44,6 +59,8 @@ jobs:
       && github.event.issue.pull_request
       && github.event.comment.user.id == github.repository_owner_id
       && startsWith(github.event.comment.body, '/approve-gate ')
+    # Only this job gets the environment's OWNER_GATE_TOKEN (see the top of the file).
+    environment: approve-gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

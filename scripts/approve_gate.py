@@ -178,8 +178,8 @@ def main():
     owner = os.environ.get("GITHUB_REPOSITORY_OWNER", "")
     owner_id = os.environ.get("GITHUB_REPOSITORY_OWNER_ID", "")
     if not token:
-        print("::error::OWNER_GATE_TOKEN is not set; the owner adds it as a repository secret (README.md, "
-              "\"Approve a gate change by comment\").")
+        print("::error::OWNER_GATE_TOKEN is not set; the owner adds it as a secret of the repository's "
+              "approve-gate environment (README.md, \"Approve a gate change by comment\").")
         return 2
     if not repo or not owner or not owner_id.isdigit():
         print("::error::GITHUB_REPOSITORY, GITHUB_REPOSITORY_OWNER and GITHUB_REPOSITORY_OWNER_ID must be set.")

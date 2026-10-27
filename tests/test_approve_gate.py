@@ -271,6 +271,10 @@ class WorkflowSafety(unittest.TestCase):
         # The owner's token reaches the one step that runs the script, and nothing else.
         self.assertEqual(text.count("secrets.OWNER_GATE_TOKEN"), 1)
         job = yaml.safe_load(text)["jobs"]["approve"]
+        # The token is a secret of the caller's approve-gate environment (default branch only); a job that calls a
+        # reusable workflow can't declare an environment, so this called job does.
+        self.assertEqual(job["environment"], "approve-gate")
+        self.assertRegex(text, r"(?m)^    environment: approve-gate$")
         self.assertEqual(job["runs-on"], "ubuntu-latest", "an owner token never runs on a self-hosted runner")
         self.assertEqual(yaml.safe_load(text)["permissions"], {"contents": "read"})
         step = job["steps"][-1]
@@ -294,6 +298,28 @@ class WorkflowSafety(unittest.TestCase):
                                                        "cancel-in-progress": False})
                 job = data["jobs"]["approve-gate"]
                 self.assertEqual(job["secrets"], {"OWNER_GATE_TOKEN": "${{ secrets.OWNER_GATE_TOKEN }}"})
+                self.assertNotIn("environment", job, "GitHub refuses environment on a job that calls a workflow")
+
+    def test_only_the_approve_job_reads_the_token_or_declares_its_environment(self):
+        """Any default-branch job that declares approve-gate passes its branch rule and gets the token, so the one
+        reader is approve-gate.yml's approve job; a caller job may only pass the secret on by name."""
+        readers, callers = [], []
+        for path in sorted(WORKFLOWS.glob("*.y*ml")) + [TEMPLATE]:
+            for name, job in (yaml.safe_load(self.text(path)).get("jobs") or {}).items():
+                text = yaml.safe_dump(job)
+                if "OWNER_GATE_TOKEN" not in text and "approve-gate" not in str(job.get("environment", "")):
+                    continue
+                if "uses" in job:
+                    self.assertRegex(job["uses"], r"(^\./\.github|^dflippojr/\.github/\.github)/workflows/approve-gate"
+                                     r"\.yml(@|$)", f"{path.name}:{name}")
+                    self.assertEqual(job["secrets"], {"OWNER_GATE_TOKEN": "${{ secrets.OWNER_GATE_TOKEN }}"})
+                    rest = {k: v for k, v in job.items() if k != "secrets"}
+                    self.assertNotIn("OWNER_GATE_TOKEN", yaml.safe_dump(rest), f"{path.name}:{name}")
+                    callers.append(path.name)
+                else:
+                    readers.append((path.name, name, job.get("environment")))
+        self.assertEqual(readers, [("approve-gate.yml", "approve", "approve-gate")])
+        self.assertEqual(callers, ["approve-gate-base.yml", "approve-gate-caller.yml"])
 
     def test_template_pins_one_sha_in_both_places(self):
         text = self.text(TEMPLATE)
