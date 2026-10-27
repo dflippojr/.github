@@ -1,7 +1,7 @@
 # gate-guard fixture: a comprehension that assigns to an attribute of an imported module binds no name
 # expect: removed-tests
 # hits: 1
-# detail: assigns to an attribute or an item
+# detail: adds, removes or moves a statement
 
 diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
 --- a/firmware/src/logic.cpp

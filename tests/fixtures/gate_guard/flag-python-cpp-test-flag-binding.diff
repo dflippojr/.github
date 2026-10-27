@@ -1,7 +1,7 @@
 # gate-guard fixture: in a C/C++ repository, PR #41 review 3: the same-file constant a module's __test__ reads flipped
 # expect: removed-tests
 # hits: 1
-# detail: names __test__
+# detail: outside a test body
 
 diff --git a/backend/tests/test_api.py b/backend/tests/test_api.py
 index 03abeca..912b8a6 100644

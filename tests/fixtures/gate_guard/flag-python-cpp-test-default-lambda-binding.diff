@@ -1,7 +1,7 @@
 # gate-guard fixture: a lambda's parameter in a test's default is not one of the test's own names
 # expect: removed-tests
 # hits: 1
-# detail: adds a use of os.getcwd
+# detail: adds, removes or moves a statement
 
 diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
 --- a/firmware/src/logic.cpp

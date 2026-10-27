@@ -1,7 +1,7 @@
 # gate-guard fixture: an assertion's value changed in a helper that a test calls
 # expect: removed-tests
 # hits: 1
-# detail: not an assert statement of a test's own body
+# detail: outside a test body
 
 diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
 --- a/firmware/src/logic.cpp

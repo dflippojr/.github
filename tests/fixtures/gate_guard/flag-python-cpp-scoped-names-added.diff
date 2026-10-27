@@ -1,7 +1,7 @@
 # gate-guard fixture: in a C/C++ repository, lambdas and comprehensions added to a Python test, even ones that use only names the test had
 # expect: removed-tests
 # hits: 1
-# detail: adds, removes, renames or reorders a def, class, lambda or comprehension inside test_environment
+# detail: adds, removes or moves a statement
 
 diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
 --- a/firmware/src/logic.cpp

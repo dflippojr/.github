@@ -1,7 +1,7 @@
 # gate-guard fixture: in a C/C++ repository, PR #41 review 2: a multi-line condition above an existing skip flipped from False to True
 # expect: removed-tests
 # hits: 1
-# detail: names skip
+# detail: not an assert statement of a test's own body
 
 diff --git a/backend/tests/test_api.py b/backend/tests/test_api.py
 index c12e0ed..fbe1372 100644

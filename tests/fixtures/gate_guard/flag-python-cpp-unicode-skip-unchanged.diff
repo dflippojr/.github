@@ -1,7 +1,7 @@
 # gate-guard fixture: in a C/C++ repository, an unchanged fixture calls a fullwidth pytest.skip, which Python reads as pytest.skip, when a test fills a list
 # expect: removed-tests
 # hits: 1
-# detail: skip
+# detail: not an assert statement of a test's own body
 
 diff --git a/backend/tests/test_api.py b/backend/tests/test_api.py
 index 087045b..cf96160 100644

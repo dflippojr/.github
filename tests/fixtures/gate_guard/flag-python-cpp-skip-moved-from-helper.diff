@@ -1,7 +1,7 @@
 # gate-guard fixture: in a C/C++ repository, PR #41 review 3: an existing skip moved from an unused helper into a collected test
 # expect: removed-tests
 # hits: 1
-# detail: names skip
+# detail: outside a test body
 
 diff --git a/backend/tests/test_api.py b/backend/tests/test_api.py
 index 4d59fa3..24b4905 100644

@@ -1,5 +1,4 @@
 import ast
-import contextlib
 import io
 import json
 import os
@@ -7,7 +6,6 @@ import pathlib
 import re
 import shutil
 import subprocess
-import symtable
 import sys
 import tempfile
 import unittest
@@ -1194,208 +1192,142 @@ class RuleDetails(unittest.TestCase):
             self.assertEqual(flagged(dict(base, **{"backend/tests/sub/hooks.py": hooks}),
                                      {"backend/tests/sub/conftest.py": hooks}, drop={"backend/tests/sub/hooks.py"}),
                              {"backend/tests/sub/conftest.py"})
-        # Since issue #40 was narrowed, a conftest.py change and any change to a file that names
-        # a skip are hits: an ignore list reformatted, an assertion edited under an environment guard.
+        # A conftest.py change is a hit even when it only reformats an ignore list. Since the assert-only
+        # rule, an assertion's compared value fixed in a test that skips on its own unchanged condition is
+        # not: the skip and its condition stay as they were.
         empty = dict(base, **{conftest: "import pytest\n\ncollect_ignore = [\n]\n"})
         node = dict(base, **{test_api: api.replace(limits, "    if not shutil.which('node'):\n"
                                                            "        pytest.skip('no node')\n" + limits)})
-        for start, change in ((empty, {conftest: "import pytest\n\ncollect_ignore = []\n"}),
-                              (node, {test_api: node[test_api].replace("120", "125")})):
-            with self.subTest(change=change):
-                self.assertEqual(flagged(start, change), set(change))
+        self.assertEqual(flagged(empty, {conftest: "import pytest\n\ncollect_ignore = []\n"}), {conftest})
+        self.assertEqual(flagged(node, {test_api: node[test_api].replace("120", "125")}), set())
 
-    def test_python_tests_in_a_c_cpp_repository_are_exempt_only_for_plain_edits_in_tests(self):
-        """Issue #40, narrowed: only assertions and plain statements inside an existing test are exempt."""
+    def test_python_tests_in_a_c_cpp_repository_are_exempt_only_for_assertion_literals(self):
+        """Issue #40, the owner's assert-only rule: only an existing test's own assert statements may change, each
+        only in its compared literals, comparison operators and pytest.approx tolerances."""
         test_api = "backend/tests/test_api.py"
         api = ("import os\n\nimport pytest\n\nfrom backend.app import create_app, reset\n\nLIMIT = 120\n\n\n"
                "# Height checks.\ndef test_height_limits():\n    \"\"\"The desk stops at its limits.\"\"\"\n"
                "    app = create_app()\n    assert os.environ\n    with pytest.raises(ValueError):\n"
-               "        app.move(LIMIT + 1)\n    assert app.max_height == LIMIT\n\n\n"
+               "        app.move(LIMIT + 1)\n    assert app.max_height == LIMIT\n"
+               "    assert app.min_height >= 60, 'lowest stop'\n"
+               "    assert app.ratio == pytest.approx(0.5, abs=0.01)\n    assert app.stops == [60, 120]\n"
+               "    assert 0 < LIMIT < 200\n\n\n"
                "class TestMotor:\n    speed = 3\n\n    def test_speed(self):\n"
-               "        assert create_app().speed == self.speed\n\n\n"
-               "async def test_status():\n    assert await create_app().status()\n")
+               "        assert create_app().speed == self.speed\n        assert create_app().speed != 0\n\n\n"
+               "async def test_status():\n    assert await create_app().status()\n    assert create_app().ready is True\n")
 
         def judged(old, new, start_text=api):
+            self.assertIn(old, start_text)
             start = dict(DESK_TREE, **{test_api: start_text})
             return judge_commits(start, dict(start, **{test_api: start_text.replace(old, new, 1)}))
 
-        # No hit: an assertion or plain statement edited, added or removed in a test, inside a
-        # with block whose header stays, in a test class's method or an async test; a docstring,
-        # a comment or a blank line inside a test.
+        # No hit: a compared literal, a signed number, a container's items, a comparison operator, a
+        # pytest.approx expected value or tolerance, a plain message, a chained comparison of names and
+        # literals, in a test class's method or an async test; a comment, a blank line or a line break
+        # inside a test.
         limits = "    assert app.max_height"
-        for old, new in (("== LIMIT\n", "== LIMIT - 1\n"), ("    assert os.environ\n", ""),
-                         (limits, "    height = app.max_height\n    assert height\n" + limits),
-                         ("        app.move(LIMIT + 1)\n", "        app.move(LIMIT + 2)\n        app.move(-1)\n"),
-                         ("== self.speed", "== self.speed * 1"), ("().status()", "().status(len([1]))"),
-                         ("stops at its limits", "stops at both limits"), (limits, "    # The upper limit.\n" + limits),
-                         ("    app = create_app()\n", "    app = create_app()\n\n")):
-            with self.subTest(new=new):
+        for old, new in ((">= 60,", ">= 65,"), (">= 60,", ">= -60,"), ("'lowest stop'", "'the lowest stop'"),
+                         ("[60, 120]", "[65, 125]"), (">= 60,", "<= 60,"), ("== LIMIT\n", "!= LIMIT\n"),
+                         ("approx(0.5, abs=0.01)", "approx(0.25, abs=0.05)"), ("0 < LIMIT < 200", "0 <= LIMIT < 250"),
+                         ("speed != 0", "speed == 3"), ("ready is True", "ready is not False"),
+                         ("    app = create_app()\n", "    app = create_app()\n\n"),
+                         ("    assert os.environ\n", "    # The environment is set.\n    assert os.environ\n"),
+                         ("== LIMIT\n", "== LIMIT  # the upper stop\n"), ("== LIMIT\n", "== (\n        LIMIT)\n")):
+            with self.subTest(old=old, new=new):
                 self.assertEqual(judged(old, new), [])
-        # A hit, with the reason in its detail: code outside a test body, a statement that is not
-        # an assertion or plain statement, a use the test did not have, a skip or exit anywhere.
-        outside, flow = "outside a test body", "not an assertion or plain statement"
-        tail = "    assert await create_app().status()\n"
+        # A hit, with the reason in its detail.
+        outside, comment = "outside a test body", "a comment or a blank line outside a test body"
+        moved, statement = "adds, removes or moves a statement", "not an assert statement of a test's own body"
+        shape, unsafe = "outside a comparison's literal operands", "which decide what else it runs"
+        tail = "    assert create_app().ready is True\n"
         cases = [("import os\n", "import os\nimport sys\n", outside), ("LIMIT = 120", "LIMIT = 125", outside),
-                 ("# Height checks.", "# Limit checks.", outside), ("import os\n", "import os\n\n", outside),
+                 ("# Height checks.", "# Limit checks.", comment), ("import os\n", "import os\n\n", comment),
                  ("def test_height_limits():", "@pytest.mark.slow\ndef test_height_limits():", outside),
                  ("def test_height_limits():", "def test_height_limits(app=None):", outside),
                  ("    speed = 3\n", "    speed = 4\n", outside),
                  (tail, tail + "\n\ndef test_reset():\n    reset()\n", outside),
-                 (limits, "    if app:\n    " + limits, flow), (limits, "    for _ in range(1):\n    " + limits, flow),
-                 (limits, "    while app:\n    " + limits, flow),
-                 (limits, "    try:\n    " + limits + " == LIMIT\n    except AssertionError:\n        pass\n"
-                  "    assert app.max_height", flow),
-                 (limits, "    return\n" + limits, flow), (limits, "    raise ValueError()\n" + limits, flow),
-                 (limits, "    yield app\n" + limits, flow), (limits, "    x = yield\n" + limits, flow),
-                 (limits, "    def later():\n        pass\n" + limits, flow),
-                 ("    app = create_app()\n", "    global LIMIT\n    app = create_app()\n", flow),
-                 ("pytest.raises(ValueError)", "pytest.raises(Exception)", flow),
-                 ("    with pytest.raises(ValueError):\n        app.move(LIMIT + 1)\n", "", flow),
-                 (limits, "    reset()\n" + limits, "adds a use of reset"),
-                 (limits, "    os.execv('/bin/true', ['true'])\n" + limits, "adds a use of os.execv"),
-                 (limits, "    o = os\n" + limits, "adds a use of os,"),
-                 (limits, "    [os.getcwd() for os in [os]]\n" + limits, "adds a use of os,"),
-                 # Only a lambda's parameters and a comprehension's plain names are bound, never a name
-                 # read in a default, nor the object or index of an attribute or item assigned.
-                 (limits, "    (lambda a=(lambda os: 0): os.getcwd())()\n" + limits, "adds a use of os.getcwd"),
-                 (limits, "    [os.getcwd() for a, os.x in [(1, 2)]]\n" + limits, "assigns to an attribute or an item"),
-                 (limits, "    [os.getcwd() for [*os[:]] in [[1]]]\n" + limits, "assigns to an attribute or an item"),
-                 (limits, "    app.__class__\n" + limits, "adds a use of .__class__"),
-                 (limits, "    g = (x for x in [1])\n    g.gi_frame.f_globals\n" + limits,
-                  "adds a use of .f_globals"),
-                 (limits, "    getattr(app, 'move')\n" + limits, "adds a use of getattr"),
-                 (limits, "    __builtins__\n" + limits, "adds a use of __builtins__"),
-                 (limits, "    [c.__globals__ for c in [create_app]]\n" + limits, "adds a use of .__globals__"),
-                 (limits, "    [create_app][0].__globals__\n" + limits, "adds a use of .__globals__"),
-                 (limits, "    os._exit(0)\n" + limits, "names _exit"),
-                 (limits, "    pytest.exit('done')\n" + limits, "names exit"),
-                 (limits, "    pytest.skip('later')\n" + limits, "names skip"),
-                 ("== self.speed\n", "== self.speed\n        self.skipTest('later')\n", "names skipTest"),
+                 # Statements other than an assert, and an assert added, removed or moved.
+                 ("stops at its limits", "stops at both limits", statement),
+                 ("    app = create_app()\n", "    app = create_app(1)\n", statement),
+                 ("        app.move(LIMIT + 1)\n", "        app.move(LIMIT + 2)\n", statement),
+                 ("pytest.raises(ValueError)", "pytest.raises(Exception)", statement),
+                 ("    with pytest.raises(ValueError):\n        app.move(LIMIT + 1)\n", "", moved),
+                 ("    assert os.environ\n", "", moved), (limits, "    assert app\n" + limits, moved),
+                 ("    assert os.environ\n    with", "    with", moved),
+                 (limits, "    if app:\n    " + limits, statement), (limits, "    for _ in range(1):\n    " + limits, statement),
+                 (limits, "    while app:\n    " + limits, statement), (limits, "    return\n" + limits, moved),
+                 (limits, "    raise ValueError()\n" + limits, moved), (limits, "    yield app\n" + limits, moved),
+                 (limits, "    def later():\n        pass\n" + limits, moved),
+                 ("    app = create_app()\n", "    global LIMIT\n    app = create_app()\n", moved),
+                 (limits, "    reset()\n" + limits, moved), (limits, "    os.execv('/bin/true', ['true'])\n" + limits, moved),
+                 (limits, "    os._exit(0)\n" + limits, moved), (limits, "    pytest.exit('done')\n" + limits, moved),
+                 (limits, "    pytest.skip('later')\n" + limits, moved), (limits, "    getattr(app, 'move')\n" + limits, moved),
+                 (limits, "    [c.__globals__ for c in [create_app]]\n" + limits, moved),
+                 ("== self.speed\n", "== self.speed\n        self.skipTest('later')\n", moved),
+                 ("== LIMIT\n", "== LIMIT; reset()\n", moved),
+                 # An assert changed beyond its compared literals and operators.
+                 ("== LIMIT\n", "== LIMIT - 1\n", shape), ("== self.speed", "== self.speed * 1", shape),
+                 ("app.max_height ==", "app.min_height ==", shape), ("[60, 120]", "[60, 120, 180]", shape),
+                 ("[60, 120]", "(60, 120)", shape), ("approx(0.5, abs=0.01)", "approx(0.5, rel=0.01)", shape),
+                 ("approx(0.5, abs=0.01)", "approx(0.5, abs=0.01, nan_ok=True)", shape),
+                 ("assert os.environ\n", "assert os.environ == 1\n", shape),
+                 ("().status()", "().status(len([1]))", unsafe), ("ready is True", "ready is True and os.sep", unsafe),
+                 ("ready is True", "ready is (True if os.sep else False)", unsafe),
+                 ("ready is True", "ready is True, f'{reset()}'", "message"), ("'lowest stop'", "reset()", "message"),
+                 ("0 < LIMIT < 200", "0 < LIMIT < reset()", "chained comparison"),
                  (tail, tail + "def (\n", "cannot parse")]
         for old, new, why in cases:
-            with self.subTest(new=new):
+            with self.subTest(old=old, new=new):
                 hits = judged(old, new)
                 self.assertTrue(hits)
                 self.assertEqual({h.path for h in hits}, {test_api})
                 self.assertTrue(any(h.rule == "removed-tests" and why in h.detail for h in hits), hits)
-        # A name a comprehension's := bound was the test's own; with that statement gone, it is the module.
-        # Python 3.7 has no :=, so there the guard cannot parse the file.
-        with self.subTest(change=":= removed"):
-            walrus = "    assert [os for v in [1] if (os := v)]\n"
-            [hit] = judged(walrus, "    module = os\n    module.getcwd()\n", api.replace(limits, walrus + limits))
-            self.assertIn("adds a use of os," if sys.version_info >= (3, 8) else "cannot parse", hit.detail)
-        # A for that assigns to an attribute or an item binds no name there; the guard does not follow it.
-        with self.subTest(change="for item target"):
-            loop = "    for app.limits[0] in [LIMIT]:\n        assert app\n"
-            [hit] = judged("        assert app\n", "        assert app.max_height\n", api.replace(limits, loop + limits))
-            self.assertIn("assigns to an attribute or an item", hit.detail)
-        # A def or a class inside a test has names of its own: a global there makes a name the test binds
-        # the module's, so any change inside one is a hit, even with its header unchanged. An edit at the
-        # test's own level is not.
-        nested = ("import os\n\n\ndef test_hw():\n    os = 1\n\n    def helper():\n        global os\n"
-                  "        assert True\n\n    helper()\n    assert os\n")
-        inner, getcwd = "        assert True\n", "        assert True\n        os.getcwd()\n"
-        guarded = nested.replace("\n    def helper():\n        global os\n        assert True\n\n    helper()\n",
-                                 "    if os:\n        def helper():\n            global os\n            assert True\n\n"
-                                 "        helper()\n")
-        for start_text, old, new in (
-                (nested, inner, inner + "        os.execv('/bin/true', ['true'])\n"), (nested, inner, getcwd),
-                (nested, inner, inner + "        (lambda: os.getcwd())()\n"),
-                (nested, inner, inner + "        [os.getcwd() for _ in [1]]\n"), (nested, inner, "        assert 1\n"),
-                (nested.replace("    def helper", "    async def helper"), inner, getcwd),
-                (nested.replace("    def helper():", "    class Helper:").replace("    helper()\n", ""), inner, getcwd),
-                (guarded, "            assert True\n", "            assert True\n            os.getcwd()\n")):
-            with self.subTest(start=start_text, new=new):
-                [hit] = judged(old, new, start_text)
-                self.assertIn("defined inside test_hw", hit.detail)
-        with self.subTest(change="nested helper, test's own assertion"):
-            self.assertEqual(judged("    assert os\n", "    assert os == 1\n", nested), [])
-        # Round b5: a change that makes unchanged code, at the test's level or in any scope inside it,
-        # resolve a name another way is a hit: the test's last binding of os removed or a first one
-        # added, or a comprehension's := binding os added or removed. Python 3.7 has no :=, so there
-        # the guard cannot parse those files.
-        readers = {"no nested scope": "    assert os\n", "def": "    def helper():\n        return os\n",
-                   "async def": "    async def helper():\n        return os\n",
-                   "class": "    class Helper:\n        value = os\n", "lambda": "    run = lambda: os\n",
-                   "list comprehension": "    assert [os for _ in [1]]\n",
-                   "set comprehension": "    assert {os for _ in [1]}\n",
-                   "dict comprehension": "    assert {os: 1 for _ in [1]}\n",
-                   "generator expression": "    assert list(os for _ in [1])\n"}
-        test_hw, binding = "import os\n\n\ndef test_hw():\n", "    os = 1\n"
-        plain_comp, walrus_comp = "    assert [v for v in [1]]\n", "    assert [(os := v) for v in [1]]\n"
-        for kind, reader in readers.items():
-            for change, start_text, old, new in (
-                    ("binding removed", test_hw + binding + reader, binding, ""),
-                    ("binding added", test_hw + reader, test_hw, test_hw + binding),
-                    (":= added", test_hw + plain_comp + reader, plain_comp, walrus_comp),
-                    (":= removed", test_hw + walrus_comp + reader, walrus_comp, plain_comp)):
-                with self.subTest(reader=kind, change=change):
-                    [hit] = judged(old, new, start_text + "    assert True\n")
-                    self.assertEqual(hit.rule, "removed-tests")
-                    self.assertIn("cannot parse" if ":=" in start_text + new and sys.version_info < (3, 8)
-                                  else "how the name os resolves in test_hw", hit.detail)
-        # An edit at the test's own level that changes how no name resolves is not a hit, beside every
-        # kind of nested scope or with none.
-        with self.subTest(change="assertion beside nested scopes"):
-            start_text = test_hw + binding + "".join(readers.values()) + "    assert True\n"
-            self.assertEqual(judged("    assert True\n", "    assert 1\n", start_text), [])
-        with self.subTest(change="assertion, no nested scope"):
-            self.assertEqual(judged("    assert value\n", "    assert value == 1\n",
-                                    "def test_hw():\n    value = 1\n    assert value\n"), [])
-        # A def, class, lambda or comprehension added, removed or reordered in a test is a hit.
-        reordered, bare = test_hw + readers["lambda"] + readers["list comprehension"], test_hw + "    assert True\n"
-        for old, new, start_text in (("    assert True\n", "    assert [v for v in [1]]\n", bare),
-                                     (readers["lambda"], "", reordered + "    assert True\n"),
-                                     (reordered, test_hw + readers["list comprehension"] + readers["lambda"],
-                                      reordered + "    assert True\n"),
-                                     ("[os for _ in [1]]", "{os for _ in [1]}", reordered + "    assert True\n")):
-            with self.subTest(start=start_text, new=new):
-                [hit] = judged(old, new, start_text)
-                self.assertIn("adds, removes, renames or reorders a def, class, lambda or comprehension inside "
-                              "test_hw", hit.detail)
-        # Whatever the guard cannot read from symtable fails closed: a module it cannot build (a nonlocal
-        # left with no binding parses, but symtable rejects it), a test whose table it cannot find, a
-        # symbol without the private flags, and nested tables that differ where the ast's scopes do not.
-        unread = test_hw + binding + "    def helper():\n        nonlocal os\n        return os\n    assert True\n"
-        real_init = symtable.Symbol.__init__
-
-        def flagless(symbol, *args, **kwargs):
-            real_init(symbol, *args, **kwargs)
-            del symbol._Symbol__flags
-
-        for patch, old, new, start_text, why in (
-                (None, binding, "", unread, "cannot build its symbol table"),
-                (mock.patch.object(gate_guard, "_py_table", return_value=None), "    assert True\n",
-                 "    assert 1\n", bare, "cannot tell which symbol table is test_hw's"),
-                (mock.patch.object(symtable.Symbol, "__init__", flagless), "    assert os\n", "    assert os == 1\n",
-                 test_hw + readers["no nested scope"], "does not give the flags of os in test_hw"),
-                (mock.patch.object(gate_guard, "_py_scopes", return_value=[]), "    assert True\n",
-                 "    run = lambda: 1\n", bare, "adds, removes, renames or reorders a scope inside test_hw")):
-            with self.subTest(why=why), patch or contextlib.nullcontext():
+        # An assert that shares its line with other code, an assert inside a block or a nested def, and one in
+        # a helper or a Test class with a constructor.
+        hw = "import os\n\n\ndef test_hw():\n"
+        for start_text, old, new, why in (
+                (hw + "    assert os.sep == '/'; os.getcwd()\n", "'/'", "'x'", "shares its line with other code"),
+                (hw + "    with open(os.devnull):\n        assert os.sep == '/'\n", "'/'", "'x'", statement),
+                (hw + "    for sep in [os.sep]:\n        assert sep == '/'\n", "'/'", "'x'", statement),
+                (hw + "    try:\n        assert os.sep == '/'\n    except AssertionError:\n        pass\n", "'/'", "'x'",
+                 statement),
+                (hw + "    def helper():\n        assert os.sep == '/'\n    helper()\n", "'/'", "'x'", statement),
+                ("import os\n\n\ndef check():\n    assert os.sep == '/'\n\n\ndef test_hw():\n    check()\n", "'/'", "'x'",
+                 outside),
+                ("import os\n\n\nclass TestHw:\n    def __init__(self):\n        pass\n\n    def test_hw(self):\n"
+                 "        assert os.sep == '/'\n", "'/'", "'x'", outside)):
+            with self.subTest(start=start_text):
                 [hit] = judged(old, new, start_text)
                 self.assertIn(why, hit.detail)
-        # A block moved between a try's clauses: finally runs always, else only without an exception.
-        with self.subTest(change="finally to else"):
-            guarded = "def test_hw():\n    try:\n        assert 1\n    except ValueError:\n        pass\n" \
-                      "    finally:\n        assert 2\n"
-            [hit] = judged("    finally:\n", "    else:\n", guarded)
-            self.assertIn(flow, hit.detail)
+        # pytest.approx counts only where a top-level import pytest is all that binds pytest.
+        approx = "    assert os.sep == pytest.approx(1)\n"
+        for start_text in ("import os\nimport types\n\npytest = types.SimpleNamespace(approx=os._exit)\n\n\n"
+                           "def test_hw():\n" + approx,
+                           "import os\n\nimport pytest\n\npytest.approx = os._exit\n\n\ndef test_hw():\n" + approx,
+                           "import os\n\nimport pytest\nfrom os import *\n\n\ndef test_hw():\n" + approx,
+                           "import os\n\nimport pytest\n\n\ndef test_hw(pytest):\n" + approx,
+                           "import os\nfrom pytest import approx\n\n\ndef test_hw():\n    assert os.sep == approx(1)\n"):
+            with self.subTest(start=start_text):
+                [hit] = judged("approx(1)", "approx(0)", start_text)
+                self.assertIn(shape, hit.detail)
+        # Since the assert-only rule, a file that names a skip elsewhere no longer taints an assertion's fix
+        # (the b6 review's advisory): no file-wide words are read.
+        skipif = ("import os\n\nimport pytest\n\n\n@pytest.mark.skipif(os.name == 'nt', reason='posix')\n"
+                  "def test_posix():\n    assert os.sep == '/'\n\n\ndef test_hw(request):\n"
+                  "    request.getfixturevalue('hw')\n    assert os.sep == '/'\n")
+        with self.subTest(change="beside a skipif"):
+            self.assertEqual(judged("    assert os.sep == '/'\n", "    assert os.sep != '\\\\'\n",
+                                    skipif.replace("def test_posix():\n    assert os.sep == '/'", "def test_posix():\n"
+                                                   "    assert os.sep")), [])
         # A carriage return inside a line, even an unchanged one: Python reads it as a line break and git does
         # not, so the guard cannot tell which lines Python reads as inside a test.
         with self.subTest(change="carriage return"):
-            [hit] = judged("== LIMIT\n", "== LIMIT - 1\n", api.replace("# Height checks.", "# Height\r# checks."))
+            [hit] = judged("== LIMIT\n", "!= LIMIT\n", api.replace("# Height checks.", "# Height\r# checks."))
             self.assertIn("carriage return", hit.detail)
-        # A fixture pulled in by name from a conftest.py the guard does not read, which may skip.
-        with self.subTest(change="getfixturevalue"):
-            hw = "def test_hw(request):\n    assert request\n"
-            [hit] = judged("    assert request\n", "    request.getfixturevalue('hw')\n    assert request\n", hw)
-            self.assertIn("names getfixturevalue", hit.detail)
         # Only a test_ function, or a test_ method of a Test class with no constructor, has a body that
         # can change; anything else in the file counts as code outside a test body.
         for start_text in ("def testheight():\n    assert 120\n", "class Motor:\n    def test_speed(self):\n"
-                           "        assert 120\n", "class TestMotor:\n    def __init__(self):\n        pass\n\n"
-                           "    def test_speed(self):\n        assert 120\n",
-                           "import pytest\n\n\n@pytest.fixture\ndef test_app():\n    assert 120\n"):
+                           "        assert 120\n", "import pytest\n\n\n@pytest.fixture\ndef test_app():\n    assert 120\n"):
             with self.subTest(start=start_text):
                 [hit] = judged("120", "125", start_text)
                 self.assertIn(outside, hit.detail)
@@ -1410,9 +1342,9 @@ class RuleDetails(unittest.TestCase):
                 self.assertEqual((hit.rule, hit.path), ("removed-tests", sorted(change)[0]))
                 self.assertIn(why, hit.detail)
 
-    def test_python_tests_in_a_c_cpp_repository_resolve_every_name_as_before(self):
-        """PR #41 b6: a changed Python test is exempt only if every name it had resolves as before, and a new
-        builtin only if nothing in the file can make it another object."""
+    def test_python_tests_in_a_c_cpp_repository_keep_earlier_bypasses_as_hits(self):
+        """PR #41 rounds b2-b6: every bypass the structural rules chased stays a hit under the assert-only rule,
+        and so does the b6 review's globals()["l" + "en"] = os.execl."""
         test_env = "backend/tests/test_environment.py"
 
         def judged(start_text, *edits):
@@ -1423,127 +1355,95 @@ class RuleDetails(unittest.TestCase):
             start = dict(DESK_TREE, **{test_env: start_text})
             return judge_commits(start, dict(start, **{test_env: head}))
 
-        # (1) A comprehension's own names, read from the ast: from Python 3.12 symtable puts a list, set or dict
-        # comprehension's names in its test's table. Targets swapped between two comprehensions, one renamed
-        # so that its unchanged element reads the test's probe, nested targets swapped, a := moved to another
-        # comprehension, a target renamed throughout.
+        def hit(start_text, *edits):
+            hits = judged(start_text, *edits)
+            self.assertEqual([(h.rule, h.path) for h in hits], [("removed-tests", test_env)], hits)
+            return hits[0].detail
+
+        # b5: a binding that unchanged code, at the test's level or in a scope inside it, reads, removed or
+        # added, or a comprehension's := binding it added or removed (Python 3.7 cannot parse :=).
+        readers = {"no nested scope": "    assert os\n", "def": "    def helper():\n        return os\n",
+                   "async def": "    async def helper():\n        return os\n",
+                   "class": "    class Helper:\n        value = os\n", "lambda": "    run = lambda: os\n",
+                   "list comprehension": "    assert [os for _ in [1]]\n",
+                   "set comprehension": "    assert {os for _ in [1]}\n",
+                   "dict comprehension": "    assert {os: 1 for _ in [1]}\n",
+                   "generator expression": "    assert list(os for _ in [1])\n"}
+        test_hw, binding = "import os\n\n\ndef test_environment():\n", "    os = 1\n"
+        plain_comp, walrus_comp = "    assert [v for v in [1]]\n", "    assert [(os := v) for v in [1]]\n"
+        for kind, reader in readers.items():
+            for change, start_text, old, new in (
+                    ("binding removed", test_hw + binding + reader, binding, ""),
+                    ("binding added", test_hw + reader, test_hw, test_hw + binding),
+                    (":= added", test_hw + plain_comp + reader, plain_comp, walrus_comp),
+                    (":= removed", test_hw + walrus_comp + reader, walrus_comp, plain_comp)):
+                with self.subTest(reader=kind, change=change):
+                    hit(start_text + "    assert True\n", (old, new))
+        # b5 and b6: comprehension targets swapped or renamed, nested targets swapped, a := moved.
         top = "import os\nfrom unittest.mock import Mock\n\n\ndef test_environment():\n    probe = os\n"
-        opens = {"list": ("[", "", "]"), "set": ("{", "", "}"), "dict": ("{", ": 1", "}"),
-                 "generator": ("list(", "", ")")}
-        for kind, (start, value, end) in opens.items():
+        for start, value, end in (("[", "", "]"), ("{", "", "}"), ("{", ": 1", "}"), ("list(", "", ")")):
             two = (top + f"    first = {start}probe.getcwd(){value} for probe in [Mock()]{end}\n"
                    f"    second = {start}probe{value} for item in [None]{end}\n    assert True\n")
-            for change, start_text, edits in (
-                    ("targets swapped", two, [("for probe in [Mock()]", "for item in [Mock()]"),
-                                              ("for item in [None]", "for probe in [None]")]),
-                    ("target renamed", top + f"    first = {start}probe.getcwd(){value} for probe in [Mock()]{end}\n"
-                     "    assert True\n", [("for probe in [Mock()]", "for item in [Mock()]")])):
-                with self.subTest(comprehension=kind, change=change):
-                    [hit] = judged(start_text, *edits)
-                    self.assertEqual(hit.rule, "removed-tests")
-                    self.assertIn("resolves in test_environment", hit.detail)
-        nested = top + "    first = [[probe.getcwd() for item in [1]] for probe in [Mock()]]\n    assert True\n"
-        walrus = top + "    first = [(probe := v) for v in [Mock()]]\n    second = [v for v in [None]]\n" \
-                       "    assert probe\n"
-        renamed = "def test_environment():\n    assert [v for v in [1]]\n    assert True\n"
-        for change, start_text, edits in (
-                ("nested targets swapped", nested, [("for item in [1]", "for probe in [1]"),
-                                                    ("for probe in [Mock()]", "for item in [Mock()]")]),
-                (":= moved", walrus, [("(probe := v) for v in [Mock()]", "v for v in [Mock()]"),
-                                      ("v for v in [None]", "(probe := v) for v in [None]")]),
-                ("target renamed throughout", renamed, [("[v for v in [1]]", "[w for w in [1]]")])):
-            with self.subTest(change=change):
-                [hit] = judged(start_text, *edits)
-                self.assertEqual(hit.rule, "removed-tests")
-                self.assertIn("cannot parse" if ":=" in start_text and sys.version_info < (3, 8)
-                              else "test_environment", hit.detail)
-                self.assertRegex(hit.detail, r"cannot parse|resolves in test_environment|binds inside test_envir")
-        # (2) A builtin added to a test is exempt only if it is the builtin: bound nowhere in the file, in
-        # any scope (a test class's attribute and another test's local too), with no wildcard import and
-        # no word that can bind a module's or the builtins' names at run time. Each hit names the use.
+            with self.subTest(comprehension=start + end):
+                hit(two, ("for probe in [Mock()]", "for item in [Mock()]"), ("for item in [None]", "for probe in [None]"))
+                hit(top + f"    assert {start}probe.getcwd(){value} for probe in [Mock()]{end}\n",
+                    ("for probe in [Mock()]", "for item in [Mock()]"))
+        for start_text, edits in (
+                (top + "    first = [[probe.getcwd() for item in [1]] for probe in [Mock()]]\n    assert True\n",
+                 [("for item in [1]", "for probe in [1]"), ("for probe in [Mock()]", "for item in [Mock()]")]),
+                (top + "    first = [(probe := v) for v in [Mock()]]\n    second = [v for v in [None]]\n    assert probe\n",
+                 [("(probe := v) for v in [Mock()]", "v for v in [Mock()]"),
+                  ("v for v in [None]", "(probe := v) for v in [None]")]),
+                ("def test_environment():\n    assert [v for v in [1]]\n    assert True\n",
+                 [("[v for v in [1]]", "[w for w in [1]]")])):
+            with self.subTest(start=start_text):
+                hit(start_text, *edits)
+        # b5 and b6: a new builtin call beside each way the file can bind or reach the builtin's name, the b6
+        # review's computed globals() key among them, and new calls of a builtin the test already called.
         shadows = {"assignment": "len = os.getcwd\n", "from-import": "from os import getcwd as len\n",
                    "import as": "import posixpath as len\n", "def": "def len():\n    return os.getcwd()\n",
-                   "class": "class len:\n    pass\n", "for": "for len in [os.getcwd]:\n    pass\n",
-                   "except as": "try:\n    pass\nexcept Exception as len:\n    pass\n",
-                   "global in a function": "def setup_module():\n    global len\n    len = os.getcwd\n",
-                   "another test's local": "def test_other():\n    len = os.getcwd\n    assert len\n",
                    "wildcard import": "from os import *\n", "globals()": "globals()['len'] = os.getcwd\n",
-                   "vars()": "vars()['len'] = os.getcwd\n", "exec": "exec('len = os.getcwd')\n",
-                   "builtins module": "import builtins\nbuiltins.len = os.getcwd\n",
+                   "computed globals() key": "globals()['l' + 'en'] = os.execl\n",
+                   "exec": "exec('len = os.getcwd')\n", "builtins module": "import builtins\nbuiltins.len = os.getcwd\n",
                    "patch string": "from unittest import mock\nmock.patch('builtins.len', os.getcwd).start()\n",
-                   "setattr": "import sys\nsetattr(sys.modules[__name__], 'len', os.getcwd)\n",
-                   "attribute of a module": "import backend.tests.test_environment as me\nme.len = os.getcwd\n",
-                   "frame globals": "import sys\nsys._getframe().f_globals['len'] = os.getcwd\n",
-                   "function globals": "(lambda: 0).__globals__['len'] = os.getcwd\n",
                    "computed getattr": "f = lambda: 0\ngetattr(f, '__glo' + 'bals__')['len'] = os.getcwd\n",
-                   "module imported by itself": "import gc\nfrom backend.tests import test_environment as me\n"
-                                                "gc.get_referents(me)[0]['len'] = os.getcwd\n",
-                   "module of a function": "import gc\nimport inspect\n"
-                                           "gc.get_referents(inspect.getmodule(os.sep))[0]['len'] = os.getcwd\n",
-                   "gc's objects": "import gc\n\n\ndef setup_module():\n    for d in gc.get_objects():\n"
-                                   "        if type(d) is dict and 'setup_module' in d:\n"
-                                   "            d['len'] = os.getcwd\n",
                    "ctypes": "import ctypes\nctypes.pythonapi.PyEval_GetBuiltins.restype = ctypes.py_object\n"
-                             "ctypes.pythonapi.PyEval_GetBuiltins()['len'] = os.getcwd\n",
-                   # len anywhere but as a plain name: a key, a keyword or an attribute that a route the guard
-                   # does not list may use, or a comment.
-                   "a string": "REGISTRY = {}\nREGISTRY['len'] = os.getcwd\n",
-                   "a keyword": "REGISTRY = dict(len=os.getcwd)\n", "an attribute read": "WIDTH = os.len\n",
-                   "a comment": "# len is os.getcwd here\n"}
-        call = ("    assert True\n", "    len()\n    assert True\n")
+                             "ctypes.pythonapi.PyEval_GetBuiltins()['len'] = os.getcwd\n"}
         for kind, shadow in shadows.items():
             with self.subTest(shadow=kind):
-                [hit] = judged("import os\n" + shadow + "\n\ndef test_environment():\n    assert True\n", call)
-                self.assertEqual(hit.rule, "removed-tests")
-                self.assertIn("adds a use of len, which test_environment did not have", hit.detail)
-        with self.subTest(shadow="a test class's attribute"):
-            [hit] = judged("import os\n\n\nclass TestEnvironment:\n    len = os.getcwd\n\n"
-                           "    def test_environment(self):\n        assert True\n",
-                           ("        assert True\n", "        len()\n        assert True\n"))
-            self.assertIn("adds a use of len", hit.detail)
-        # A builtin the test already used is not exempt either where the file may make it another object: an
-        # unchanged from os import execl as print, and a print(...) beside the test's print('x').
-        with self.subTest(shadow="a use the test had"):
-            [hit] = judged("from os import execl as print\n\n\ndef test_environment():\n    print('x')\n"
-                           "    assert True\n", ("    assert True\n", "    print('/bin/true', 'true')\n    assert True\n"))
-            self.assertIn("adds a use of print, which test_environment did not have", hit.detail)
-        # Nor is a builtin outside the harmless ones, such as exec, that the test already called.
-        with self.subTest(shadow="exec the test had"):
-            [hit] = judged("def test_environment():\n    exec('value = 1')\n    assert True\n",
-                           ("    assert True\n", "    exec('import os')\n    assert True\n"))
-            self.assertIn("adds a use of exec, which test_environment did not have", hit.detail)
-        # The real builtins stay exempt where nothing shadows them, a test's own len is its own, and a builtin
-        # the test already used stays exempt.
-        for start_text, edits in (("import os\n\n\ndef test_environment():\n    assert True\n", [call]),
-                                  ("def test_environment():\n    assert True\n",
-                                   [("    assert True\n", "    print(len([1]), min(1, 2))\n    assert True\n")]),
-                                  ("import os\n\n\ndef test_environment():\n    len = os.getcwd\n    assert len\n    assert True\n",
-                                   [call]),
-                                  ("def test_environment():\n    print('x')\n    assert True\n",
-                                   [("    assert True\n", "    print('y')\n    assert True\n")]),
-                                  # desk-controller's usual fix: an assertion that already calls len, in a
-                                  # file whose other test monkeypatches, which no longer makes len exempt anew.
-                                  ("def test_environment(monkeypatch):\n    monkeypatch.setattr('os.sep', '/')\n"
-                                   "    assert len([1]) == 1\n", [("== 1\n", "== 1 or False\n")]),
-                                  # A comprehension in an assertion edited beside a lambda in a nested class:
-                                  # the guard compares them in source order, not by depth.
+                start_text = "import os\n" + shadow + "\n\ndef test_environment():\n    assert callable(len)\n    assert False\n"
+                self.assertIn("adds, removes or moves a statement",
+                              hit(start_text, ("    assert False\n", "    len('/bin/true', 'true')\n    assert False\n")))
+                # An existing call of it changed, in its argument rather than in a compared literal.
+                self.assertIn("outside a comparison's literal operands",
+                              hit(start_text.replace("callable(len)", "len('/bin/false', 'x') == 0"),
+                                  ("'/bin/false'", "'/bin/true'")))
+        for start_text, edits in (
+                ("from os import execl as print\n\n\ndef test_environment():\n    print('x')\n    assert True\n",
+                 [("    assert True\n", "    print('/bin/true', 'true')\n    assert True\n")]),
+                ("def test_environment():\n    exec('value = 1')\n    assert True\n",
+                 [("    assert True\n", "    exec('import os')\n    assert True\n")])):
+            with self.subTest(start=start_text):
+                hit(start_text, *edits)
+        # Controls: an existing assertion's compared literal fixed beside a monkeypatch, beside a shadowed
+        # builtin, and beside a lambda in a nested class stays exempt; the call it compares is unchanged.
+        for start_text, edits in (("def test_environment(monkeypatch):\n    monkeypatch.setattr('os.sep', '/')\n"
+                                   "    assert len([1]) == 1\n", [("== 1\n", "== 2\n")]),
+                                  ("from os import getcwd as len\n\n\ndef test_environment():\n    assert len() == '/'\n",
+                                   [("== '/'", "!= '/tmp'")]),
                                   ("def test_environment():\n    class Fake:\n        value = property(lambda self: 1)\n"
-                                   "    assert [a for a in [1]] == [1]\n", [("== [1]\n", "== [1] or False\n")])):
-            with self.subTest(control=start_text, edits=edits):
+                                   "    assert Fake().value == 1\n", [("== 1\n", "== 2\n")])):
+            with self.subTest(control=start_text):
                 self.assertEqual(judged(start_text, *edits), [])
-        # (3) Any name a changed test had, in any of its scopes, must resolve to the same binding in every
-        # scope from its own up to the module's, a module import's module and name included. A changed
-        # module-level binding is code outside a test body, a hit before b6 too.
-        for change, start_text, edits, why in (
-                ("module import changed", "from os import getcwd as probe\n\n\ndef test_environment():\n"
-                 "    assert probe\n", [("from os import getcwd", "from os import getpid"),
-                                        ("assert probe\n", "assert probe is not None\n")], "outside a test body"),
-                ("method's comprehension", "import os\nfrom unittest.mock import Mock\n\n\nclass TestEnv:\n"
-                 "    def test_environment(self):\n        probe = os\n        assert [probe.getcwd() for probe in "
-                 "[Mock()]]\n", [("for probe in", "for item in")], "resolves in")):
-            with self.subTest(change=change):
-                [hit] = judged(start_text, *edits)
-                self.assertIn(why, hit.detail)
+        # b6: a module import changed beside an assertion edit, and a method's comprehension target renamed.
+        for start_text, edits, why in (
+                ("from os import getcwd as probe\n\n\ndef test_environment():\n    assert probe == 1\n",
+                 [("from os import getcwd", "from os import getpid"), ("== 1", "== 2")], "outside a test body"),
+                ("import os\nfrom unittest.mock import Mock\n\n\nclass TestEnv:\n    def test_environment(self):\n"
+                 "        probe = os\n        assert [probe.getcwd() for probe in [Mock()]]\n",
+                 [("for probe in", "for item in")], "which decide what else it runs")):
+            with self.subTest(start=start_text):
+                self.assertIn(why, hit(start_text, *edits))
 
     def test_environment_guard_skip_is_not_a_hit(self):
         details = " ".join(h.detail for h in self.hits("flag-skip-python"))

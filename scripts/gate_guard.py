@@ -39,11 +39,11 @@ import argparse
 import ast
 import base64
 import bisect
-import builtins
 import collections
 import configparser
 import datetime
 import difflib
+import io
 import json
 import os
 import posixpath
@@ -51,10 +51,9 @@ import re
 import secrets
 import shutil
 import subprocess
-import symtable
 import sys
 import tempfile
-import unicodedata
+import tokenize
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -584,13 +583,6 @@ def _python_test(path, facts):
     return _ext(path) in PY_EXTS and _test_root(path) not in facts.c_test_roots
 
 
-# A skip, an exit, __test__ or getfixturevalue named anywhere in a Python test
-# file, even in a comment or a string, as written or as Python reads a name
-# (NFKC, so fullwidth letters are ASCII ones): an unchanged condition, helper
-# or fixture of the file can read what a plain statement changes, and
-# getfixturevalue pulls in, by name, a fixture of a conftest.py that may skip.
-PY_HIDE = re.compile(r"\b(?:skip|skipif|skipIf|skipUnless|skipTest|SkipTest|xfail|importorskip|expectedFailure|"
-                     r"exit|_exit|__test__|getfixturevalue)\b")
 # A source encoding declaration (PEP 263). The guard reads a file as UTF-8, so a
 # file that may declare another, on any line, is not exempt.
 PY_CODING = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
@@ -598,65 +590,16 @@ PY_CODING = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
 # as ASCII ones, and tabs and form feeds as indentation.
 PY_PRINTABLE = re.compile(r"[ -~]*")
 PY_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
-PY_PLAIN = (ast.Assert, ast.Expr, ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Pass, ast.Delete)
-# Clauses that hold statements of their own: except handlers and, from Python
-# 3.10, match cases (the guard runs on 3.7, which has none).
-PY_CLAUSES = tuple(c for c in (ast.excepthandler, getattr(ast, "match_case", None)) if c)
-# Expressions with names of their own: comprehensions and lambdas. They hold no
-# global or nonlocal, so any other name in them is their test's.
-PY_SCOPES = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp, ast.Lambda)
-# Builtins a changed statement may use though its test did not: none reaches a
-# module, a frame or an attribute by name, or runs code from a string.
-PY_BUILTINS = frozenset(
-    "abs all any ascii bin bool bytearray bytes callable chr complex dict divmod enumerate filter float format "
-    "frozenset hasattr hash hex id int isinstance issubclass iter len list map max min next object oct ord pow "
-    "print range repr reversed round set slice sorted str sum super tuple type zip".split()
-) | frozenset(n for n in dir(builtins) if n.endswith(("Error", "Exception", "Warning")))
-# What symtable says of a name in a scope, as the is_ methods of its Symbol (is_nonlocal is from Python 3.8).
-PY_SYMBOL = ("local", "global", "declared_global", "free", "nonlocal", "parameter", "imported", "assigned",
-             "referenced", "annotated", "namespace")
-# Words that can reach a module's or the builtins' names at run time, as written or as Python reads a name
-# (NFKC), anywhere in a file: a builtin there may not be the builtin (round b6). So can any dunder but
-# PY_TEXT_DUNDERS, which give only text or a constructor, and getattr, whose attribute name can be computed.
-PY_DYNAMIC = frozenset(
-    "builtins globals locals vars exec eval compile importlib import_module modules setattr delattr getattr "
-    "attrgetter patch f_globals f_builtins f_locals _getframe currentframe getmodule get_referents get_referrers "
-    "get_objects gc ctypes pythonapi".split())
-PY_TEXT_DUNDERS = frozenset(("__name__", "__main__", "__init__", "__file__", "__doc__"))
-PY_COMPS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
-# Nodes the guard runs on 3.7, which has neither: := is from Python 3.8, a type alias from 3.12.
-PY_WALRUS, PY_ALIAS = (getattr(ast, n, ()) for n in ("NamedExpr", "TypeAlias"))
-# Names that reach a module's globals or a frame from any value.
-PY_REFLECT = re.compile(r"^__\w*__$|^(?:f_globals|f_locals|f_builtins|f_back|f_code|gi_frame|gi_code|cr_frame|"
-                        r"ag_frame|tb_frame|tb_next)$")
-
-
-def _py_dump(value):
-    """A field of an ast node as text that leaves out line numbers."""
-    if isinstance(value, list):
-        return "[" + ", ".join(_py_dump(v) for v in value) + "]"
-    return ast.dump(value) if isinstance(value, ast.AST) else repr(value)
-
-
-def _py_split(node):
-    """(header, blocks) of a statement: the text of all it says but its statements, and its lists of statements.
-
-    The header names the field of each block, so a try's finally does not
-    compare equal to its else.
-    """
-    header, blocks = [type(node).__name__], []
-    for field, value in ast.iter_fields(node):
-        if isinstance(value, list) and value and isinstance(value[0], ast.stmt):
-            header.append(field)
-            blocks.append(value)
-        elif isinstance(value, list) and value and isinstance(value[0], PY_CLAUSES):
-            for clause in value:
-                clause_header, clause_blocks = _py_split(clause)
-                header.append(clause_header)
-                blocks += clause_blocks
-        else:
-            header.append(f"{field}={_py_dump(value)}")
-    return repr(header), blocks
+# The nodes ast.parse gives a literal, by name: Constant from Python 3.8; Num,
+# Str, Bytes, NameConstant and Ellipsis on 3.7, which 3.14 no longer has.
+PY_LITERALS = frozenset(("Constant", "Num", "Str", "Bytes", "NameConstant", "Ellipsis"))
+# Nodes a changed assertion may not hold, by name: they decide whether or how
+# often its other code runs (and, or, a conditional, a comprehension, a
+# lambda), bind a name (:=), suspend the test, or unpack an iterable.
+PY_UNSAFE = frozenset(("BoolOp", "IfExp", "ListComp", "SetComp", "DictComp", "GeneratorExp", "Lambda", "NamedExpr",
+                       "Await", "Yield", "YieldFrom", "Starred"))
+# pytest.approx(expected, rel, abs): the arguments an exempt change may give another literal.
+PY_TOLERANCES = ("rel", "abs")
 
 
 def _py_chain(node):
@@ -666,86 +609,6 @@ def _py_chain(node):
         parts.append(node.attr)
         node = node.value
     return ".".join([node.id] + parts[::-1]) if isinstance(node, ast.Name) else None
-
-
-def _py_params(args):
-    """The names a parameter list binds: its parameters, not what its defaults read or bind."""
-    params = getattr(args, "posonlyargs", []) + args.args + args.kwonlyargs + [args.vararg, args.kwarg]
-    return {p.arg for p in params if p}
-
-
-def _py_bound(target):
-    """The names a comprehension's target binds: its plain names, also inside a tuple, a list or a starred
-    item, not the object or index of an attribute or item it assigns."""
-    return {n.id for n in ast.walk(target) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
-
-
-def _py_binds(node):
-    """Every name node binds anywhere in it, in any scope: a nested def's or class's, a lambda's, a
-    comprehension's, a := target's, an import's, an except's or a match's."""
-    names = set()
-    for n in ast.walk(node):
-        if isinstance(n, ast.Name) and not isinstance(n.ctx, ast.Load):
-            names.add(n.id)
-        elif isinstance(n, ast.arg):
-            names.add(n.arg)
-        elif isinstance(n, ast.alias):
-            names.add((n.asname or n.name).split(".")[0])
-        else:
-            names.update(v for f, v in ast.iter_fields(n) if f in ("name", "rest") and isinstance(v, str))
-    return names
-
-
-def _py_reads(node, bound=frozenset()):
-    """The names and dotted names node uses, each whole (os.path.join, not os), but for those in bound.
-
-    A comprehension's and a lambda's own names count as bound inside them; the
-    first iterable of a comprehension and a lambda's defaults are outside.
-    """
-    chain = _py_chain(node)
-    if chain:
-        return set() if chain.split(".")[0] in bound else {chain}
-    reads = set()
-    if isinstance(node, ast.Lambda):
-        for default in node.args.defaults + node.args.kw_defaults:
-            reads |= _py_reads(default, bound) if default else set()
-        return reads | _py_reads(node.body, bound | _py_params(node.args))
-    if isinstance(node, PY_SCOPES):
-        inner = bound | set().union(*(_py_bound(g.target) for g in node.generators))
-        for i, g in enumerate(node.generators):
-            reads |= _py_reads(g.iter, inner if i else bound)
-            for condition in g.ifs:
-                reads |= _py_reads(condition, inner)
-        for field in ("elt", "key", "value"):
-            reads |= _py_reads(getattr(node, field), inner) if hasattr(node, field) else set()
-        return reads
-    for child in ast.iter_child_nodes(node):
-        reads |= _py_reads(child, bound)
-    return reads
-
-
-def _py_locals(test):
-    """The names a test binds as its own: its parameters, and what its statements assign, import or define."""
-    names, declared = _py_params(test.args), set()
-
-    def visit(node):
-        if isinstance(node, (ast.Global, ast.Nonlocal)):
-            declared.update(node.names)
-        elif isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
-            names.add(node.id)
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            names.update((a.asname or a.name).split(".")[0] for a in node.names)
-        elif isinstance(node, ast.ExceptHandler) and node.name:
-            names.add(node.name)
-        if isinstance(node, PY_DEFS + (ast.ClassDef,)):
-            names.add(node.name)
-        elif not isinstance(node, PY_SCOPES):
-            for child in ast.iter_child_nodes(node):
-                visit(child)
-
-    for statement in test.body:
-        visit(statement)
-    return names - declared
 
 
 def _py_marks_only(node):
@@ -840,20 +703,183 @@ def _py_unplain(old, new, plain, uses):
     return None
 
 
+def _py_binds_here(node):
+    """The names node itself binds or declares, not those of the nodes inside it, with '*' for a wildcard import."""
+    if isinstance(node, ast.Name):
+        return set() if isinstance(node.ctx, ast.Load) else {node.id}
+    if isinstance(node, ast.arg):
+        return {node.arg}
+    if isinstance(node, ast.alias):
+        return {(node.asname or node.name).split(".")[0]}
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return set(node.names)
+    return {v for f, v in ast.iter_fields(node) if f in ("name", "rest") and isinstance(v, str)}
+
+
+def _py_pytest(tree):
+    """Whether pytest in tree is the pytest module: one top-level import pytest is all that binds or declares
+    the name, nothing assigns or deletes an attribute of it, and no wildcard import may rebind it."""
+    imports = [a for n in tree.body if isinstance(n, ast.Import)
+               for a in n.names if a.name == "pytest" and not a.asname]
+    for n in ast.walk(tree):
+        if n not in imports and {"pytest", "*"} & _py_binds_here(n):
+            return False
+        if (isinstance(n, ast.Attribute) and not isinstance(n.ctx, ast.Load)
+                and (_py_chain(n) or "").startswith("pytest.")):
+            return False
+    return len(imports) == 1
+
+
+def _py_text(node):
+    """Whether node is a string literal."""
+    return type(node).__name__ == "Str" or (type(node).__name__ == "Constant" and isinstance(node.value, str))
+
+
+def _py_leaves(node):
+    """The ids of the literals in node, a literal (see _py_literal), or None when it is not one.
+
+    A container's own node is not one of them, so its kind and length stay
+    compared; a signed number counts as one literal, so 5 may become -5.
+    """
+    if type(node).__name__ in PY_LITERALS:
+        return {id(node)}
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        return {id(node)} if type(node.operand).__name__ in PY_LITERALS else None
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        parts = node.elts
+    elif isinstance(node, ast.Dict):
+        parts = node.keys + node.values
+    else:
+        return None
+    leaves = [_py_leaves(p) if p is not None else None for p in parts]
+    return None if None in leaves else set().union(*leaves)
+
+
+def _py_masks(node, approx):
+    """The ids of the nodes of the assert statement node an exempt change may give other literals.
+
+    They are its message if that is a string, and, where its test is a
+    comparison, the literals of each literal operand (a constant, a signed
+    number, or a list, tuple, set or dict of literals) and, when approx says
+    pytest is the pytest module, those of a pytest.approx operand's expected
+    value and its rel and abs.
+    """
+    masked = {id(node.msg)} if node.msg is not None and _py_text(node.msg) else set()
+    if not isinstance(node.test, ast.Compare):
+        return masked
+    for operand in [node.test.left] + node.test.comparators:
+        literal = [operand]
+        if approx and isinstance(operand, ast.Call) and _py_chain(operand.func) == "pytest.approx":
+            literal = operand.args[:3] + [k.value for k in operand.keywords if k.arg in PY_TOLERANCES]
+        for part in literal:
+            masked |= _py_leaves(part) or set()
+    return masked
+
+
+def _py_masked(node, masked):
+    """node as text without line numbers, with each node whose id is in masked, and each comparison
+    operator, as a placeholder."""
+    if isinstance(node, list):
+        return "[" + ", ".join(_py_masked(n, masked) for n in node) + "]"
+    if id(node) in masked:
+        return "<literal>"
+    if isinstance(node, ast.cmpop):
+        return "<comparison>"
+    if not isinstance(node, ast.AST):
+        return repr(node)
+    return f"{type(node).__name__}({', '.join(f'{f}={_py_masked(v, masked)}' for f, v in ast.iter_fields(node))})"
+
+
+def _py_assert_change(old, new, name, approx):
+    """Why changing the assert statement old of the test name to new is more than replacing its compared
+    literals, comparison operators and pytest.approx tolerances, or None."""
+    for node in (old, new):
+        if any(type(n).__name__ in PY_UNSAFE for n in ast.walk(node)):
+            return (f"it changes an assertion in {name} that holds an and, or, a conditional expression, a "
+                    "comprehension, a lambda, :=, await, yield or a starred item, which decide what else it runs")
+        if node.msg is not None and not _py_text(node.msg):
+            return (f"it changes an assertion in {name} whose message is not a plain string; the message runs only "
+                    "when the assertion fails")
+        test = node.test
+        if isinstance(test, ast.Compare) and len(test.ops) > 1 and not all(
+                isinstance(o, ast.Name) or _py_leaves(o) for o in [test.left] + test.comparators):
+            return (f"it changes a chained comparison in {name} with an operand that is not a name or a literal, "
+                    "which runs only while the links before it hold")
+    if _py_masked(old, _py_masks(old, approx)) != _py_masked(new, _py_masks(new, approx)):
+        rebound = "" if approx or "pytest.approx" not in {_py_chain(n) for n in ast.walk(new)} else (
+            "; pytest.approx counts only where a top-level import pytest is all that binds pytest")
+        return (f"it changes an assertion in {name} outside a comparison's literal operands, its operators and a "
+                f"pytest.approx tolerance: a name, an attribute, a call or its argument, or the expression's "
+                f"shape{rebound}")
+    return None
+
+
+def _python_test_change(old, new, approx):
+    """Why changing the test old to new is more than replacing assert statements of its own body, each by one
+    that differs only in compared literals, comparison operators and pytest.approx tolerances, or None."""
+    dumps = [[ast.dump(s) for s in test.body] for test in (old, new)]
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, *dumps, autojunk=False).get_opcodes():
+        if op == "equal":
+            continue
+        if i2 - i1 != j2 - j1:
+            return f"it adds, removes or moves a statement in {new.name}"
+        for a, b in zip(old.body[i1:i2], new.body[j1:j2]):
+            if not (isinstance(a, ast.Assert) and isinstance(b, ast.Assert)):
+                return (f"it changes a statement of {new.name} that is not an assert statement of a test's own "
+                        "body: a plain statement, a docstring, or an if, for, while, with or try, even around an "
+                        "assert")
+            why = _py_assert_change(a, b, new.name, approx)
+            if why:
+                return why
+    return None
+
+
+def _py_logical_lines(text):
+    """{line number: (first, last)} of each line of text in a logical line, which blank and comment lines
+    are not."""
+    found, first = {}, None
+    for token in tokenize.generate_tokens(io.StringIO(text).readline):
+        if token.type in (tokenize.COMMENT, tokenize.NL, tokenize.INDENT, tokenize.DEDENT, tokenize.ENDMARKER):
+            continue
+        first = token.start[0] if first is None else first
+        if token.type == tokenize.NEWLINE:
+            found.update((i, (first, token.end[0])) for i in range(first, token.end[0] + 1))
+            first = None
+    return found
+
+
+def _py_line_change(tree, tests, text, changed):
+    """Why changed, the numbers of the changed lines of text, parsed as tree with its tests, are more than the
+    lines of assert statements of the tests' own bodies and comments and blank lines inside them, or None."""
+    lines, logical = text.split("\n")[:-1], _py_logical_lines(text)
+    asserts = {s.lineno for test in tests for s in test.body if isinstance(s, ast.Assert)}
+    starts = collections.Counter(n.lineno for n in ast.walk(tree) if isinstance(n, ast.stmt))
+    bodies = _py_body_lines(tree, tests, lines)
+    for i in sorted(changed):
+        if i not in logical:
+            if i not in bodies:
+                return "it changes a comment or a blank line outside a test body"
+            continue
+        first, last = logical[i]
+        if first not in asserts:
+            return "it changes a line outside an assert statement of a test's own body"
+        if sum(starts[j] for j in range(first, last + 1)) != 1:
+            return "an assert statement it changes shares its line with other code"
+    return None
+
+
 def _python_unexempt(fd):
     """Why fd, a Python file in a Python test directory of a C/C++ repository, is not exempt, or None.
 
-    Issue #40: only an edit in place of a test_*.py or *_test.py module that
-    changes assertions and plain statements inside its existing tests is
-    exempt. Every changed line, even a comment or a blank line, must be inside
-    a test body and hold only printable ASCII, and the file must be UTF-8 as
-    Python reads it, so the text the guard compares is the code Python runs.
-    The code outside those bodies must stay the same statement for statement,
-    and a changed statement may use only the names and dotted names its test
-    already used, its test's own names and harmless builtins. A change inside
-    a def or a class nested in a test is not exempt: a global there can make a
-    name the test binds the module's. Nor is one that changes how a name
-    resolves in a changed test or any scope inside it (_python_scope_change).
+    Issue #40, the owner's assert-only rule: only an edit in place of a
+    test_*.py or *_test.py module that replaces assert statements of its
+    existing tests' own bodies is exempt, each new assert the removed one
+    with only its compared literals, comparison operators and pytest.approx
+    tolerances changed (_python_test_change). Every other line of the file
+    stays as it was, but for comments and blank lines inside a test body.
+    Every changed line holds only printable ASCII, and the file must be
+    UTF-8 as Python reads it, so the text the guard compares is the code
+    Python runs.
     """
     if not is_test_module(fd.path):
         return "it is not a test_*.py or *_test.py module (a conftest.py or a helper can change any test)"
@@ -865,30 +891,22 @@ def _python_unexempt(fd):
     if any("\r" in text for text in sides):
         return ("it holds a carriage return inside a line, which Python reads as a line break and git does not, "
                 "so the guard cannot tell which lines are inside a test")
-    lines = [text.split("\n")[:-1] for text in sides]
-    coding = _py_coding(lines[0] + lines[1])
+    coding = _py_coding(sides[0].split("\n") + sides[1].split("\n"))
     if coding:
         return f"it declares the source encoding {coding}; the guard reads only UTF-8"
     if not all(PY_PRINTABLE.fullmatch(l.text) for l in fd.lines if l.kind != " "):
         return ("a changed line holds a character that is not printable ASCII, such as a tab, a form feed or a "
                 "letter Python reads as an ASCII one")
-    hide = next(filter(None, (PY_HIDE.search(t) for text in sides
-                              for t in (text, unicodedata.normalize("NFKC", text)))), None)
-    if hide:
-        return f"it names {hide.group()}, which can skip, hide or stop tests"
+    texts = [text.lstrip("﻿") for text in sides]
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            texts = [text.lstrip("﻿") for text in sides]
             trees = [ast.parse(text) for text in texts]
-    except (SyntaxError, ValueError):
+            for text in texts:
+                _py_logical_lines(text)
+    except (SyntaxError, ValueError, tokenize.TokenError):
         return "the guard cannot parse it"
     tests, skeletons = [_python_tests(tree) for tree in trees], []
-    changed = [{l.old for l in fd.lines if l.kind == "-"}, {l.new for l in fd.lines if l.kind == "+"}]
-    if any(side - _py_body_lines(tree, side_tests, side_lines)
-           for side, tree, side_tests, side_lines in zip(changed, trees, tests, lines)):
-        return ("it changes a line outside a test body: a def or class line, a decorator, an import, a comment, "
-                "a blank line, or module- or class-level code")
     for tree, side in zip(trees, tests):
         bodies = [t.body for t in side]
         for t in side:
@@ -899,380 +917,10 @@ def _python_unexempt(fd):
     if skeletons[0] != skeletons[1]:
         return ("it changes code outside a test body: a def or class line, a decorator, an import, or module- or "
                 "class-level code")
-    builtin_names = _py_builtins(fd.path, texts, trees)
-    return (next(filter(None, (_python_test_change(old, new, *builtin_names) for old, new in zip(*tests))), None)
-            or _python_scope_change(texts, trees, tests))
-
-
-def _py_builtins(path, texts, trees):
-    """(real, shadowed): what the file at path, texts parsed as trees, may make of the builtins' names.
-
-    Round b6. shadowed holds the builtins' names that a scope of either side
-    binds, even another test's, or that either side holds otherwise than as
-    a plain name: in a string, a keyword, an attribute or a comment, which a
-    route to a namespace the guard does not list may use; after a wildcard
-    import, every builtin's name. real holds the harmless builtins that are
-    not shadowed, and none if either side names what can reach a name at run
-    time (PY_DYNAMIC, or a dunder) or imports a module named as the file is,
-    which may be the file itself.
-    """
-    # Each side as written and as NFKC, which ast reads names as: [old, old NFKC, new, new NFKC].
-    words = [collections.Counter(re.findall(r"\w+", t)) for text in texts
-             for t in (text, unicodedata.normalize("NFKC", text))]
-    bound, imported, names = set(), set(), []
-    for tree in trees:
-        bound |= _py_binds(tree)
-        names.append(collections.Counter(n.id for n in ast.walk(tree) if isinstance(n, ast.Name)))
-        for n in ast.walk(tree):
-            if isinstance(n, (ast.Import, ast.ImportFrom)):
-                imported.update(".".join([getattr(n, "module", None) or ""] + [a.name for a in n.names]).split("."))
-    every = set(dir(builtins))
-    shadowed = every if "*" in bound else {b for b in every if b in bound or words[1][b] != names[0][b]
-                                           or words[3][b] != names[1][b]}
-    found = set().union(*words)
-    if (found & PY_DYNAMIC or posixpath.basename(path)[:-len(".py")] in imported
-            or any(w[:2] == w[-2:] == "__" and len(w) > 4 and w not in PY_TEXT_DUNDERS for w in found)):
-        return frozenset(), frozenset(shadowed)
-    return PY_BUILTINS - shadowed, frozenset(shadowed)
-
-
-def _python_test_change(old, new, real, shadowed):
-    """Why changing the test old to new is more than an edit of assertions and plain statements, or None.
-
-    real holds the harmless builtins that are the builtins in the file, shadowed the builtins' names the file
-    may make another object (_py_builtins). Neither a shadowed name nor a builtin outside the harmless ones,
-    such as exec, is exempt where old used it, unless new binds it.
-    """
-    unsure = (set(dir(builtins)) - PY_BUILTINS) | shadowed
-    # A name old binds anywhere, even in a nested def or a comprehension, is not one it used from outside.
-    known, own = _py_reads(old, frozenset(_py_binds(old))), _py_locals(new)
-    flow = (ast.Yield, ast.YieldFrom) + (() if isinstance(new, ast.AsyncFunctionDef) else (ast.Await,))
-
-    def plain(statement):
-        return isinstance(statement, PY_PLAIN) and not any(isinstance(n, flow) for n in ast.walk(statement))
-
-    def uses(statement):
-        # On any value: a comprehension's or a lambda's name, or an item of a list.
-        reflect = next((n.attr for n in ast.walk(statement)
-                        if isinstance(n, ast.Attribute) and PY_REFLECT.match(n.attr)), None)
-        if reflect:
-            return f"it adds a use of .{reflect}, which reaches a module's globals or a frame"
-        for chain in sorted(_py_reads(statement)):
-            parts = chain.split(".")
-            if PY_REFLECT.match(parts[0]) or not (parts[0] in own or chain in real
-                                                  or (chain in known and parts[0] not in unsure)):
-                return f"it adds a use of {chain}, which {new.name} did not have"
-        return None
-
-    # A for or a comprehension that assigns to an attribute or an item binds no name there and may
-    # change what any statement reads, so the guard does not follow a test that holds one.
-    if ast.dump(old) != ast.dump(new) and any(
-            isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension))
-            and any(isinstance(t, (ast.Attribute, ast.Subscript)) for t in ast.walk(n.target)) for n in ast.walk(new)):
-        return (f"it changes {new.name}, which assigns to an attribute or an item in a for or a comprehension's "
-                "for; the guard does not follow that")
-    why = _py_unplain(old.body, new.body, plain, uses)
-    if why == "flow":
-        return (f"it changes a statement in {new.name} that is not an assertion or plain statement: an if, for, "
-                "while, with, try, match, return, raise, yield, await, global or definition")
-    if why == "nested":
-        return (f"it changes the body of a function or class defined inside {new.name}, whose names may not be "
-                f"{new.name}'s; the guard does not follow a nested scope")
-    return why
-
-
-def _py_scopes(node):
-    """The defs, classes, lambdas and comprehensions inside node, each before those inside it, in source order."""
-    found = []
-    for child in ast.iter_child_nodes(node):
-        if isinstance(child, PY_DEFS + (ast.ClassDef,) + PY_SCOPES):
-            found.append((type(child).__name__, getattr(child, "name", None)))
-        found += _py_scopes(child)
-    return found
-
-
-def _py_table(module, tree, test):
-    """The symbol table of test, a test of tree, in module, tree's table, or None when no one table is test's.
-
-    A table is matched by its type, name and line, which symtable takes from
-    the same parse as the ast, so Python 3.7's decorator line matches too.
-    """
-    path = next([n] if n is test else [n, test] for n in tree.body
-                if n is test or (isinstance(n, ast.ClassDef) and test in n.body))
-    table = module
-    for node in path:
-        kind = "class" if isinstance(node, ast.ClassDef) else "function"
-        found = [t for t in table.get_children()
-                 if t.get_type() == kind and t.get_name() == node.name and t.get_lineno() == node.lineno]
-        if len(found) != 1:
-            return None
-        table = found[0]
-    return table
-
-
-def _py_symbol(symbols, name):
-    """(what symtable says of name in symbols, a scope's symbols by name, in words; its flags and scope).
-
-    The flags and scope are private to symtable, so a Python without them
-    gives None for both, which the caller treats as unknown.
-    """
-    if name not in symbols:
-        return "not a name there", -1, -1
-    symbol = symbols[name]
-    flags, scope = (getattr(symbol, "_Symbol__" + f, None) for f in ("flags", "scope"))
-    if None in (flags, scope):
-        return "unknown", None, None
-    words =[w for w in PY_SYMBOL if getattr(symbol, "is_" + w, lambda: False)()]
-    return " ".join(words + ["cell"] * (scope == symtable.CELL)) or "unused", flags, scope
-
-
-def _py_resolve(old, new, where, own):
-    """Why the symbol table new resolves a name otherwise than old, in its scope where or one inside it, or None.
-
-    own says the tables are a test's own. There only names on both sides are
-    compared: a name the change adds or removes there is one the changed
-    statements alone use, which the other rules judge. Inside, every name is.
-    """
-    sides = [{s.get_name(): s for s in t.get_symbols()} for t in (old, new)]
-    names = sides[0].keys() & sides[1].keys() if own else sides[0].keys() | sides[1].keys()
-    for name in sorted(names):
-        (before, *a), (after, *b) = (_py_symbol(side, name) for side in sides)
-        if None in a + b:
-            return f"symtable on this Python does not give the flags of {name} in {where}"
-        if a != b:
-            return (f"it changes how the name {name} resolves in {where} ({before} before, {after} after), so "
-                    "code the change leaves alone may read another object")
-    children = [t.get_children() for t in (old, new)]
-    kinds = [[(str(t.get_type()), t.get_name()) for t in side] for side in children]
-    if kinds[0] != kinds[1]:
-        return f"it adds, removes, renames or reorders a scope inside {where}"
-    return next(filter(None, (_py_resolve(a, b, f"{where}.{a.get_name()}", False) for a, b in zip(*children))),
-                None)
-
-
-class _PyScope:
-    """A scope of a module as the guard reads it from the ast: its label, the scope around it, the names that
-    occur in it, and the roles it gives each name it binds or declares."""
-
-    def __init__(self, label, parent, kind):
-        self.label, self.parent, self.kind = label, parent, kind
-        self.names, self.roles = set(), collections.defaultdict(set)
-
-    def add(self, name, role=None):
-        self.names.add(name)
-        if role:
-            self.roles[name].add(role)
-
-
-def _py_new_scope(scopes, parent, name, kind):
-    """A new scope of kind (function, class or comprehension) named name inside parent, added to scopes,
-    with a label no other scope has. A lambda's or a comprehension's name, such as <ListComp>, is numbered."""
-    prefix, taken = "" if parent.parent is None else parent.label + ".", {s.label for s in scopes}
-    numbered = (f"{prefix}{name[:-1]} {i}>" if name.startswith("<") else f"{prefix}{name} {i}"
-                for i in range(1, len(scopes) + 2))
-    label = next(l for l in ([] if name.startswith("<") else [prefix + name]) + list(numbered) if l not in taken)
-    scopes.append(_PyScope(label, parent, kind))
-    return scopes[-1]
-
-
-def _py_import(node, alias):
-    """(the name an alias of the import node binds, its role: the module and the name it imports)."""
-    if isinstance(node, ast.Import):
-        return alias.asname or alias.name.split(".")[0], f"import {alias.name}"
-    return alias.asname or alias.name, f"from {'.' * (node.level or 0)}{node.module or ''} import {alias.name}"
-
-
-def _py_walrus(node, scope, scopes):
-    """Record a :=, whose target the nearest scope that is not a comprehension binds; each comprehension
-    on the way reads it from there."""
-    _py_visit(node.value, scope, scopes)
-    name, target = node.target.id, scope
-    while target.kind == "comprehension":
-        target.add(name, "assigned by := here, bound outside")
-        target = target.parent
-    target.add(name, f"assigned by := in {scope.label}")
-
-
-def _py_visit_scope(node, scope, scopes):
-    """Record a def, class, lambda or comprehension: what scope evaluates and binds of it (decorators,
-    defaults, annotations, bases, a comprehension's first iterable), then what its own scope binds and reads."""
-    kind = type(node).__name__
-    if isinstance(node, PY_COMPS):
-        inner = _py_new_scope(scopes, scope, f"<{kind}>", "comprehension")
-        for i, g in enumerate(node.generators):
-            _py_visit(g.iter, inner if i else scope, scopes)
-            for part in [g.target] + g.ifs:
-                _py_visit(part, inner, scopes)
-        parts = [getattr(node, f) for f in ("elt", "key", "value") if hasattr(node, f)]
-    else:
-        outer = list(node.decorator_list) if hasattr(node, "decorator_list") else []
-        if isinstance(node, ast.ClassDef):
-            outer += node.bases + [k.value for k in node.keywords]
-        else:
-            args = node.args
-            params = getattr(args, "posonlyargs", []) + args.args + args.kwonlyargs + [args.vararg, args.kwarg]
-            outer += args.defaults + [d for d in args.kw_defaults if d]
-            outer += [p.annotation for p in params if p and p.annotation] + [getattr(node, "returns", None)]
-        for part in filter(None, outer):
-            _py_visit(part, scope, scopes)
-        if hasattr(node, "name"):
-            scope.add(node.name, "def" if isinstance(node, PY_DEFS) else "class")
-        inner = _py_new_scope(scopes, scope, getattr(node, "name", "<lambda>"),
-                              "class" if isinstance(node, ast.ClassDef) else "function")
-        for name in set() if isinstance(node, ast.ClassDef) else _py_params(node.args):
-            inner.add(name, "parameter")
-        parts = node.body if isinstance(node.body, list) else [node.body]
-    for part in parts:
-        _py_visit(part, inner, scopes)
-
-
-def _py_visit(node, scope, scopes):
-    """Record in scope, and in a new scope for each def, class, lambda and comprehension inside node, the
-    names node binds, declares and reads."""
-    if isinstance(node, PY_DEFS + (ast.ClassDef, ast.Lambda) + PY_COMPS):
-        return _py_visit_scope(node, scope, scopes)
-    if isinstance(node, PY_WALRUS):
-        return _py_walrus(node, scope, scopes)
-    if isinstance(node, (ast.Import, ast.ImportFrom)):
-        for alias in node.names:
-            scope.add(*_py_import(node, alias))
-        return None
-    if isinstance(node, ast.Name):
-        scope.add(node.id, {ast.Load: None, ast.Del: "deleted"}.get(type(node.ctx), "assigned"))
-    elif isinstance(node, (ast.Global, ast.Nonlocal)):
-        for name in node.names:
-            scope.add(name, f"declared {type(node).__name__.lower()}")
-    else:  # an except ... as, and a match's capture
-        for field in ("name", "rest"):
-            if isinstance(getattr(node, field, None), str):
-                scope.add(getattr(node, field), f"bound by {type(node).__name__}")
-    for child in ast.iter_child_nodes(node):
-        _py_visit(child, scope, scopes)
-    return None
-
-
-def _py_nonlocal(scope, name):
-    """The function scope around scope whose name a nonlocal name in scope is, or None."""
-    target = scope.parent
-    while target is not None and target.kind != "module":
-        roles = target.roles.get(name, ())
-        if target.kind == "function" and roles and "declared nonlocal" not in roles:
-            return target
-        target = target.parent
-    return None
-
-
-def _py_declared(scopes):
-    """Give the scope whose name a global or nonlocal declares the roles the declaring scope gives it, so
-    a scope that reads the name there sees each place that binds it."""
-    for scope in scopes[1:]:
-        for name, roles in list(scope.roles.items()):
-            target = scopes[0] if "declared global" in roles else None
-            target = _py_nonlocal(scope, name) if "declared nonlocal" in roles else target
-            if target is not None:
-                target.roles[name].add(f"bound in {scope.label} as {', '.join(sorted(roles))}")
-
-
-def _py_model(tree):
-    """Every scope of the module tree, the module's first and each before those inside it, as _PyScope."""
-    scopes = [_PyScope("the module", None, "module")]
-    for statement in tree.body:
-        _py_visit(statement, scopes[0], scopes)
-    _py_declared(scopes)
-    return scopes
-
-
-def _py_lookup(scope, name):
-    """[(label, roles)] of each scope from scope out to the module: the roles each gives name."""
-    chain = []
-    while scope:
-        chain.append((scope.label, frozenset(scope.roles.get(name, ()))))
-        scope = scope.parent
-    return chain
-
-
-def _python_resolution_change(trees):
-    """Why a name that occurs in the same scope of both trees is bound otherwise there or around it, or None.
-
-    Round b6 of PR #41, the owner's last structural round: the ast, not
-    symtable, gives each comprehension its own scope on every Python. For
-    each name in each scope of the file, a test's or any inside or around
-    it, the roles that scope and every scope around it, out to the module,
-    give the name must stay the same: parameter, assigned, deleted, def,
-    class, import of a module or of a name from one, := (and in which
-    comprehension), global or nonlocal (and where). A name in only one side
-    of a scope is one the changed statements alone use or bind, which the
-    new-use rule judges. A type parameter or a type alias fails closed.
-    """
-    if any(getattr(n, "type_params", None) or isinstance(n, PY_ALIAS) for tree in trees for n in ast.walk(tree)):
-        return "it holds a type parameter or a type alias, whose scopes the guard does not follow"
-    models = [_py_model(tree) for tree in trees]
-    shapes = [[(s.label, s.parent and s.parent.label) for s in model] for model in models]
-    if shapes[0] != shapes[1]:
-        return "it adds, removes, renames or reorders a def, class, lambda or comprehension in the file"
-    for old, new in zip(*models):
-        for name in sorted(old.names & new.names):
-            for (where, before), (_, after) in zip(_py_lookup(old, name), _py_lookup(new, name)):
-                if before != after:
-                    return (f"it changes how the name {name} resolves in {old.label} ({where}: "
-                            f"{', '.join(sorted(before)) or 'not bound'} before, "
-                            f"{', '.join(sorted(after)) or 'not bound'} after), so code the change leaves alone "
-                            "may read another object")
-    return None
-
-
-def _py_bindings(node):
-    """What each comprehension and lambda inside node binds, in source order, each before those inside it: a
-    comprehension's targets' names, generator by generator, or a lambda's parameters, and the targets of each
-    := inside it."""
-    found = []
-    for n in ast.iter_child_nodes(node):
-        if isinstance(n, PY_COMPS + (ast.Lambda,)):
-            found.append((type(n).__name__, [sorted(_py_bound(g.target)) for g in n.generators]
-                          if isinstance(n, PY_COMPS) else sorted(_py_params(n.args)),
-                          sorted(w.target.id for w in ast.walk(n) if isinstance(w, PY_WALRUS))))
-        found += _py_bindings(n)
-    return found
-
-
-def _python_scope_change(texts, trees, tests):
-    """Why a change to tests, the tests of trees parsed from texts, makes a name resolve otherwise, or None.
-
-    Round b5 of PR #41, the owner's structural rule: in each changed test, a
-    def, class, lambda or comprehension added, removed, renamed or reordered,
-    or a name whose symtable classification changes in the test or in any
-    scope inside it, is a hit, even with the changed lines outside that
-    scope. So is a module symtable cannot build. The nested scopes are
-    compared as the ast has them too, since from Python 3.12 symtable puts a
-    list, set or dict comprehension's names in its enclosing scope.
-
-    Round b6 adds, after those: every scope of the file read from the ast
-    (_python_resolution_change), and what each comprehension and lambda in a
-    changed test binds, so a renamed target is a hit on every Python.
-    """
-    pairs = [(old, new) for old, new in zip(*tests) if ast.dump(old) != ast.dump(new)]
-    if not pairs:
-        return None
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            modules = [symtable.symtable(text, "test.py", "exec") for text in texts]
-    except Exception:  # anything symtable raises, even on code ast.parse accepts, fails closed
-        return "the guard cannot build its symbol table"
-    for old, new in pairs:
-        if _py_scopes(old) != _py_scopes(new):
-            return f"it adds, removes, renames or reorders a def, class, lambda or comprehension inside {new.name}"
-        tables = [_py_table(module, tree, test) for module, tree, test in zip(modules, trees, (old, new))]
-        if None in tables:
-            return f"the guard cannot tell which symbol table is {new.name}'s"
-        why = _py_resolve(*tables, new.name, True)
-        if why:
-            return why
-    why = _python_resolution_change(trees)
-    if why:
-        return why
-    return next((f"it changes the names a comprehension or lambda binds inside {new.name}: a target, a parameter "
-                 "or a := target" for old, new in pairs if _py_bindings(old) != _py_bindings(new)), None)
+    approx = all(_py_pytest(tree) for tree in trees)
+    why = next(filter(None, (_python_test_change(old, new, approx) for old, new in zip(*tests))), None)
+    changed = [{l.old for l in fd.lines if l.kind == "-"}, {l.new for l in fd.lines if l.kind == "+"}]
+    return why or next(filter(None, map(_py_line_change, trees, tests, texts, changed)), None)
 
 
 def c_cpp_hits(files, facts, flagged):
@@ -1295,8 +943,8 @@ def c_cpp_hits(files, facts, flagged):
                 why = _python_unexempt(fd)
                 if why:
                     hits.append(Hit("removed-tests", fd.path, None, f"{fd.status} a Python test file of a C/C++ "
-                                    f"repository: {why}; only an edit of assertions and plain statements inside "
-                                    "existing tests is exempt, so this needs approval"))
+                                    f"repository: {why}; only replacing compared literals or comparison operators in "
+                                    "assert statements of existing tests is exempt, so this needs approval"))
                 continue
         elif fd.modes & {"160000"}:
             detail = f"{fd.status} a submodule of a C/C++ repository, which may hold sources or headers"
