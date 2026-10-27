@@ -52,64 +52,31 @@ whatever the change:
   extension counts, except `.gitignore`, `.gitattributes`, `.gitkeep` and
   `.keep`), as in a Python backend's `backend/tests`. Such a file is exempt
   only when its change edits a `test_*.py` or `*_test.py` module in place and
-  changes nothing but assertions and plain statements (an assignment, an
-  expression, `pass`, `del`) inside its existing tests: top-level `test_`
-  functions, and `test_` methods of top-level `Test` classes with no
-  constructor, with no decorator but pytest marks. Everything else in it stays
-  the same statement for statement, a block whose header stays (a `with` or an
-  `if`) is compared inside, and a changed statement may use only names and
-  dotted names its test already used, its test's own names and harmless
-  builtins (a name the test binds anywhere, even in a nested `def` or `class`,
-  a lambda, a comprehension or a `:=`, is not one it used; a lambda binds only
-  its parameters, a comprehension only plain names, and any change to a test
-  whose `for` or comprehension assigns to an attribute or an item is a hit).
-  In each changed test, the guard also compares Python's own symbol tables
-  (`symtable`) of both sides. A nested `def`, `class`, lambda, comprehension or
-  generator expression added, removed, renamed or reordered is a hit. So is a
-  name whose classification changes (local, global, free, cell, nonlocal,
-  parameter, imported, assigned, referenced) in any scope inside the test, or
-  in the test itself for a name both sides have. This holds even when the
-  changed lines are outside that scope, as when deleting the test's
-  `os = Mock()` makes an unchanged nested helper's `os` the module's. A file
-  `symtable` cannot read is a hit too.
-  From Python 3.12, `symtable` puts a list, set or dict comprehension's names in
-  its enclosing table, so the guard also reads every scope of the file from the
-  ast, with each comprehension its own scope, on every Python. For each name in
-  each scope that both sides have, the way that scope and every scope around it,
-  out to the module, bind or declare the name must stay the same: a parameter,
-  an assignment, a `del`, a `def` or `class`, an import (of which module, and
-  which name from it), a `:=` (and in which comprehension), a `global` or a
-  `nonlocal` (and where). Comprehensions that swap their targets, so that an
-  unchanged `probe.getcwd()` reads the test's `probe` instead of a `Mock`, are a
-  hit. So is a renamed target, a lambda parameter or a `:=` target moved between
-  comprehensions, and a type parameter or type alias anywhere in the file.
-  A builtin the test did not use (`len`, `print` and the other harmless ones)
-  is exempt only when it is the builtin. No scope of either side may bind the
-  name, even another test's, and each side may hold the name only as a plain
-  name: not in a string, a keyword, an attribute or a comment. The file may
-  have no wildcard import and no import of a module named as the file is. It
-  may also name nothing that can reach a module's or the builtins' names at
-  run time: `builtins`, `globals`, `locals`, `vars`, `exec`, `eval`, `compile`,
-  `importlib`, `modules`, `setattr`, `delattr`, `getattr`, `patch`, a frame's
-  `f_globals`, `_getframe`, `getmodule`, `gc`, `ctypes`, or any dunder but
-  `__name__`, `__main__`, `__init__`, `__file__` and `__doc__`. So an unchanged
-  `from os import getcwd as len` makes a new `len()` a hit. Where the test
-  already used a builtin's name, that use counts only if no scope binds the
-  name, the file holds it only as a plain name and has no wildcard import, and
-  the builtin is one of the harmless ones (so not `exec`, `getattr` or `open`).
-  Every changed line, even a comment or a blank line, must be
-  inside a test body (indented deeper than its `def`) and hold only printable
-  ASCII, so Python reads it as the guard does. Any other change is a hit: a
-  `conftest.py` or helper, a rename, addition or deletion, an import, a
-  decorator, a `def` or `class` line, module- or class-level code or comments,
-  control flow (`if`, `for`, `while`, `with`, `try`, `match`, `return`,
-  `raise`, `yield`), a tab, a form feed or a non-ASCII character in a changed
-  line, and any change to a file that declares a source encoding other than
-  UTF-8, holds a carriage return inside a line, or names a skip, `xfail`, an
-  exit, `__test__` or `getfixturevalue` anywhere, even in a comment or a
-  string, as written or as Python reads names (NFKC, so fullwidth letters
-  count). Removed tests and new skips are hits as in
-  any repository;
+  does nothing but replace `assert` statements of its existing tests' own
+  bodies (top-level `test_` functions, and `test_` methods of top-level `Test`
+  classes with no constructor, with no decorator but pytest marks), each new
+  `assert` the one it replaces with only these changed: a comparison's literal
+  operands (a constant, a signed number, or a list, tuple, set or dict of
+  literals of the same shape), its operators (`==`, `!=`, `<`, `<=`, `>`,
+  `>=`, `is`, `is not`, `in`, `not in`), a plain-string message, and a
+  `pytest.approx` operand's expected value, `rel` and `abs`, where one
+  top-level `import pytest` is all that binds `pytest`. So that a change can
+  alter only what is compared, never what runs, a changed `assert` may hold no
+  `and`, `or`, conditional expression, comprehension, lambda, `:=`, `await`,
+  `yield` or starred item, no message but a plain string, and no chained
+  comparison with an operand other than a name or a literal. Any other change
+  is a hit: an `assert` added, removed or moved, a name, attribute, call or
+  argument changed, any statement that is not an `assert` of the test's own
+  body (a plain statement, a docstring, or an `if`, `for`, `while`, `with` or
+  `try`, even around an `assert`), an `assert` that shares its line with other
+  code, code outside a test body, a comment or blank line outside a test body,
+  a `conftest.py` or helper, a rename, addition or deletion, a tab, a form feed
+  or a non-ASCII character in a changed line, and any change to a file that
+  declares a source encoding other than UTF-8 or holds a carriage return inside
+  a line. The guard does not follow the code a comparison reaches (an
+  object's `__eq__`, a `conftest.py` hook), so an exempt change can still give
+  code already in the file or its imports other values to compare. Removed
+  tests and new skips are hits as in any repository;
 - an added, deleted or renamed C/C++ source or header anywhere, including
   `.c++`, `.cp`, `.h++`, `.tpp`, `.tcc`, `.inl`, `.ino`, `.pde`, `.s` and files
   with no extension, which can shadow or drop an include; and any changed

@@ -553,9 +553,10 @@ def removed_test_hits(files):
 #   - a change to any file in or under a test directory, in either tree,
 #     except a Python file in a test directory that holds no C/C++ source or
 #     header in either tree (a Python backend's tests/), when its change only
-#     edits assertions and plain statements inside its existing tests (issue
-#     #40, see _python_unexempt). The guard does not model what pytest
-#     collects or skips, so any other change to such a file is a hit;
+#     replaces compared literals and comparison operators in assert statements
+#     of its existing tests (issue #40, see _python_unexempt). The guard does
+#     not model what pytest collects or skips, so any other change to such a
+#     file is a hit;
 #   - an added, deleted or renamed C/C++ source or header anywhere, or a
 #     changed submodule;
 #   - every pull request, when a platformio.ini names extra_configs or test_dir
@@ -666,41 +667,6 @@ def _py_body_lines(tree, tests, lines):
             inside.update(i for i in range(deeper[0], deeper[-1] + 1)
                           if i in deeper or not lines[i - 1].strip(" \t\f"))
     return inside
-
-
-def _py_unplain(old, new, plain, uses):
-    """Why changing the statements old to new is more than an edit of assertions and plain statements, or None.
-
-    plain(statement) says whether a statement is one, uses(statement) why a new
-    one uses what it may not. A statement whose header stays, such as a with
-    or an if, is compared block by block, but for a def or a class: its names
-    are its own, and a global there makes one the test binds the module's, so
-    any change inside it is "nested".
-    """
-    dumps = [[ast.dump(s) for s in side] for side in (old, new)]
-    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, *dumps, autojunk=False).get_opcodes():
-        removed, added = old[i1:i2], new[j1:j2]
-        if op == "equal":
-            continue
-        if len(removed) == len(added):
-            pairs = [(a, b) for a, b in zip(removed, added) if not (plain(a) and plain(b))]
-            for a, b in pairs:
-                (header_a, blocks_a), (header_b, blocks_b) = _py_split(a), _py_split(b)
-                if header_a != header_b or plain(a) or plain(b):
-                    return "flow"
-                if isinstance(a, PY_DEFS + (ast.ClassDef,)):
-                    return "nested"
-                why = next(filter(None, (_py_unplain(x, y, plain, uses) for x, y in zip(blocks_a, blocks_b))), None)
-                if why:
-                    return why
-            added = [b for a, b in zip(removed, added) if (a, b) not in pairs]
-            removed = []
-        if not all(plain(s) for s in removed + added):
-            return "flow"
-        why = next(filter(None, map(uses, added)), None)
-        if why:
-            return why
-    return None
 
 
 def _py_binds_here(node):

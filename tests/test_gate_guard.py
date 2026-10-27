@@ -1700,7 +1700,9 @@ class GitEndToEnd(unittest.TestCase):
                      "flag-skip-platformio-test-dir-link-comment", "flag-skip-platformio-extra-config-negated-bracket",
                      "flag-fewer-tests-cpp-shadow-header", "pass-python-test-edit-cpp-repo",
                      "flag-python-cpp-test-under-if-false", "flag-python-cpp-rename-disabled-dir",
-                     "flag-python-cpp-collect-ignore-multiline"]:
+                     "flag-python-cpp-collect-ignore-multiline", "pass-python-cpp-assert-approx-tolerance",
+                     "pass-python-cpp-assert-beside-skipif", "flag-python-cpp-computed-globals-key",
+                     "flag-python-cpp-assert-in-with"]:
             with self.subTest(fixture=name), tempfile.TemporaryDirectory() as tmp:
                 subprocess.run(["git", "init", "-q", tmp], check=True, capture_output=True)
                 text = (FIXTURES / f"{name}.diff").read_text(encoding="utf-8")
