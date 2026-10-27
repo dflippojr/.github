@@ -793,10 +793,14 @@ def _python_unexempt(fd):
             return isinstance(statement, PY_PLAIN) and not any(isinstance(n, flow) for n in ast.walk(statement))
 
         def uses(statement, name=new.name):
+            # On any value: a comprehension's or a lambda's name, or an item of a list.
+            reflect = next((n.attr for n in ast.walk(statement)
+                            if isinstance(n, ast.Attribute) and PY_REFLECT.match(n.attr)), None)
+            if reflect:
+                return f"it adds a use of .{reflect}, which reaches a module's globals or a frame"
             for chain in sorted(_py_reads(statement)):
                 parts = chain.split(".")
-                if any(map(PY_REFLECT.match, parts)) or not (parts[0] in own or chain in known
-                                                             or chain in PY_BUILTINS):
+                if PY_REFLECT.match(parts[0]) or not (parts[0] in own or chain in known or chain in PY_BUILTINS):
                     return f"it adds a use of {chain}, which {name} did not have"
             return None
 
