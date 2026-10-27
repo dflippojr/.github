@@ -601,7 +601,8 @@ PY_PLAIN = (ast.Assert, ast.Expr, ast.Assign, ast.AugAssign, ast.AnnAssign, ast.
 # Clauses that hold statements of their own: except handlers and, from Python
 # 3.10, match cases (the guard runs on 3.7, which has none).
 PY_CLAUSES = tuple(c for c in (ast.excepthandler, getattr(ast, "match_case", None)) if c)
-# Expressions with names of their own: comprehensions and lambdas.
+# Expressions with names of their own: comprehensions and lambdas. They hold no
+# global or nonlocal, so any other name in them is their test's.
 PY_SCOPES = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp, ast.Lambda)
 # Builtins a changed statement may use though its test did not: none reaches a
 # module, a frame or an attribute by name, or runs code from a string.
@@ -794,7 +795,9 @@ def _py_unplain(old, new, plain, uses):
 
     plain(statement) says whether a statement is one, uses(statement) why a new
     one uses what it may not. A statement whose header stays, such as a with
-    or an if, is compared block by block.
+    or an if, is compared block by block, but for a def or a class: its names
+    are its own, and a global there makes one the test binds the module's, so
+    any change inside it is "nested".
     """
     dumps = [[ast.dump(s) for s in side] for side in (old, new)]
     for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, *dumps, autojunk=False).get_opcodes():
@@ -807,6 +810,8 @@ def _py_unplain(old, new, plain, uses):
                 (header_a, blocks_a), (header_b, blocks_b) = _py_split(a), _py_split(b)
                 if header_a != header_b or plain(a) or plain(b):
                     return "flow"
+                if isinstance(a, PY_DEFS + (ast.ClassDef,)):
+                    return "nested"
                 why = next(filter(None, (_py_unplain(x, y, plain, uses) for x, y in zip(blocks_a, blocks_b))), None)
                 if why:
                     return why
@@ -830,7 +835,9 @@ def _python_unexempt(fd):
     Python reads it, so the text the guard compares is the code Python runs.
     The code outside those bodies must stay the same statement for statement,
     and a changed statement may use only the names and dotted names its test
-    already used, its test's own names and harmless builtins.
+    already used, its test's own names and harmless builtins. A change inside
+    a def or a class nested in a test is not exempt: a global there can make a
+    name the test binds the module's.
     """
     if not is_test_module(fd.path):
         return "it is not a test_*.py or *_test.py module (a conftest.py or a helper can change any test)"
@@ -910,6 +917,9 @@ def _python_test_change(old, new):
     if why == "flow":
         return (f"it changes a statement in {new.name} that is not an assertion or plain statement: an if, for, "
                 "while, with, try, match, return, raise, yield, await, global or definition")
+    if why == "nested":
+        return (f"it changes the body of a function or class defined inside {new.name}, whose names may not be "
+                f"{new.name}'s; the guard does not follow a nested scope")
     return why
 
 
