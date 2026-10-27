@@ -1,0 +1,22 @@
+# gate-guard fixture: in a C/C++ repository, PR #41 review 3: the same-file list a conftest.py collect_ignore_glob reads gains an entry
+# expect: removed-tests
+# hits: 1
+# detail: conftest.py
+
+diff --git a/backend/tests/conftest.py b/backend/tests/conftest.py
+index c8d2acf..285ad48 100644
+--- a/backend/tests/conftest.py
++++ b/backend/tests/conftest.py
+@@ -1,2 +1,2 @@
+-IGNORED = []
++IGNORED = ["test_*.py"]
+ collect_ignore_glob = IGNORED
+diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
+index b384dce..3925a03 100644
+--- a/firmware/src/logic.cpp
++++ b/firmware/src/logic.cpp
+@@ -1,3 +1,3 @@
+ int clamp(int v, int lo, int hi) {
+-  return v < lo ? lo : v;
++  return v < lo ? lo : (v > hi ? hi : v);
+ }

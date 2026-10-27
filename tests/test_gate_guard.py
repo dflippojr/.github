@@ -1,3 +1,4 @@
+import ast
 import io
 import json
 import os
@@ -40,6 +41,11 @@ def fixture_expectations(path):
     rules = re.search(r"^# expect:(.*)$", text, re.M).group(1).split()
     hits = int(re.search(r"^# hits: (\d+)$", text, re.M).group(1))
     return set(rules), hits
+
+
+def fixture_details(path):
+    """The '# detail:' header lines of a fixture: text some hit's detail must contain."""
+    return re.findall(r"^# detail: (.*)$", path.read_text(encoding="utf-8"), re.M)
 
 
 def analyze_text(text):
@@ -115,6 +121,8 @@ class Fixtures(unittest.TestCase):
                 hits = analyze_text(path.read_text(encoding="utf-8"))
                 self.assertEqual({h.rule for h in hits}, rules, hits)
                 self.assertEqual(len(hits), count, hits)
+                for detail in fixture_details(path):
+                    self.assertTrue(any(detail in h.detail for h in hits), (detail, hits))
                 # The file name says which way the fixture should go.
                 self.assertEqual(bool(hits), path.name.startswith("flag-"))
 
@@ -123,6 +131,24 @@ class Fixtures(unittest.TestCase):
             with self.subTest(fixture=path.name):
                 code, _ = run_main(["--diff-file", str(path)])
                 self.assertEqual(code, 1 if path.name.startswith("flag-") else 0)
+
+
+class PythonSupport(unittest.TestCase):
+    """The README promises Python 3.7 or later, and the workflows run the runner's own python3; CI runs 3.12."""
+    SOURCE = pathlib.Path(gate_guard.__file__).read_text(encoding="utf-8")
+
+    def test_parses_as_python_3_7(self):
+        # feature_version needs 3.8; on 3.7 itself, importing gate_guard is the check.
+        ast.parse(self.SOURCE, **({"feature_version": (3, 7)} if sys.version_info >= (3, 8) else {}))
+
+    def test_uses_no_ast_names_newer_than_python_3_7(self):
+        # ast.Constant exists on 3.7, but ast.parse makes Num, Str and NameConstant there instead.
+        newer = {"Constant", "NamedExpr", "unparse", "get_source_segment", "Match", "match_case", "MatchValue",
+                 "MatchSingleton", "MatchSequence", "MatchMapping", "MatchClass", "MatchStar", "MatchAs", "MatchOr",
+                 "TryStar", "TypeAlias", "TypeVar", "ParamSpec", "TypeVarTuple"}
+        used = set(re.findall(r"\bast\.(\w+)", self.SOURCE))
+        self.assertEqual(used & newer, set())
+        self.assertNotRegex(self.SOURCE, r"\.end_(?:lineno|col_offset)\b")
 
 
 class RuleDetails(unittest.TestCase):
@@ -965,13 +991,19 @@ class RuleDetails(unittest.TestCase):
         """Issue #40: desk-controller's backend/tests are Python, beside firmware Unity tests."""
         unity, api, base = DESK_UNITY, DESK_API, DESK_TREE
         edited = api.replace("120", "125")
-        # (a) An assertion fixed, a conftest edited or a test added: no hit.
+        # (a) An assertion fixed: no hit. A conftest edited or a test added is a hit (issue #40, narrowed).
         for change in ({"backend/tests/test_api.py": edited},
-                       {"backend/tests/conftest.py": "import pytest\n\n\n@pytest.fixture\ndef app():\n    pass\n"},
-                       {"backend/tests/test_api.py": api + "\n\ndef test_reset():\n    assert create_app()\n"},
                        {"backend/tests/test_api.py": edited, "firmware/src/logic.cpp": "int clamp(int v) { return v; }\n"}):
             with self.subTest(change=sorted(change)):
                 self.assertEqual(judge_commits(base, dict(base, **change)), [])
+        for change, why in (({"backend/tests/conftest.py": "import pytest\n\n\n@pytest.fixture\ndef app():\n    pass\n"},
+                             "conftest.py"),
+                            ({"backend/tests/test_api.py": api + "\n\ndef test_reset():\n    assert create_app()\n"},
+                             "outside a test body")):
+            with self.subTest(change=sorted(change)):
+                [hit] = judge_commits(base, dict(base, **change))
+                self.assertEqual((hit.rule, hit.path), ("removed-tests", sorted(change)[0]))
+                self.assertIn(why, hit.detail)
         # (b) A test removed, or the test file deleted.
         fewer = api.split("\n\n\ndef test_height_limits")[0] + "\n"
         [hit] = judge_commits(base, dict(base, **{"backend/tests/test_api.py": fewer}))
@@ -986,8 +1018,9 @@ class RuleDetails(unittest.TestCase):
         for skipped in (api.replace("def test_height_limits", "@pytest.mark.skip\ndef test_height_limits"),
                         api.replace("    assert create_app().max_height", "    pytest.skip('later')\n    assert create_app().max_height")):
             with self.subTest(skipped=skipped):
-                [hit] = judge_commits(base, dict(base, **{"backend/tests/test_api.py": skipped}))
-                self.assertEqual((hit.rule, hit.path), ("skip-marker", "backend/tests/test_api.py"))
+                hits = judge_commits(base, dict(base, **{"backend/tests/test_api.py": skipped}))
+                self.assertEqual({(h.rule, h.path) for h in hits}, {("skip-marker", "backend/tests/test_api.py"),
+                                                                    ("removed-tests", "backend/tests/test_api.py")})
         # (d) The C/C++ rules stand: a Unity test edit, a Python file in the firmware
         # test directory, and a Python test directory that gains a C/C++ file.
         cases = [({"firmware/test/test_logic/test_main.cpp": unity.replace("0, clamp", "1, clamp")},
@@ -1052,17 +1085,18 @@ class RuleDetails(unittest.TestCase):
         native = dict(base, **{"backend/tests/native": "#include <unity.h>\n", "backend/tests/gen_cases.py": "N = 3\n"})
         with self.subTest(change="backend/tests/gen_cases.py"):
             self.assertEqual(flagged(native, {"backend/tests/gen_cases.py": "N = 2\n"}), {"backend/tests/gen_cases.py"})
-        # Still no hit: a fixture added, a test moved or a module renamed between test modules,
-        # an edit beside git's own dotfiles.
+        # A fixture added, or a test moved or a module renamed between test modules, is a hit
+        # too since issue #40 was narrowed; an edit beside git's own dotfiles is not.
         keep = dict(base, **{"backend/tests/.gitkeep": "", "backend/tests/.gitignore": "*.log\n"})
         fixture = "import pytest\n\n\n@pytest.fixture\ndef app():\n    pass\n"
-        for start, change, drop in ((base, {conftest: fixture}, ()),
-                                    (base, {test_api: fewer, "backend/tests/test_limits.py": helper[
-                                        "backend/tests/helpers.py"]}, ()),
-                                    (base, {"backend/tests/test_api_v2.py": api}, {test_api}),
-                                    (keep, {test_api: api.replace("120", "125")}, ())):
+        limits = {test_api: fewer, "backend/tests/test_limits.py": helper["backend/tests/helpers.py"]}
+        for start, change, drop, expected in ((base, {conftest: fixture}, (), {conftest}),
+                                              (base, limits, (), set(limits)),
+                                              (base, {"backend/tests/test_api_v2.py": api}, {test_api},
+                                               {"backend/tests/test_api_v2.py"}),
+                                              (keep, {test_api: api.replace("120", "125")}, (), set())):
             with self.subTest(change=sorted(change), drop=drop):
-                self.assertEqual(flagged(start, change, drop), set())
+                self.assertEqual(flagged(start, change, drop), expected)
 
     def test_python_tests_in_a_c_cpp_repository_are_judged_by_statement(self):
         """PR #41 review 2: a change inside a multi-line statement, or a move to another directory, stays a hit."""
@@ -1150,22 +1184,107 @@ class RuleDetails(unittest.TestCase):
             with self.subTest(header=header):
                 self.assertTrue(flipped(cls, cls.replace("class TestLimits:", header)), header)
         with self.subTest(change="test method added"):
-            self.assertFalse(flagged(dict(base, **{test_api: cls}),
-                                     {test_api: cls + "\n    def test_width(self):\n        assert True\n"}))
+            self.assertEqual(flagged(dict(base, **{test_api: cls}),
+                                     {test_api: cls + "\n    def test_width(self):\n        assert True\n"}), {test_api})
         # A module renamed to conftest.py, whose ignore list then applies.
         hooks = "collect_ignore = ['test_api.py']\n"
         with self.subTest(change="renamed to conftest.py"):
             self.assertEqual(flagged(dict(base, **{"backend/tests/sub/hooks.py": hooks}),
                                      {"backend/tests/sub/conftest.py": hooks}, drop={"backend/tests/sub/hooks.py"}),
                              {"backend/tests/sub/conftest.py"})
-        # Still no hit: an ignore list reformatted, and an assertion edited under an environment guard.
+        # Since issue #40 was narrowed, a conftest.py change and any change to a file that names
+        # a skip are hits: an ignore list reformatted, an assertion edited under an environment guard.
         empty = dict(base, **{conftest: "import pytest\n\ncollect_ignore = [\n]\n"})
         node = dict(base, **{test_api: api.replace(limits, "    if not shutil.which('node'):\n"
                                                            "        pytest.skip('no node')\n" + limits)})
         for start, change in ((empty, {conftest: "import pytest\n\ncollect_ignore = []\n"}),
                               (node, {test_api: node[test_api].replace("120", "125")})):
             with self.subTest(change=change):
-                self.assertEqual(flagged(start, change), set())
+                self.assertEqual(flagged(start, change), set(change))
+
+    def test_python_tests_in_a_c_cpp_repository_are_exempt_only_for_plain_edits_in_tests(self):
+        """Issue #40, narrowed: only assertions and plain statements inside an existing test are exempt."""
+        test_api = "backend/tests/test_api.py"
+        api = ("import os\n\nimport pytest\n\nfrom backend.app import create_app, reset\n\nLIMIT = 120\n\n\n"
+               "# Height checks.\ndef test_height_limits():\n    \"\"\"The desk stops at its limits.\"\"\"\n"
+               "    app = create_app()\n    assert os.environ\n    with pytest.raises(ValueError):\n"
+               "        app.move(LIMIT + 1)\n    assert app.max_height == LIMIT\n\n\n"
+               "class TestMotor:\n    speed = 3\n\n    def test_speed(self):\n"
+               "        assert create_app().speed == self.speed\n\n\n"
+               "async def test_status():\n    assert await create_app().status()\n")
+
+        def judged(old, new, start_text=api):
+            start = dict(DESK_TREE, **{test_api: start_text})
+            return judge_commits(start, dict(start, **{test_api: start_text.replace(old, new, 1)}))
+
+        # No hit: an assertion or plain statement edited, added or removed in a test, inside a
+        # with block whose header stays, in a test class's method or an async test; a docstring
+        # or a comment.
+        limits = "    assert app.max_height"
+        for old, new in (("== LIMIT\n", "== LIMIT - 1\n"), ("    assert os.environ\n", ""),
+                         (limits, "    height = app.max_height\n    assert height\n" + limits),
+                         ("        app.move(LIMIT + 1)\n", "        app.move(LIMIT + 2)\n        app.move(-1)\n"),
+                         ("== self.speed", "== self.speed * 1"), ("status()", "status(len([1]))"),
+                         ("stops at its limits", "stops at both limits"), ("# Height checks.", "# Limit checks.")):
+            with self.subTest(new=new):
+                self.assertEqual(judged(old, new), [])
+        # A hit, with the reason in its detail: code outside a test body, a statement that is not
+        # an assertion or plain statement, a use the test did not have, a skip or exit anywhere.
+        outside, flow = "outside a test body", "not an assertion or plain statement"
+        tail = "    assert await create_app().status()\n"
+        cases = [("import os\n", "import os\nimport sys\n", outside), ("LIMIT = 120", "LIMIT = 125", outside),
+                 ("def test_height_limits():", "@pytest.mark.slow\ndef test_height_limits():", outside),
+                 ("def test_height_limits():", "def test_height_limits(app=None):", outside),
+                 ("    speed = 3\n", "    speed = 4\n", outside),
+                 (tail, tail + "\n\ndef test_reset():\n    reset()\n", outside),
+                 (limits, "    if app:\n    " + limits, flow), (limits, "    for _ in range(1):\n    " + limits, flow),
+                 (limits, "    while app:\n    " + limits, flow),
+                 (limits, "    try:\n    " + limits + " == LIMIT\n    except AssertionError:\n        pass\n"
+                  "    assert app.max_height", flow),
+                 (limits, "    return\n" + limits, flow), (limits, "    raise ValueError()\n" + limits, flow),
+                 (limits, "    yield app\n" + limits, flow), (limits, "    x = yield\n" + limits, flow),
+                 (limits, "    def later():\n        pass\n" + limits, flow),
+                 ("    app = create_app()\n", "    global LIMIT\n    app = create_app()\n", flow),
+                 ("pytest.raises(ValueError)", "pytest.raises(Exception)", flow),
+                 ("    with pytest.raises(ValueError):\n        app.move(LIMIT + 1)\n", "", flow),
+                 (limits, "    reset()\n" + limits, "adds a use of reset"),
+                 (limits, "    os.execv('/bin/true', ['true'])\n" + limits, "adds a use of os.execv"),
+                 (limits, "    o = os\n" + limits, "adds a use of os,"),
+                 (limits, "    [os.getcwd() for os in [os]]\n" + limits, "adds a use of os,"),
+                 (limits, "    app.__class__\n" + limits, "adds a use of app.__class__"),
+                 (limits, "    g = (x for x in [1])\n    g.gi_frame.f_globals\n" + limits,
+                  "adds a use of g.gi_frame.f_globals"),
+                 (limits, "    getattr(app, 'move')\n" + limits, "adds a use of getattr"),
+                 (limits, "    os._exit(0)\n" + limits, "names _exit"),
+                 (limits, "    pytest.exit('done')\n" + limits, "names exit"),
+                 (limits, "    pytest.skip('later')\n" + limits, "names skip"),
+                 ("== self.speed\n", "== self.speed\n        self.skipTest('later')\n", "names skipTest"),
+                 (tail, tail + "def (\n", "cannot parse")]
+        for old, new, why in cases:
+            with self.subTest(new=new):
+                hits = judged(old, new)
+                self.assertTrue(hits)
+                self.assertEqual({h.path for h in hits}, {test_api})
+                self.assertTrue(any(h.rule == "removed-tests" and why in h.detail for h in hits), hits)
+        # Only a test_ function, or a test_ method of a Test class with no constructor, has a body that
+        # can change; anything else in the file counts as code outside a test body.
+        for start_text in ("def testheight():\n    assert 120\n", "class Motor:\n    def test_speed(self):\n"
+                           "        assert 120\n", "class TestMotor:\n    def __init__(self):\n        pass\n\n"
+                           "    def test_speed(self):\n        assert 120\n",
+                           "import pytest\n\n\n@pytest.fixture\ndef test_app():\n    assert 120\n"):
+            with self.subTest(start=start_text):
+                [hit] = judged("120", "125", start_text)
+                self.assertIn(outside, hit.detail)
+        # Other Python files in the test directory, and a test module renamed, added or deleted.
+        start = dict(DESK_TREE, **{"backend/tests/helpers.py": "LIMIT = 120\n"})
+        for change, drop, why in (({"backend/tests/helpers.py": "LIMIT = 125\n"}, (), "not a test_*.py module"),
+                                  ({"backend/tests/test_api_v2.py": DESK_API}, {test_api}, "only an edit in place"),
+                                  ({"backend/tests/test_new.py": DESK_API}, (), "only an edit in place")):
+            with self.subTest(change=sorted(change)):
+                head = {p: t for p, t in dict(start, **change).items() if p not in drop}
+                [hit] = judge_commits(start, head)
+                self.assertEqual((hit.rule, hit.path), ("removed-tests", sorted(change)[0]))
+                self.assertIn(why, hit.detail)
 
     def test_environment_guard_skip_is_not_a_hit(self):
         details = " ".join(h.detail for h in self.hits("flag-skip-python"))
@@ -1419,7 +1538,9 @@ class GitEndToEnd(unittest.TestCase):
                      "flag-fewer-tests-cpp-root-test-dir", "flag-skip-platformio-test-dir-link",
                      "flag-fewer-tests-cpp-included-markdown", "flag-fewer-tests-cpp-has-include-spliced",
                      "flag-skip-platformio-test-dir-link-comment", "flag-skip-platformio-extra-config-negated-bracket",
-                     "flag-fewer-tests-cpp-shadow-header"]:
+                     "flag-fewer-tests-cpp-shadow-header", "pass-python-test-edit-cpp-repo",
+                     "flag-python-cpp-test-under-if-false", "flag-python-cpp-rename-disabled-dir",
+                     "flag-python-cpp-collect-ignore-multiline"]:
             with self.subTest(fixture=name), tempfile.TemporaryDirectory() as tmp:
                 subprocess.run(["git", "init", "-q", tmp], check=True, capture_output=True)
                 text = (FIXTURES / f"{name}.diff").read_text(encoding="utf-8")

@@ -1,6 +1,6 @@
 # gate-guard fixture: in a C/C++ repository, a Python test under backend/tests gets a skip marker
-# expect: skip-marker
-# hits: 1
+# expect: skip-marker removed-tests
+# hits: 2
 
 diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
 index b384dce..3925a03 100644
