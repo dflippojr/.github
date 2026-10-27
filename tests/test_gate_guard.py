@@ -1507,6 +1507,11 @@ class RuleDetails(unittest.TestCase):
             [hit] = judged("from os import execl as print\n\n\ndef test_environment():\n    print('x')\n"
                            "    assert True\n", ("    assert True\n", "    print('/bin/true', 'true')\n    assert True\n"))
             self.assertIn("adds a use of print, which test_environment did not have", hit.detail)
+        # Nor is a builtin outside the harmless ones, such as exec, that the test already called.
+        with self.subTest(shadow="exec the test had"):
+            [hit] = judged("def test_environment():\n    exec('value = 1')\n    assert True\n",
+                           ("    assert True\n", "    exec('import os')\n    assert True\n"))
+            self.assertIn("adds a use of exec, which test_environment did not have", hit.detail)
         # The real builtins stay exempt where nothing shadows them, a test's own len is its own, and a builtin
         # the test already used stays exempt.
         for start_text, edits in (("import os\n\n\ndef test_environment():\n    assert True\n", [call]),
