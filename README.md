@@ -85,14 +85,17 @@ whatever the change:
   comprehensions, and a type parameter or type alias anywhere in the file.
   A builtin the test did not use (`len`, `print` and the other harmless ones)
   is exempt only when it is the builtin. No scope of either side may bind the
-  name, even another test's, and nothing may set it as an attribute. The file
-  may have no wildcard import and no import of a module named as the file is.
-  It may also name nothing that can reach a module's or the builtins' names at
+  name, even another test's, and each side may hold the name only as a plain
+  name: not in a string, a keyword, an attribute or a comment. The file may
+  have no wildcard import and no import of a module named as the file is. It
+  may also name nothing that can reach a module's or the builtins' names at
   run time: `builtins`, `globals`, `locals`, `vars`, `exec`, `eval`, `compile`,
   `importlib`, `modules`, `setattr`, `delattr`, `getattr`, `patch`, a frame's
-  `f_globals`, `_getframe`, `getmodule`, `get_referents`, or any dunder but
+  `f_globals`, `_getframe`, `getmodule`, `gc`, `ctypes`, or any dunder but
   `__name__`, `__main__`, `__init__`, `__file__` and `__doc__`. So an unchanged
-  `from os import getcwd as len` makes a new `len()` a hit.
+  `from os import getcwd as len` makes a new `len()` a hit. A builtin that
+  fails that test, or any other builtin, such as `exec`, is not exempt even
+  where the test already used it.
   Every changed line, even a comment or a blank line, must be
   inside a test body (indented deeper than its `def`) and hold only printable
   ASCII, so Python reads it as the guard does. Any other change is a hit: a

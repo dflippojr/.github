@@ -616,13 +616,13 @@ PY_BUILTINS = frozenset(
 PY_SYMBOL = ("local", "global", "declared_global", "free", "nonlocal", "parameter", "imported", "assigned",
              "referenced", "annotated", "namespace")
 # Words that can reach a module's or the builtins' names at run time, as written or as Python reads a name
-# (NFKC), anywhere in a file: a builtin a changed test adds there may not be the builtin (round b6). Any
-# dunder but a few that give only text or a constructor counts, as do a frame's or a module's finders and
-# getattr, whose attribute name can be computed.
-PY_DYNAMIC = re.compile(r"\b(?:builtins|globals|locals|vars|exec|eval|compile|importlib|import_module|modules|"
-                        r"setattr|delattr|getattr|attrgetter|patch|f_globals|f_builtins|f_locals|_getframe|"
-                        r"currentframe|getmodule|get_referents|get_referrers|"
-                        r"(?!__(?:name|main|init|file|doc)__\b)__\w+__)\b")
+# (NFKC), anywhere in a file: a builtin there may not be the builtin (round b6). So can any dunder but
+# PY_TEXT_DUNDERS, which give only text or a constructor, and getattr, whose attribute name can be computed.
+PY_DYNAMIC = frozenset(
+    "builtins globals locals vars exec eval compile importlib import_module modules setattr delattr getattr "
+    "attrgetter patch f_globals f_builtins f_locals _getframe currentframe getmodule get_referents get_referrers "
+    "get_objects gc ctypes pythonapi".split())
+PY_TEXT_DUNDERS = frozenset(("__name__", "__main__", "__init__", "__file__", "__doc__"))
 PY_COMPS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 # Nodes the guard runs on 3.7, which has neither: := is from Python 3.8, a type alias from 3.12.
 PY_WALRUS, PY_ALIAS = (getattr(ast, n, ()) for n in ("NamedExpr", "TypeAlias"))
@@ -908,31 +908,38 @@ def _py_real_builtins(path, texts, trees):
     """The harmless builtins that are the builtins in both sides of the file at path, texts parsed as trees.
 
     Round b6: none if either side names what can reach a name at run time
-    (PY_DYNAMIC), has a wildcard import or imports a module named as the
-    file is, which may be the file itself; else those that no scope of
-    either side binds, even another test's, nor sets as an attribute of
-    anything.
+    (PY_DYNAMIC, or a dunder), has a wildcard import or imports a module
+    named as the file is, which may be the file itself. Else those that no
+    scope of either side binds, even another test's, and that each side
+    holds only as plain names: not as a string, a keyword, an attribute or
+    in a comment, which a route to a namespace the guard does not list may
+    use.
     """
-    if any(PY_DYNAMIC.search(t) for text in texts for t in (text, unicodedata.normalize("NFKC", text))):
+    words = [collections.Counter(re.findall(r"\w+", t)) for text in texts
+             for t in (text, unicodedata.normalize("NFKC", text))]
+    found = set().union(*words)
+    if found & PY_DYNAMIC or any(w[:2] == w[-2:] == "__" and len(w) > 4 and w not in PY_TEXT_DUNDERS for w in found):
         return frozenset()
-    bound, imported = set(), set()
+    bound, imported, names = set(), set(), []
     for tree in trees:
         bound |= _py_binds(tree)
+        names.append(collections.Counter(n.id for n in ast.walk(tree) if isinstance(n, ast.Name)))
         for n in ast.walk(tree):
-            if isinstance(n, ast.Attribute) and not isinstance(n.ctx, ast.Load):
-                bound.add(n.attr)
-            elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            if isinstance(n, (ast.Import, ast.ImportFrom)):
                 imported.update(".".join([getattr(n, "module", None) or ""] + [a.name for a in n.names]).split("."))
     if "*" in bound or posixpath.basename(path)[:-len(".py")] in imported:
         return frozenset()
-    return PY_BUILTINS - bound
+    # words holds each side as written and as NFKC, which ast reads names as: [old, old NFKC, new, new NFKC].
+    return frozenset(b for b in PY_BUILTINS - bound if words[1][b] == names[0][b] and words[3][b] == names[1][b])
 
 
 def _python_test_change(old, new, real):
     """Why changing the test old to new is more than an edit of assertions and plain statements, or None.
 
-    real holds the harmless builtins that are the builtins in the file (_py_real_builtins).
+    real holds the harmless builtins that are the builtins in the file (_py_real_builtins). A builtin's name
+    not in real, such as exec or a shadowed print, is not exempt even where old used it, unless new binds it.
     """
+    unsure = set(dir(builtins)) - real
     # A name old binds anywhere, even in a nested def or a comprehension, is not one it used from outside.
     known, own = _py_reads(old, frozenset(_py_binds(old))), _py_locals(new)
     flow = (ast.Yield, ast.YieldFrom) + (() if isinstance(new, ast.AsyncFunctionDef) else (ast.Await,))
@@ -948,7 +955,8 @@ def _python_test_change(old, new, real):
             return f"it adds a use of .{reflect}, which reaches a module's globals or a frame"
         for chain in sorted(_py_reads(statement)):
             parts = chain.split(".")
-            if PY_REFLECT.match(parts[0]) or not (parts[0] in own or chain in known or chain in real):
+            if PY_REFLECT.match(parts[0]) or not (parts[0] in own or chain in real
+                                                  or (chain in known and parts[0] not in unsure)):
                 return f"it adds a use of {chain}, which {new.name} did not have"
         return None
 
