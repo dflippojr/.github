@@ -1269,6 +1269,12 @@ class RuleDetails(unittest.TestCase):
                 self.assertTrue(hits)
                 self.assertEqual({h.path for h in hits}, {test_api})
                 self.assertTrue(any(h.rule == "removed-tests" and why in h.detail for h in hits), hits)
+        # A block moved between a try's clauses: finally runs always, else only without an exception.
+        with self.subTest(change="finally to else"):
+            guarded = "def test_hw():\n    try:\n        assert 1\n    except ValueError:\n        pass\n" \
+                      "    finally:\n        assert 2\n"
+            [hit] = judged("    finally:\n", "    else:\n", guarded)
+            self.assertIn(flow, hit.detail)
         # A fixture pulled in by name from a conftest.py the guard does not read, which may skip.
         with self.subTest(change="getfixturevalue"):
             hw = "def test_hw(request):\n    assert request\n"
