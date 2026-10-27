@@ -59,12 +59,18 @@ whatever the change:
   the same statement for statement, a block whose header stays (a `with` or an
   `if`) is compared inside, and a changed statement may use only names and
   dotted names its test already used, its test's own names and harmless
-  builtins. Any other change is a hit: a `conftest.py` or helper, a rename,
-  addition or deletion, an import, a decorator, a `def` or `class` line,
-  module- or class-level code, control flow (`if`, `for`, `while`, `with`,
-  `try`, `match`, `return`, `raise`, `yield`), and any change to a file that
-  names a skip, `xfail`, an exit, `__test__` or `getfixturevalue` anywhere,
-  even in a comment or a string. Removed tests and new skips are hits as in
+  builtins. Every changed line, even a comment or a blank line, must be
+  inside a test body (indented deeper than its `def`) and hold only printable
+  ASCII, so Python reads it as the guard does. Any other change is a hit: a
+  `conftest.py` or helper, a rename, addition or deletion, an import, a
+  decorator, a `def` or `class` line, module- or class-level code or comments,
+  control flow (`if`, `for`, `while`, `with`, `try`, `match`, `return`,
+  `raise`, `yield`), a tab, a form feed or a non-ASCII character in a changed
+  line, and any change to a file that declares a source encoding other than
+  UTF-8, holds a carriage return inside a line, or names a skip, `xfail`, an
+  exit, `__test__` or `getfixturevalue` anywhere, even in a comment or a
+  string, as written or as Python reads names (NFKC, so fullwidth letters
+  count). Removed tests and new skips are hits as in
   any repository;
 - an added, deleted or renamed C/C++ source or header anywhere, including
   `.c++`, `.cp`, `.h++`, `.tpp`, `.tcc`, `.inl`, `.ino`, `.pde`, `.s` and files

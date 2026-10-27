@@ -1218,14 +1218,15 @@ class RuleDetails(unittest.TestCase):
             return judge_commits(start, dict(start, **{test_api: start_text.replace(old, new, 1)}))
 
         # No hit: an assertion or plain statement edited, added or removed in a test, inside a
-        # with block whose header stays, in a test class's method or an async test; a docstring
-        # or a comment inside a test.
+        # with block whose header stays, in a test class's method or an async test; a docstring,
+        # a comment or a blank line inside a test.
         limits = "    assert app.max_height"
         for old, new in (("== LIMIT\n", "== LIMIT - 1\n"), ("    assert os.environ\n", ""),
                          (limits, "    height = app.max_height\n    assert height\n" + limits),
                          ("        app.move(LIMIT + 1)\n", "        app.move(LIMIT + 2)\n        app.move(-1)\n"),
                          ("== self.speed", "== self.speed * 1"), ("().status()", "().status(len([1]))"),
-                         ("stops at its limits", "stops at both limits"), (limits, "    # The upper limit.\n" + limits)):
+                         ("stops at its limits", "stops at both limits"), (limits, "    # The upper limit.\n" + limits),
+                         ("    app = create_app()\n", "    app = create_app()\n\n")):
             with self.subTest(new=new):
                 self.assertEqual(judged(old, new), [])
         # A hit, with the reason in its detail: code outside a test body, a statement that is not
