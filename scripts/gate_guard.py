@@ -652,9 +652,32 @@ def _py_chain(node):
     return ".".join([node.id] + parts[::-1]) if isinstance(node, ast.Name) else None
 
 
-def _py_bound(node):
-    """The names a target, a comprehension's targets or a parameter list binds."""
-    return {n.id if isinstance(n, ast.Name) else n.arg for n in ast.walk(node) if isinstance(n, (ast.Name, ast.arg))}
+def _py_params(args):
+    """The names a parameter list binds: its parameters, not what its defaults read or bind."""
+    params = getattr(args, "posonlyargs", []) + args.args + args.kwonlyargs + [args.vararg, args.kwarg]
+    return {p.arg for p in params if p}
+
+
+def _py_bound(target):
+    """The names a comprehension's target binds: its plain names, also inside a tuple, a list or a starred
+    item, not the object or index of an attribute or item it assigns."""
+    return {n.id for n in ast.walk(target) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+
+
+def _py_binds(node):
+    """Every name node binds anywhere in it, in any scope: a nested def's or class's, a lambda's, a
+    comprehension's, a := target's, an import's, an except's or a match's."""
+    names = set()
+    for n in ast.walk(node):
+        if isinstance(n, ast.Name) and not isinstance(n.ctx, ast.Load):
+            names.add(n.id)
+        elif isinstance(n, ast.arg):
+            names.add(n.arg)
+        elif isinstance(n, ast.alias):
+            names.add((n.asname or n.name).split(".")[0])
+        else:
+            names.update(v for f, v in ast.iter_fields(n) if f in ("name", "rest") and isinstance(v, str))
+    return names
 
 
 def _py_reads(node, bound=frozenset()):
@@ -670,7 +693,7 @@ def _py_reads(node, bound=frozenset()):
     if isinstance(node, ast.Lambda):
         for default in node.args.defaults + node.args.kw_defaults:
             reads |= _py_reads(default, bound) if default else set()
-        return reads | _py_reads(node.body, bound | _py_bound(node.args))
+        return reads | _py_reads(node.body, bound | _py_params(node.args))
     if isinstance(node, PY_SCOPES):
         inner = bound | set().union(*(_py_bound(g.target) for g in node.generators))
         for i, g in enumerate(node.generators):
@@ -687,7 +710,7 @@ def _py_reads(node, bound=frozenset()):
 
 def _py_locals(test):
     """The names a test binds as its own: its parameters, and what its statements assign, import or define."""
-    names, declared = {a.arg for a in ast.walk(test.args) if isinstance(a, ast.arg)}, set()
+    names, declared = _py_params(test.args), set()
 
     def visit(node):
         if isinstance(node, (ast.Global, ast.Nonlocal)):
@@ -857,7 +880,8 @@ def _python_unexempt(fd):
 
 def _python_test_change(old, new):
     """Why changing the test old to new is more than an edit of assertions and plain statements, or None."""
-    known, own = _py_reads(old, frozenset(_py_locals(old))), _py_locals(new)
+    # A name old binds anywhere, even in a nested def or a comprehension, is not one it used from outside.
+    known, own = _py_reads(old, frozenset(_py_binds(old))), _py_locals(new)
     flow = (ast.Yield, ast.YieldFrom) + (() if isinstance(new, ast.AsyncFunctionDef) else (ast.Await,))
 
     def plain(statement):
@@ -869,6 +893,9 @@ def _python_test_change(old, new):
                         if isinstance(n, ast.Attribute) and PY_REFLECT.match(n.attr)), None)
         if reflect:
             return f"it adds a use of .{reflect}, which reaches a module's globals or a frame"
+        if any(isinstance(n, ast.comprehension) and any(isinstance(t, (ast.Attribute, ast.Subscript))
+                                                         for t in ast.walk(n.target)) for n in ast.walk(statement)):
+            return "it assigns to an attribute or an item in a comprehension's for, which the guard does not follow"
         for chain in sorted(_py_reads(statement)):
             parts = chain.split(".")
             if PY_REFLECT.match(parts[0]) or not (parts[0] in own or chain in known or chain in PY_BUILTINS):
