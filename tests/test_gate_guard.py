@@ -1061,6 +1061,66 @@ class RuleDetails(unittest.TestCase):
             with self.subTest(change=sorted(change), drop=drop):
                 self.assertEqual(flagged(start, change, drop), set())
 
+    def test_python_tests_in_a_c_cpp_repository_are_judged_by_statement(self):
+        """PR #41 review 2: a change inside a multi-line statement, or a move to another directory, stays a hit."""
+        api, base, conftest = DESK_API, DESK_TREE, "backend/tests/conftest.py"
+        test_api, limits = "backend/tests/test_api.py", "    assert create_app().max_height"
+
+        def flagged(start, change, drop=()):
+            head = {p: t for p, t in dict(start, **change).items() if p not in drop}
+            return {h.path for h in judge_commits(start, head)}
+
+        def flipped(old, new):
+            """Whether changing old to new, both a test_api.py with a False to flip, flags test_api.py alone."""
+            start = dict(base, **{test_api: old})
+            return flagged(start, {test_api: new}) == {test_api}
+
+        # (1) An entry added to an existing multi-line ignore list, or the condition an ignore list sits under.
+        for name in ("collect_ignore", "collect_ignore_glob"):
+            start = dict(base, **{conftest: f"import pytest\n\n{name} = [\n]\n"})
+            with self.subTest(name=name):
+                self.assertEqual(flagged(start, {conftest: f"import pytest\n\n{name} = [\n    'test_api.py',\n]\n"}),
+                                 {conftest})
+        guarded = "import sys\n\nif sys.version_info < (3,):\n    collect_ignore = ['test_api.py']\n"
+        with self.subTest(change="ignore list's condition"):
+            self.assertEqual(flagged(dict(base, **{conftest: guarded}),
+                                     {conftest: guarded.replace("sys.version_info < (3,)", "True")}), {conftest})
+        # (2) A test module moved to another directory: a dot-directory pytest does not
+        # recurse into, or a subdirectory, as a git rename or a delete and an add.
+        for directory in ("backend/tests/.disabled", "backend/tests/unit"):
+            for text in (api, api + "# moved\n", api.replace("\n\n\n", "\n\n\n# moved\n", 1)):
+                change = {f"{directory}/test_api.py": text}
+                with self.subTest(change=change):
+                    self.assertTrue(flagged(base, change, drop={test_api}), change)
+        moved = {test_api: api.split("\n\n\ndef test_height_limits")[0] + "\n",
+                 "backend/tests/unit/test_limits.py": "def test_height_limits():\n    assert True\n"}
+        with self.subTest(change=sorted(moved)):
+            self.assertIn(test_api, flagged(base, moved))
+        # (3) A skip whose condition spans lines, or sits lines above it, flipped from False to True.
+        for skip in ("pytest.skip('later')", "self.skipTest('later')", "raise unittest.SkipTest('later')"):
+            for block in (f"    if (\n        False\n    ):\n        {skip}\n",
+                          f"    if False:\n        print('later')\n        {skip}\n"):
+                old = api.replace(limits, block + limits)
+                with self.subTest(block=block):
+                    self.assertTrue(flipped(old, old.replace("False", "True")), block)
+        for decorator in ("@pytest.mark.skipif(\n    False,\n    reason='later',\n)\n",
+                          "@unittest.skipIf(\n    False,\n    'later',\n)\n"):
+            old = api.replace("def test_height_limits", decorator + "def test_height_limits")
+            with self.subTest(decorator=decorator):
+                self.assertTrue(flipped(old, old.replace("False", "True")), decorator)
+        # A condition that reads a constant of the same file.
+        old = "LATER = False\n" + api.replace(limits, "    if LATER:\n        pytest.skip('later')\n" + limits)
+        with self.subTest(change="constant"):
+            self.assertTrue(flipped(old, old.replace("LATER = False", "LATER = True")))
+        # Still no hit: an ignore list reformatted, and an assertion edited under an environment guard.
+        empty = dict(base, **{conftest: "import pytest\n\ncollect_ignore = [\n]\n"})
+        node = dict(base, **{test_api: api.replace(limits, "    if not shutil.which('node'):\n"
+                                                           "        pytest.skip('no node')\n" + limits)})
+        for start, change in ((empty, {conftest: "import pytest\n\ncollect_ignore = []\n"}),
+                              (node, {test_api: node[test_api].replace("120", "125")})):
+            with self.subTest(change=change):
+                self.assertEqual(flagged(start, change), set())
+
     def test_environment_guard_skip_is_not_a_hit(self):
         details = " ".join(h.detail for h in self.hits("flag-skip-python"))
         self.assertIn("flaky", details)
