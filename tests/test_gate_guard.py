@@ -1479,7 +1479,17 @@ class RuleDetails(unittest.TestCase):
                    "module imported by itself": "import gc\nfrom backend.tests import test_environment as me\n"
                                                 "gc.get_referents(me)[0]['len'] = os.getcwd\n",
                    "module of a function": "import gc\nimport inspect\n"
-                                           "gc.get_referents(inspect.getmodule(os.sep))[0]['len'] = os.getcwd\n"}
+                                           "gc.get_referents(inspect.getmodule(os.sep))[0]['len'] = os.getcwd\n",
+                   "gc's objects": "import gc\n\n\ndef setup_module():\n    for d in gc.get_objects():\n"
+                                   "        if type(d) is dict and 'setup_module' in d:\n"
+                                   "            d['len'] = os.getcwd\n",
+                   "ctypes": "import ctypes\nctypes.pythonapi.PyEval_GetBuiltins.restype = ctypes.py_object\n"
+                             "ctypes.pythonapi.PyEval_GetBuiltins()['len'] = os.getcwd\n",
+                   # len anywhere but as a plain name: a key, a keyword or an attribute that a route the guard
+                   # does not list may use, or a comment.
+                   "a string": "REGISTRY = {}\nREGISTRY['len'] = os.getcwd\n",
+                   "a keyword": "REGISTRY = dict(len=os.getcwd)\n", "an attribute read": "WIDTH = os.len\n",
+                   "a comment": "# len is os.getcwd here\n"}
         call = ("    assert True\n", "    len()\n    assert True\n")
         for kind, shadow in shadows.items():
             with self.subTest(shadow=kind):
@@ -1491,12 +1501,21 @@ class RuleDetails(unittest.TestCase):
                            "    def test_environment(self):\n        assert True\n",
                            ("        assert True\n", "        len()\n        assert True\n"))
             self.assertIn("adds a use of len", hit.detail)
-        # The real builtins stay exempt where nothing shadows them, and a test's own len is its own.
+        # A builtin the test already used is not exempt either where the file may make it another object: an
+        # unchanged from os import execl as print, and a print(...) beside the test's print('x').
+        with self.subTest(shadow="a use the test had"):
+            [hit] = judged("from os import execl as print\n\n\ndef test_environment():\n    print('x')\n"
+                           "    assert True\n", ("    assert True\n", "    print('/bin/true', 'true')\n    assert True\n"))
+            self.assertIn("adds a use of print, which test_environment did not have", hit.detail)
+        # The real builtins stay exempt where nothing shadows them, a test's own len is its own, and a builtin
+        # the test already used stays exempt.
         for start_text, edits in (("import os\n\n\ndef test_environment():\n    assert True\n", [call]),
                                   ("def test_environment():\n    assert True\n",
                                    [("    assert True\n", "    print(len([1]), min(1, 2))\n    assert True\n")]),
                                   ("import os\n\n\ndef test_environment():\n    len = os.getcwd\n    assert len\n    assert True\n",
-                                   [call])):
+                                   [call]),
+                                  ("def test_environment():\n    print('x')\n    assert True\n",
+                                   [("    assert True\n", "    print('y')\n    assert True\n")])):
             with self.subTest(control=start_text, edits=edits):
                 self.assertEqual(judged(start_text, *edits), [])
         # (3) Any name a changed test had, in any of its scopes, must resolve to the same binding in every
