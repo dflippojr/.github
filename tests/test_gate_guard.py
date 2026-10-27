@@ -1144,6 +1144,14 @@ class RuleDetails(unittest.TestCase):
         helper = "def require_later():\n    pytest.skip('later')\n\n\n" + api
         with self.subTest(change="helper call"):
             self.assertTrue(flipped(helper, helper.replace(limits, "    require_later()\n" + limits)))
+        # A test class's header changed: a base, a metaclass or a decorator can take it out of collection.
+        cls = "from helpers import Hidden, hide\n\n\nclass TestLimits:\n    def test_height(self):\n        assert True\n"
+        for header in ("class TestLimits(Hidden):", "class TestLimits(metaclass=Hidden):", "@hide\nclass TestLimits:"):
+            with self.subTest(header=header):
+                self.assertTrue(flipped(cls, cls.replace("class TestLimits:", header)), header)
+        with self.subTest(change="test method added"):
+            self.assertFalse(flagged(dict(base, **{test_api: cls}),
+                                     {test_api: cls + "\n    def test_width(self):\n        assert True\n"}))
         # A module renamed to conftest.py, whose ignore list then applies.
         hooks = "collect_ignore = ['test_api.py']\n"
         with self.subTest(change="renamed to conftest.py"):
