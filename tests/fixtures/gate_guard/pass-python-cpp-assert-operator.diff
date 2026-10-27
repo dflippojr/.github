@@ -1,0 +1,31 @@
+# gate-guard fixture: an assertion's comparison operator fixed in an existing test
+# expect: 
+# hits: 0
+
+diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
+--- a/firmware/src/logic.cpp
++++ b/firmware/src/logic.cpp
+@@ -1 +1 @@
+-int limit = 120;
++int limit = 125;
+diff --git a/backend/tests/test_guard.py b/backend/tests/test_guard.py
+--- a/backend/tests/test_guard.py
++++ b/backend/tests/test_guard.py
+@@ -1,16 +1,16 @@
+ import os
+ 
+ import pytest
+ 
+ from backend.app import create_app
+ 
+ 
+ def test_status():
+     response = create_app().test_client().get("/status")
+     assert response.status_code == 200, "status is up"
+-    assert response.json["height"] <= 120
++    assert response.json["height"] < 120
+     assert response.json["ratio"] == pytest.approx(0.5, abs=0.01)
+ 
+ 
+ def test_later():
+     assert False

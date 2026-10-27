@@ -1,6 +1,7 @@
-# gate-guard fixture: a new call of the real builtins len and print in a test, which nothing in the file shadows
-# expect: 
-# hits: 0
+# gate-guard fixture: a new call of the real builtins len and print in a test: under the assert-only rule (the assert-only round), any statement but a replaced assertion is a hit
+# expect: removed-tests
+# hits: 1
+# detail: not an assert
 
 diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
 --- a/firmware/src/logic.cpp
