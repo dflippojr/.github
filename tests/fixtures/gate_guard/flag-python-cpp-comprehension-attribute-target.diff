@@ -1,0 +1,21 @@
+# gate-guard fixture: a comprehension that assigns to an attribute of an imported module binds no name
+# expect: removed-tests
+# hits: 1
+# detail: assigns to an attribute or an item
+
+diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
+--- a/firmware/src/logic.cpp
++++ b/firmware/src/logic.cpp
+@@ -1 +1 @@
+-int limit = 120;
++int limit = 125;
+diff --git a/backend/tests/test_environment.py b/backend/tests/test_environment.py
+--- a/backend/tests/test_environment.py
++++ b/backend/tests/test_environment.py
+@@ -1,5 +1,6 @@
+ import os
+ 
+ 
+ def test_environment():
+     assert os.environ is not None
++    [os.getcwd() for os.review_probe in [None]]

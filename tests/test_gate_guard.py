@@ -1253,6 +1253,11 @@ class RuleDetails(unittest.TestCase):
                  (limits, "    os.execv('/bin/true', ['true'])\n" + limits, "adds a use of os.execv"),
                  (limits, "    o = os\n" + limits, "adds a use of os,"),
                  (limits, "    [os.getcwd() for os in [os]]\n" + limits, "adds a use of os,"),
+                 # Only a lambda's parameters and a comprehension's plain names are bound, never a name
+                 # read in a default, nor the object or index of an attribute or item assigned.
+                 (limits, "    (lambda a=(lambda os: 0): os.getcwd())()\n" + limits, "adds a use of os.getcwd"),
+                 (limits, "    [os.getcwd() for a, os.x in [(1, 2)]]\n" + limits, "assigns to an attribute or an item"),
+                 (limits, "    [os.getcwd() for [*os[:]] in [[1]]]\n" + limits, "assigns to an attribute or an item"),
                  (limits, "    app.__class__\n" + limits, "adds a use of .__class__"),
                  (limits, "    g = (x for x in [1])\n    g.gi_frame.f_globals\n" + limits,
                   "adds a use of .f_globals"),

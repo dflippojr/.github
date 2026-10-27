@@ -1,0 +1,21 @@
+# gate-guard fixture: a lambda's parameter in a test's default is not one of the test's own names
+# expect: removed-tests
+# hits: 1
+# detail: adds a use of os.getcwd
+
+diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
+--- a/firmware/src/logic.cpp
++++ b/firmware/src/logic.cpp
+@@ -1 +1 @@
+-int limit = 120;
++int limit = 125;
+diff --git a/backend/tests/test_environment.py b/backend/tests/test_environment.py
+--- a/backend/tests/test_environment.py
++++ b/backend/tests/test_environment.py
+@@ -1,5 +1,6 @@
+ import os
+ 
+ 
+ def test_environment(probe=lambda os: os):
+     assert os.environ is not None
++    os.getcwd()
