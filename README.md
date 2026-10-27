@@ -56,8 +56,10 @@ whatever the change:
   bodies (top-level `test_` functions, and `test_` methods of top-level `Test`
   classes with no constructor, with no decorator but pytest marks), each new
   `assert` the one it replaces with only these changed: a comparison's literal
-  operands (a constant, a signed number, or a list, tuple, set or dict of
-  literals of the same shape), its operators (`==`, `!=`, `<`, `<=`, `>`,
+  operands (a constant, an int or float constant with a minus sign, such as
+  `-1` or `-0.5`, or a list, tuple, set or dict of literals of the same
+  shape; any other unary operator or operand, such as `-None`, `+1`, `~1` or
+  `not 1`, is a changed shape), its operators (`==`, `!=`, `<`, `<=`, `>`,
   `>=`, `is`, `is not`, `in`, `not in`), a plain-string message, and a
   `pytest.approx` operand's expected value, `rel` and `abs`, where one
   top-level `import pytest` is all that binds `pytest`. So that a change can

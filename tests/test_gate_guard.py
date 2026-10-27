@@ -1336,7 +1336,7 @@ class RuleDetails(unittest.TestCase):
                 [hit] = judged(old, new, signs)
                 self.assertIn(shape, hit.detail)
         with self.subTest(change="from a unary minus on None to a number"):
-            [hit] = judged("== 1\n", "== -1\n", signs.replace("== 1\n", "== -None\n"))
+            [hit] = judged("== -None\n", "== -1\n", signs.replace("== 1\n", "== -None\n"))
             self.assertIn(shape, hit.detail)
         # Since the assert-only rule, a file that names a skip elsewhere no longer taints an assertion's fix
         # (the b6 review's advisory): no file-wide words are read.

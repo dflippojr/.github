@@ -701,16 +701,24 @@ def _py_text(node):
     return type(node).__name__ == "Str" or (type(node).__name__ == "Constant" and isinstance(node.value, str))
 
 
+def _py_number(node):
+    """Whether node is an int or float literal, not a bool or a complex number (Num on Python 3.7)."""
+    if type(node).__name__ not in ("Constant", "Num"):
+        return False
+    return type(node.value if hasattr(node, "value") else node.n) in (int, float)
+
+
 def _py_leaves(node):
-    """The ids of the literals in node, a literal (see _py_literal), or None when it is not one.
+    """The ids of the literals in node, a literal (see _py_masks), or None when it is not one.
 
     A container's own node is not one of them, so its kind and length stay
-    compared; a signed number counts as one literal, so 5 may become -5.
+    compared; a minus on an int or float counts as part of the literal, so 5
+    may become -5, but no other unary operator or operand does.
     """
     if type(node).__name__ in PY_LITERALS:
         return {id(node)}
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
-        return {id(node)} if type(node.operand).__name__ in PY_LITERALS else None
+    if isinstance(node, ast.UnaryOp):
+        return {id(node)} if isinstance(node.op, ast.USub) and _py_number(node.operand) else None
     if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
         parts = node.elts
     elif isinstance(node, ast.Dict):
@@ -725,7 +733,7 @@ def _py_masks(node, approx):
     """The ids of the nodes of the assert statement node an exempt change may give other literals.
 
     They are its message if that is a string, and, where its test is a
-    comparison, the literals of each literal operand (a constant, a signed
+    comparison, the literals of each literal operand (a constant, a negated
     number, or a list, tuple, set or dict of literals) and, when approx says
     pytest is the pytest module, those of a pytest.approx operand's expected
     value and its rel and abs.
