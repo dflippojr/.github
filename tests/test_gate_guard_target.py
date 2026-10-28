@@ -211,7 +211,7 @@ class Scenarios(unittest.TestCase):
         self.assertLessEqual({"head-edits-caller", "stale-owner-label", "bot-label", "owner-label-after-head",
                               "approve-gate-no-record", "approve-gate-push-race", "approve-gate-head-record",
                               "approve-gate-record-without-command", "approve-gate-hand-label-after-workflow",
-                              "approve-gate-second-command-race"},
+                              "approve-gate-second-command-race", "approve-gate-command-rerun"},
                              names)
 
     def test_scenarios(self):
@@ -709,16 +709,32 @@ class ApproveGateLabel(unittest.TestCase):
             events.append(OwnerLabel.event("labeled", "dflippojr", at, i=2 * i))
         return events
 
-    def test_a_hand_label_after_an_earlier_workflow_label_keeps_todays_rule(self):
-        """The owner approved A by comment at 10:00, B was pushed at 12:00, and the owner re-applied the label by
-        hand at 13:00: the command and record belong to the 10:00 label, not this one."""
+    def test_a_rerun_of_a_recorded_command_marks_its_new_label(self):
+        """approve_gate.py checks the command and the head on every run, not whether a record already links the
+        command. The owner approves A by comment; run 1 labels and records A; B is pushed; a rerun of run 1 removes
+        and re-applies the label and dies before its record. Its only command is the one run 1's record links."""
+        comments = [self.command(self.OTHER, at="2026-10-16T10:00:00Z", i=0),
+                    self.record(self.OTHER, at="2026-10-16T10:00:03Z", command=0, i=1)]
+        events = self.history("2026-10-16T10:00:02Z", "2026-10-16T12:00:15Z")
+        counts, why = gate_guard.owner_label(gate_guard.APPROVAL_LABEL, {gate_guard.APPROVAL_LABEL}, events,
+                                             "dflippojr", self.HEAD, self.PUSHED, comments)
+        self.assertFalse(counts)
+        self.assertIn("applied through `/approve-gate`, but no unedited head record from the owner", why)
+
+    def test_a_hand_label_after_an_earlier_workflow_label_needs_a_record(self):
+        """The limit of the shared token: the owner approved A by comment at 10:00, B was pushed at 12:00, and the
+        owner re-applied the label by hand at 13:00. That reads as a rerun of the 10:00 command, so the hand label
+        needs a head record for B (`ao owner-label apply` writes one)."""
         comments = [self.command(self.OTHER, at="2026-10-16T10:00:00Z"),
                     self.record(self.OTHER, at="2026-10-16T10:00:03Z", i=1)]
         events = self.history("2026-10-16T10:00:02Z", self.LABELED)
         counts, why = gate_guard.owner_label(gate_guard.APPROVAL_LABEL, {gate_guard.APPROVAL_LABEL}, events,
                                              "dflippojr", self.HEAD, self.PUSHED, comments)
+        self.assertFalse(counts)
+        self.assertIn("no unedited head record from the owner", why)
+        counts, why = gate_guard.owner_label(gate_guard.APPROVAL_LABEL, {gate_guard.APPROVAL_LABEL}, events,
+                                             "dflippojr", self.HEAD, self.PUSHED, comments + [self.ao_record()])
         self.assertTrue(counts, why)
-        self.assertNotIn("/approve-gate", why)
 
     def test_a_command_the_first_run_did_not_record_marks_the_second_runs_label(self):
         """Two commands before the first label: run 1 labels and records for its command; B is pushed; run 2 labels

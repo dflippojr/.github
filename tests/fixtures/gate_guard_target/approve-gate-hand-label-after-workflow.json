@@ -1,5 +1,5 @@
 {
-  "description": "The owner approved head A by comment at 10:00 and the workflow labeled and recorded it; B was pushed at 12:00; the owner reviewed B, removed the label and applied it again by hand. The old command and record belong to the 10:00 label: today's rule, accepted.",
+  "description": "The owner approved head A by comment at 10:00 and the workflow labeled and recorded it; B was pushed at 12:00; the owner reviewed B, removed the label and applied it again by hand. The shared token makes that read as a rerun of the 10:00 command, which approve_gate.py would accept, so the label needs a head record for B: refused.",
   "diff": "flag-gate-target-caller",
   "pushed_at": "2026-10-16T12:00:00Z",
   "labels": [
@@ -38,9 +38,9 @@
     }
   ],
   "expect": {
-    "conclusion": "success",
-    "exit": 0,
-    "title": "2 hits, approved by the owner",
-    "reason": "`gate-change-approved` was applied by the owner @dflippojr at 2026-10-16T13:00:00Z, after {head} was pushed at 2026-10-16T12:00:00Z"
+    "conclusion": "failure",
+    "exit": 1,
+    "title": "2 hits, not approved",
+    "reason": "applied through `/approve-gate`, but no unedited head record from the owner"
   }
 }
