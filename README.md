@@ -306,11 +306,13 @@ anything from the pull request:
 - **The owner's identity.** A label applied by the owner login counts, whoever
   was driving it. Owner-identity launches (`AO_WORKER_IDENTITY=owner`) and a
   leaked owner token are outside what this check can see.
-- **Deleted `/approve-gate` comments.** The guard can tell a workflow label
-  from a hand label only by the owner's command and the workflow's record.
-  Anyone with write access to the repository can delete comments, the owner's
-  included, and the API lists no deleted ones. Deleting both turns a workflow
-  label left by a failed run back into a hand label, judged by its time alone.
+- **Deleted or edited `/approve-gate` comments.** The guard can tell a
+  workflow label from a hand label only by the owner's command and the
+  workflow's record. Anyone with write access to the repository can delete or
+  edit comments, the owner's included, and the API lists no deleted ones.
+  Deleting both, or rewriting their text (an edited record no longer counts
+  as a record either), turns a workflow label left by a failed run back into
+  a hand label, judged by its time alone.
   Requiring the head record for every owner label on a pull request, as `ao
   ready` already does, would close this; that is the owner's decision.
 - **What a diff can't show.** A test made vacuous (`assert True`), a slower
