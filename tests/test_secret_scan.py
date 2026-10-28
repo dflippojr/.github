@@ -547,3 +547,30 @@ def test_committed_manifest_is_empty_and_loads():
     assert scan.EXEMPTIONS == path
     assert json.loads(path.read_text(encoding="utf-8")) == []
     assert scan.load_exemptions() == []
+
+
+@pytest.mark.parametrize("mode", ["--financial", "--financial-only"])
+def test_extra_matches_on_one_exempted_line_still_fail(repo, manifest, capsys, monkeypatch, mode):
+    # Budget counts matched values, not deduplicated (line, rule) findings.
+    base = git(repo, "rev-parse", "HEAD")
+    commit(repo, CARD_PATH, "pair = '" + CARD + "', '" + CARD + "'\n")
+    manifest([entry("luhn-number", 1), entry("account-like-number", 1)])
+    monkeypatch.setenv("SECRET_SCAN_DENYLIST_SHA256", scan.digest("unrelated-synthetic-host"))
+    monkeypatch.setattr(scan, "scan_gitleaks", lambda *args: set())
+    result, rows, captured = financial_run(repo, capsys, "--base", base, "--repository", SYNTHETIC_REPOSITORY, mode=mode)
+    assert result == 1
+    assert captured.out.splitlines()[-1] == "secret-scan: 2 finding(s), 2 exempt"
+    assert {row["rule"] for row in rows} == {"luhn-number", "account-like-number"}
+
+
+@pytest.mark.parametrize("mode", ["--financial", "--financial-only"])
+def test_every_match_on_one_line_within_budget_is_exempt(repo, manifest, capsys, monkeypatch, mode):
+    base = git(repo, "rev-parse", "HEAD")
+    commit(repo, CARD_PATH, "pair = '" + CARD + "', '" + CARD + "'\n")
+    manifest([entry("luhn-number", 2), entry("account-like-number", 2)])
+    monkeypatch.setenv("SECRET_SCAN_DENYLIST_SHA256", scan.digest("unrelated-synthetic-host"))
+    monkeypatch.setattr(scan, "scan_gitleaks", lambda *args: set())
+    result, rows, captured = financial_run(repo, capsys, "--base", base, "--repository", SYNTHETIC_REPOSITORY, mode=mode)
+    assert result == 0
+    assert captured.out.splitlines()[-1] == "secret-scan: 0 finding(s), 4 exempt"
+    assert rows == []
