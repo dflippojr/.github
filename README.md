@@ -212,13 +212,14 @@ base: the same head against a new base can bring hits the old base hid.
    the owner's newest `gate-change-approved` label as the workflow's when the
    workflow's own record (`Owner approved … by [comment](…)`, edited or not)
    was posted at or after it, or when an `/approve-gate` command from the
-   owner (edited or not) was posted no later than it, unless an unedited
-   record posted between an earlier label and this one links that command:
-   its run labeled earlier. That label counts only when the owner's newest
-   unedited head record for `gate-change-approved`, posted at or after the
-   label (so after the push), names the exact current head. No record, a
-   record for another SHA, an edited record or someone else's record fails
-   closed; the owner approves the current head again.
+   owner (edited or not) was posted no later than it. A command an earlier
+   run already recorded still marks it: the workflow checks the command and
+   the head on each run, so a rerun of that run labels again. That label
+   counts only when the owner's newest unedited head record for
+   `gate-change-approved`, posted at or after the label (so after the push),
+   names the exact current head. No record, a record for another SHA, an
+   edited record or someone else's record fails closed; the owner approves
+   the current head again.
 
    The label starts the guard, and the workflow posts its record a moment
    later. No comment reruns the guard, so while such a label is under a
@@ -226,14 +227,16 @@ base: the same head against a new base can bring hits the old base hid.
    5 seconds for up to a minute, then fails closed. A record that lands after
    that needs a rerun of the job or another pull request event.
 
-   A label the owner applies by hand keeps the rule above, with or without
-   the record `ao owner-label apply` writes: a command an earlier run
-   recorded, and that run's record, don't mark it. One case can't be told
-   apart, since both go through the owner's token: a hand label applied after
-   an `/approve-gate` that no record links (refused, or its run failed before
-   the record) looks like the label of a run that died before its record, so
-   it needs a head record too; `ao owner-label apply` writes one.
-   `findings-accepted` has no workflow and keeps the rule above.
+   A label the owner applies by hand on a pull request with no earlier
+   `/approve-gate` from the owner keeps the rule above, with or without the
+   record `ao owner-label apply` writes. One case can't be told apart, since
+   both go through the owner's token: a hand label applied after any owner
+   `/approve-gate` on the pull request, refused, failed or recorded, looks
+   like the label of a run, or a rerun, that died before its record. So it
+   needs a head record for the current head too, which `ao owner-label
+   apply` writes, and while it is under a minute old the guard waits for
+   one as above. `findings-accepted` has no workflow and keeps the rule
+   above.
 5. Ends the job with the verdict: the job fails when any of them has
    unapproved hits, as `gate-guard.yml` does. It also fails while
    `findings-accepted` is on a pull request but doesn't count, so nothing can
