@@ -73,7 +73,8 @@ class FakeGitHub:
             if path == f"/repos/{REPO}/issues/{number}/comments":
                 # {head} in a body stands for the head sha, which the scenario's git trees decide.
                 return [{"id": i, "user": {"login": c["author"]}, "body": c["body"].format(head=self.head),
-                         "created_at": c["created_at"], "updated_at": c.get("updated_at", c["created_at"])}
+                         "created_at": c["created_at"], "updated_at": c.get("updated_at", c["created_at"]),
+                         "html_url": f"https://github.com/{REPO}/pull/{number}#issuecomment-{i}"}
                         for i, c in enumerate(s.get("comments", []))]
             ref = f"refs/heads/{s['head_ref']}"
             if path == f"/repos/{REPO}/activity?ref={ref}":
@@ -209,7 +210,8 @@ class Scenarios(unittest.TestCase):
         names = {p.stem for p in SCENARIOS.glob("*.json")}
         self.assertLessEqual({"head-edits-caller", "stale-owner-label", "bot-label", "owner-label-after-head",
                               "approve-gate-no-record", "approve-gate-push-race", "approve-gate-head-record",
-                              "approve-gate-record-without-command", "approve-gate-hand-label-after-workflow"},
+                              "approve-gate-record-without-command", "approve-gate-hand-label-after-workflow",
+                              "approve-gate-second-command-race"},
                              names)
 
     def test_scenarios(self):
@@ -601,14 +603,17 @@ class ApproveGateLabel(unittest.TestCase):
 
     @staticmethod
     def comment(body, at, author="dflippojr", edited_at=None, i=0):
-        return {"id": i, "user": {"login": author}, "body": body, "created_at": at, "updated_at": edited_at or at}
+        return {"id": i, "user": {"login": author}, "body": body, "created_at": at, "updated_at": edited_at or at,
+                "html_url": f"https://github.com/x#issuecomment-{i}"}
 
     def command(self, sha=HEAD, at="2026-10-16T12:59:50Z", **kw):
         return self.comment(f"/approve-gate {sha}", at, **kw)
 
-    def record(self, sha=HEAD, at="2026-10-16T13:00:01Z", label=gate_guard.APPROVAL_LABEL, **kw):
-        return self.comment(f"Owner approved `{label}` at head {sha} by [comment](https://github.com/x). A later push "
-                            f"invalidates it.\n\n<!-- owner-label {label} head={sha} -->", at, **kw)
+    def record(self, sha=HEAD, at="2026-10-16T13:00:01Z", label=gate_guard.APPROVAL_LABEL, command=0, **kw):
+        """approve_gate.py's record, which links the command it acted on (the comment with id `command`)."""
+        return self.comment(f"Owner approved `{label}` at head {sha} by [comment](https://github.com/x#issuecomment-"
+                            f"{command}). A later push invalidates it.\n\n<!-- owner-label {label} head={sha} -->",
+                            at, **kw)
 
     def ao_record(self, sha=HEAD, at="2026-10-16T13:00:01Z", label=gate_guard.APPROVAL_LABEL):
         return self.comment(f"Owner applied `{label}` at head {sha}. A later push invalidates it.\n\n"
@@ -708,12 +713,41 @@ class ApproveGateLabel(unittest.TestCase):
         """The owner approved A by comment at 10:00, B was pushed at 12:00, and the owner re-applied the label by
         hand at 13:00: the command and record belong to the 10:00 label, not this one."""
         comments = [self.command(self.OTHER, at="2026-10-16T10:00:00Z"),
-                    self.record(self.OTHER, at="2026-10-16T10:00:03Z")]
+                    self.record(self.OTHER, at="2026-10-16T10:00:03Z", i=1)]
         events = self.history("2026-10-16T10:00:02Z", self.LABELED)
         counts, why = gate_guard.owner_label(gate_guard.APPROVAL_LABEL, {gate_guard.APPROVAL_LABEL}, events,
                                              "dflippojr", self.HEAD, self.PUSHED, comments)
         self.assertTrue(counts, why)
         self.assertNotIn("/approve-gate", why)
+
+    def test_a_command_the_first_run_did_not_record_marks_the_second_runs_label(self):
+        """Two commands before the first label: run 1 labels and records for its command; B is pushed; run 2 labels
+        again and dies before its record. Command 2, which no record links, marks run 2's label."""
+        comments = [self.command(self.OTHER, at="2026-10-16T10:00:00Z", i=0),
+                    self.command(self.OTHER, at="2026-10-16T10:00:01Z", i=1),
+                    self.record(self.OTHER, at="2026-10-16T10:00:09Z", command=0, i=2)]
+        events = self.history("2026-10-16T10:00:08Z", "2026-10-16T12:00:15Z")
+        counts, why = gate_guard.owner_label(gate_guard.APPROVAL_LABEL, {gate_guard.APPROVAL_LABEL}, events,
+                                             "dflippojr", self.HEAD, self.PUSHED, comments)
+        self.assertFalse(counts)
+        self.assertIn("no unedited head record from the owner", why)
+
+    def test_a_hand_label_before_the_workflow_label_does_not_unmark_its_command(self):
+        """The command, a hand label while the run starts, then the run's remove-and-relabel, which dies."""
+        events = self.history("2026-10-16T12:59:55Z", self.LABELED)
+        counts, why = gate_guard.owner_label(gate_guard.APPROVAL_LABEL, {gate_guard.APPROVAL_LABEL}, events,
+                                             "dflippojr", self.HEAD, self.PUSHED, [self.command()])
+        self.assertFalse(counts)
+        self.assertIn("no unedited head record from the owner", why)
+
+    def test_an_edited_record_does_not_use_up_its_command(self):
+        """Only an unedited record shows which command an earlier label came from."""
+        comments = [self.command(self.OTHER, at="2026-10-16T10:00:00Z"),
+                    self.record(self.OTHER, at="2026-10-16T10:00:03Z", edited_at="2026-10-16T12:30:00Z", i=1)]
+        events = self.history("2026-10-16T10:00:02Z", self.LABELED)
+        counts, _ = gate_guard.owner_label(gate_guard.APPROVAL_LABEL, {gate_guard.APPROVAL_LABEL}, events,
+                                           "dflippojr", self.HEAD, self.PUSHED, comments)
+        self.assertFalse(counts)
 
     def test_a_workflow_label_after_an_earlier_hand_label_needs_a_record(self):
         """The workflow removes a label already on before it labels; its command still marks its own label."""
@@ -727,10 +761,10 @@ class ApproveGateLabel(unittest.TestCase):
         """The limit of the shared token: a command with no label between it and a hand label could be the run that
         applied that label and died, so the hand label needs a record (`ao owner-label apply` writes one)."""
         comments = [self.command(self.OTHER, at="2026-10-16T10:00:00Z"),
-                    self.record(self.OTHER, at="2026-10-16T10:00:03Z"),
-                    self.command(self.OTHER, at="2026-10-16T12:30:00Z"),
+                    self.record(self.OTHER, at="2026-10-16T10:00:03Z", i=1),
+                    self.command(self.OTHER, at="2026-10-16T12:30:00Z", i=2),
                     self.comment("`gate-change-approved` was not applied: the pull request's head is now c.",
-                                 "2026-10-16T12:30:02Z")]
+                                 "2026-10-16T12:30:02Z", i=3)]
         events = self.history("2026-10-16T10:00:02Z", self.LABELED)
         counts, why = gate_guard.owner_label(gate_guard.APPROVAL_LABEL, {gate_guard.APPROVAL_LABEL}, events,
                                              "dflippojr", self.HEAD, self.PUSHED, comments)

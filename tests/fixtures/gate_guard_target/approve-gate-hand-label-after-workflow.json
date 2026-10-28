@@ -33,7 +33,7 @@
     },
     {
       "author": "dflippojr",
-      "body": "Owner approved `gate-change-approved` at head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa by [comment](https://github.com/dflippojr/demo/pull/7#issuecomment-1). A later push invalidates it.\n\n<!-- owner-label gate-change-approved head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -->",
+      "body": "Owner approved `gate-change-approved` at head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa by [comment](https://github.com/dflippojr/demo/pull/7#issuecomment-0). A later push invalidates it.\n\n<!-- owner-label gate-change-approved head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -->",
       "created_at": "2026-10-16T10:00:03Z"
     }
   ],
