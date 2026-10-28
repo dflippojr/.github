@@ -53,6 +53,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tokenize
 import urllib.error
 import urllib.parse
@@ -62,6 +63,12 @@ import warnings
 APPROVAL_LABEL = "gate-change-approved"
 FINDINGS_LABEL = "findings-accepted"
 OWNER_LABELS = (APPROVAL_LABEL, FINDINGS_LABEL)
+# The owner head record `ao owner-label apply` and approve_gate.py post, and
+# the two things that mark a gate-change-approved label as approve_gate.py's:
+# the owner's /approve-gate command, and the record approve_gate.py writes.
+HEAD_RECORD = re.compile(r"<!-- owner-label (\S+) head=([0-9a-f]{40}) -->")
+APPROVE_COMMAND = re.compile(r"\s*/approve-gate(?!\S)")
+APPROVE_RECORD = re.compile(rf"Owner approved `{APPROVAL_LABEL}` at head [0-9a-f]{{40}} by \[comment\]\(([^)\s]*)\)")
 # The judging job's check with the caller template: the caller's job id, then
 # the reusable workflow's job name. pr_body_lint.py reads its verdict annotation.
 REQUIRED_CHECK = "gate-guard-target / gate-guard"
@@ -71,6 +78,11 @@ MAX_SUMMARY_BYTES = 1000000
 TRUNCATED = "\n\n… (truncated; the job log has the rest)\n"
 MAX_ANNOTATIONS = 50
 MAX_API_PAGES = 30
+# approve_gate.py posts its head record a moment after the label that starts
+# the guard, and no comment reruns the guard, so a fresh /approve-gate label
+# waits up to RECORD_WAIT seconds for it, reading the comments every RECORD_POLL.
+RECORD_WAIT = 60
+RECORD_POLL = 5
 
 Hit = collections.namedtuple("Hit", "rule path line detail")
 # kind is " " (context), "-" (removed) or "+" (added); old/new are line numbers.
@@ -1542,20 +1554,92 @@ def head_pushed_at(activities, ref, sha):
     return max(times) if times else None
 
 
-def owner_label(label, labels, events, owner, sha, pushed_at):
+def _by(comment, owner):
+    return ((comment.get("user") or {}).get("login") or "").lower() == owner.lower()
+
+
+def _now():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def newest_label_event(label, events):
+    """The newest labeled/unlabeled event for label, or None."""
+    history = [e for e in events if e.get("event") in ("labeled", "unlabeled")
+               and ((e.get("label") or {}).get("name") or "").lower() == label]
+    return max(history, key=lambda e: (e.get("created_at") or "", e.get("id") or 0)) if history else None
+
+
+def from_approve_gate(comments, owner, applied):
+    """Whether the owner's gate-change-approved label applied at `applied` may be approve_gate.py's.
+
+    The workflow labels with the owner's token, so the event's actor can't
+    tell. It labels only after the owner's /approve-gate comment, and records
+    the head after the label, linking the command. A command from the owner no
+    newer than the label marks it, even one an earlier run's record links,
+    since a rerun of that run acts on the command again. So does a record from
+    the owner posted at or after the label. An edited command or record still
+    marks it, since the edit may postdate the run. A time that can't be read
+    marks it too.
+    """
+    for c in comments:
+        if not _by(c, owner):
+            continue
+        body, at = c.get("body") or "", parse_time(c.get("created_at"))
+        if APPROVE_COMMAND.match(body) and (at is None or at <= applied):
+            return True
+        if APPROVE_RECORD.search(body) and (at is None or at >= applied):
+            return True
+    return False
+
+
+def awaiting_record(events, owner, comments):
+    """Whether the owner's newest gate-change-approved label came through /approve-gate under RECORD_WAIT seconds
+    ago and has no head record yet, which approve_gate.py may still be posting."""
+    newest = newest_label_event(APPROVAL_LABEL, events)
+    actor = ((newest or {}).get("actor") or {}).get("login") or ""
+    if newest is None or newest.get("event") != "labeled" or actor.lower() != owner.lower():
+        return False
+    applied = parse_time(newest.get("created_at"))
+    return (applied is not None and (_now() - applied).total_seconds() < RECORD_WAIT
+            and from_approve_gate(comments, owner, applied)
+            and recorded_head(comments, APPROVAL_LABEL, owner, applied) is None)
+
+
+def recorded_head(comments, label, owner, since):
+    """(sha, posted) from the owner's newest unedited head record for label posted at or after since, or None.
+
+    Anyone with write access can edit the owner's comment, so an edited one
+    never counts (the rule of agent-ops `ao owner-label`).
+    """
+    found = None
+    for c in comments:
+        at = parse_time(c.get("created_at"))
+        if not _by(c, owner) or at is None or at < since or c.get("updated_at") != c.get("created_at"):
+            continue
+        for match in HEAD_RECORD.finditer(c.get("body") or ""):
+            if match.group(1).lower() == label and (found is None or at >= found[1]):
+                found = (match.group(2), at)
+    return found
+
+
+def owner_label(label, labels, events, owner, sha, pushed_at, comments=()):
     """(counts, reason) for an owner-only label on a pull request whose head is sha.
 
     The label counts only when the newest labeled/unlabeled event for it is
     'labeled' by the owner, after sha was pushed. A label a worker re-applies
     becomes the worker's, and a new push makes the owner's label stale.
+
+    A gate-change-approved label approve_gate.py may have applied also needs
+    the owner's newest head record since the label, among the pull request's
+    comments, to name sha. The workflow re-reads the head after it labels, but
+    a run that dies, or an API that fails, before the record or the re-read
+    can leave its label on a head pushed in between.
     """
     if label not in labels:
         return False, f"`{label}` is not on this pull request"
-    history = [e for e in events if e.get("event") in ("labeled", "unlabeled")
-               and ((e.get("label") or {}).get("name") or "").lower() == label]
-    if not history:
+    newest = newest_label_event(label, events)
+    if newest is None:
         return False, f"no labeled event was found for `{label}`"
-    newest = max(history, key=lambda e: (e.get("created_at") or "", e.get("id") or 0))
     actor = (newest.get("actor") or {}).get("login") or "unknown"
     if newest.get("event") != "labeled":
         return False, f"`{label}` was last removed, by @{actor}"
@@ -1568,8 +1652,21 @@ def owner_label(label, labels, events, owner, sha, pushed_at):
     if applied is None or applied <= pushed_at:
         return False, (f"`{label}` was applied by the owner at {newest.get('created_at')}, before {sha[:7]} "
                        f"was pushed at {_stamp(pushed_at)}; the owner re-applies it after reviewing the new commits")
-    return True, (f"`{label}` was applied by the owner @{actor} at {_stamp(applied)}, after {sha[:7]} "
-                  f"was pushed at {_stamp(pushed_at)}")
+    reason = (f"`{label}` was applied by the owner @{actor} at {_stamp(applied)}, after {sha[:7]} "
+              f"was pushed at {_stamp(pushed_at)}")
+    if label != APPROVAL_LABEL or not from_approve_gate(comments, owner, applied):
+        return True, reason
+    record = recorded_head(comments, label, owner, applied)
+    if record is None:
+        return False, (f"`{label}` was applied through `/approve-gate`, but no unedited head record from the owner "
+                       f"was posted at or after it, so it may cover a head pushed while it was applied; the owner "
+                       f"approves {sha[:7]} again")
+    seen, posted = record
+    if seen != sha:
+        return False, (f"`{label}` was applied through `/approve-gate`, but the owner's head record names "
+                       f"{seen[:7]}, not the head {sha[:7]}; the owner approves the head after reviewing it")
+    return True, (f"{reason}, through `/approve-gate`, and the owner's head record posted at {_stamp(posted)} "
+                  f"names {sha[:7]}")
 
 
 class GitHub:
@@ -1758,7 +1855,7 @@ def _target_hits(github, repo, base_ref, sha, server, token):
 def _target_labels(github, repo, number, head, sha, owner):
     """(labels on the PR, {label: (counts, reason)}) for the owner-only labels."""
     labels = {l["name"].lower() for l in github.pages(f"/repos/{repo}/issues/{number}/labels")}
-    events, pushed_at = [], None
+    events, comments, pushed_at = [], [], None
     if labels & set(OWNER_LABELS):
         events = github.pages(f"/repos/{repo}/issues/{number}/events")
         head_repo = (head.get("repo") or {}).get("full_name")
@@ -1766,7 +1863,15 @@ def _target_labels(github, repo, number, head, sha, owner):
         if head_repo:
             activity = github.pages(f"/repos/{head_repo}/activity?ref={urllib.parse.quote(ref, safe='/')}")
             pushed_at = head_pushed_at(activity, ref, sha)
-    return labels, {label: owner_label(label, labels, events, owner, sha, pushed_at) for label in OWNER_LABELS}
+    if APPROVAL_LABEL in labels:
+        comments = github.pages(f"/repos/{repo}/issues/{number}/comments")
+        for _ in range(RECORD_WAIT // RECORD_POLL):
+            if not awaiting_record(events, owner, comments):
+                break
+            time.sleep(RECORD_POLL)
+            comments = github.pages(f"/repos/{repo}/issues/{number}/comments")
+    return labels, {label: owner_label(label, labels, events, owner, sha, pushed_at, comments)
+                    for label in OWNER_LABELS}
 
 
 def judge_pull_request(github, repo, pr, sha, owner, server, token):
