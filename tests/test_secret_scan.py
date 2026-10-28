@@ -344,3 +344,206 @@ def test_non_utf8_financial_filename_is_scanned(repo, monkeypatch, capsys, mode)
     expected = "<redacted-path:" + hashlib.sha256(raw_path).hexdigest() + ">"
     assert {row["rule"] for row in rows} == {"luhn-number", "account-like-number"}
     assert all(row["file"] == expected and row["line"] == 2 for row in rows)
+
+
+SYNTHETIC_REPOSITORY = "synthetic-owner/synthetic-repo"
+GENERIC_ERROR = "secret-scan: configuration or scanner error; scan incomplete\n"
+CARD = "4111" + "1111" * 3
+CARD_PATH = "tests/test_cards.py"
+
+
+def path_hash(path):
+    return hashlib.sha256(path.encode()).hexdigest()
+
+
+def entry(rule, max_count=1, path=CARD_PATH, repository=SYNTHETIC_REPOSITORY, **changes):
+    return {"repository": repository, "path_sha256": path_hash(path), "rule": rule,
+            "max_count": max_count, "reason": "SYNTHETIC deliberate test value", **changes}
+
+
+@pytest.fixture
+def manifest(tmp_path_factory, monkeypatch):
+    """A trusted manifest outside the scanned repository; write None for no file."""
+    path = tmp_path_factory.mktemp("trusted-scanner") / "secret-scan-exemptions.json"
+    monkeypatch.setattr(scan, "EXEMPTIONS", path)
+    monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
+
+    def write(entries):
+        path.write_text(entries if isinstance(entries, str) else json.dumps(entries), encoding="utf-8")
+    return write
+
+
+def financial_run(repo, capsys, *extra):
+    result = scan.main(["--repo-dir", str(repo), "--financial-only", *extra])
+    captured = capsys.readouterr()
+    assert CARD not in captured.out + captured.err, "exempted value must never be logged"
+    assert CARD_PATH not in captured.out + captured.err, "raw path must never be logged"
+    rows = [json.loads(line) for line in captured.out.splitlines()[:-1]]
+    return result, rows, captured
+
+
+def test_exempt_luhn_and_account_findings_pass_without_printing(repo, manifest, capsys):
+    # A Luhn-valid run is always also account-like, so both rules need an entry.
+    commit(repo, CARD_PATH, "value = '" + CARD + "'\n")
+    manifest([entry("luhn-number"), entry("account-like-number")])
+    result, rows, captured = financial_run(repo, capsys, "--repository", SYNTHETIC_REPOSITORY)
+    assert result == 0
+    assert captured.out == "secret-scan: 0 finding(s), 2 exempt\n"
+    assert rows == [] and captured.err == ""
+
+
+def test_exemption_covers_only_its_rule(repo, manifest, capsys):
+    commit(repo, CARD_PATH, "value = '" + CARD + "'\n")
+    manifest([entry("luhn-number")])
+    result, rows, captured = financial_run(repo, capsys, "--repository", SYNTHETIC_REPOSITORY)
+    assert result == 1
+    assert captured.out.splitlines()[-1] == "secret-scan: 1 finding(s), 1 exempt"
+    assert rows == [{"file": "<redacted-path:" + path_hash(CARD_PATH) + ">", "line": 1, "rule": "account-like-number"}]
+
+
+def test_findings_above_max_count_still_fail(repo, manifest, capsys):
+    commit(repo, CARD_PATH, "first = '" + CARD + "'\nsecond = '" + CARD + "'\n")
+    manifest([entry("luhn-number", 1), entry("account-like-number", 2)])
+    result, rows, captured = financial_run(repo, capsys, "--repository", SYNTHETIC_REPOSITORY)
+    assert result == 1
+    assert captured.out.splitlines()[-1] == "secret-scan: 1 finding(s), 3 exempt"
+    assert [row["rule"] for row in rows] == ["luhn-number"]
+
+
+def test_different_rule_in_exempted_file_fails(repo, manifest, capsys):
+    commit(repo, CARD_PATH, "value = '" + CARD + "'\nrouting = '021000021'\n")
+    manifest([entry("luhn-number"), entry("account-like-number")])
+    result, rows, _ = financial_run(repo, capsys, "--repository", SYNTHETIC_REPOSITORY)
+    assert result == 1
+    assert rows == [{"file": "<redacted-path:" + path_hash(CARD_PATH) + ">", "line": 2, "rule": "aba-routing-number"}]
+
+
+def test_entry_for_another_repository_does_not_apply(repo, manifest, capsys):
+    commit(repo, CARD_PATH, "value = '" + CARD + "'\n")
+    manifest([entry("luhn-number"), entry("account-like-number")])
+    result, rows, captured = financial_run(repo, capsys, "--repository", "synthetic-owner/other-repo")
+    assert result == 1
+    assert captured.out.splitlines()[-1] == "secret-scan: 2 finding(s), 0 exempt"
+    assert {row["rule"] for row in rows} == {"luhn-number", "account-like-number"}
+
+
+def test_manifest_inside_scanned_repository_is_ignored(repo, manifest, capsys, monkeypatch):
+    commit(repo, CARD_PATH, "value = '" + CARD + "'\n")
+    commit(repo, "config/secret-scan-exemptions.json", json.dumps([entry("luhn-number"), entry("account-like-number")]))
+    monkeypatch.chdir(repo)
+    manifest([])
+    result, rows, _ = financial_run(repo, capsys, "--repository", SYNTHETIC_REPOSITORY)
+    assert result == 1
+    assert {row["rule"] for row in rows} == {"luhn-number", "account-like-number"}
+
+
+def test_missing_manifest_applies_no_exemptions(repo, manifest, capsys):
+    commit(repo, CARD_PATH, "value = '" + CARD + "'\n")
+    assert not scan.EXEMPTIONS.exists()
+    result, rows, captured = financial_run(repo, capsys, "--repository", SYNTHETIC_REPOSITORY)
+    assert result == 1
+    assert captured.out.splitlines()[-1] == "secret-scan: 2 finding(s), 0 exempt"
+
+
+def test_without_repository_no_exemption_applies(repo, manifest, capsys):
+    # Several deliberate values, as in the financial-planner baseline.
+    commit(repo, CARD_PATH, "".join(f"value{index} = '{CARD}'\n" for index in range(3)) + "routing = '021000021'\n")
+    manifest([entry("luhn-number", 3), entry("account-like-number", 3), entry("aba-routing-number")])
+    result, rows, captured = financial_run(repo, capsys)
+    assert result == 1
+    assert captured.out.splitlines()[-1] == "secret-scan: 7 finding(s), 0 exempt"
+    assert len(rows) == 7
+
+
+def test_repository_defaults_to_github_repository(repo, manifest, capsys, monkeypatch):
+    commit(repo, CARD_PATH, "value = '" + CARD + "'\n")
+    manifest([entry("luhn-number"), entry("account-like-number")])
+    monkeypatch.setenv("GITHUB_REPOSITORY", SYNTHETIC_REPOSITORY)
+    result, _, captured = financial_run(repo, capsys)
+    assert result == 0
+    assert captured.out == "secret-scan: 0 finding(s), 2 exempt\n"
+
+
+@pytest.mark.parametrize("value", ["not-a-repository", "owner/name/extra", "owner/na me"])
+def test_invalid_repository_fails_closed(repo, manifest, capsys, value):
+    commit(repo, CARD_PATH, "value = '" + CARD + "'\n")
+    manifest([])
+    result, _, captured = financial_run(repo, capsys, "--repository", value)
+    assert result == 2
+    assert captured.err == GENERIC_ERROR
+
+
+STALE_OR_INVALID = [
+    pytest.param([entry("luhn-number", path="tests/test_removed.py"), entry("account-like-number")], id="stale-no-file"),
+    pytest.param([entry("luhn-number", 2), entry("account-like-number")], id="stale-fewer-findings"),
+    pytest.param([entry("luhn-number", path="tests/test_clean.py")], id="stale-no-findings"),
+    pytest.param([entry("github-pat")], id="unknown-rule"),
+    pytest.param([entry("luhn-number"), entry("luhn-number", reason="other")], id="duplicate-key"),
+    pytest.param([entry("luhn-number", 0)], id="zero-max-count"),
+    pytest.param([entry("luhn-number", -1)], id="negative-max-count"),
+    pytest.param([entry("luhn-number", 1.0)], id="float-max-count"),
+    pytest.param([entry("luhn-number", True)], id="bool-max-count"),
+    pytest.param([entry("luhn-number", reason="")], id="empty-reason"),
+    pytest.param([entry("luhn-number", reason="  ")], id="blank-reason"),
+    pytest.param([entry("luhn-number", reason=None)], id="non-string-reason"),
+    pytest.param([entry("luhn-number", repository="no-slash")], id="bad-repository"),
+    pytest.param([entry("luhn-number", path_sha256="A" * 64)], id="uppercase-hash"),
+    pytest.param([entry("luhn-number", path_sha256="0" * 63)], id="short-hash"),
+    pytest.param([{key: value for key, value in entry("luhn-number").items() if key != "reason"}], id="missing-field"),
+    pytest.param([entry("luhn-number", note="extra")], id="extra-field"),
+    pytest.param(["luhn-number"], id="non-object-entry"),
+    pytest.param({"entries": []}, id="non-array"),
+    pytest.param("[", id="malformed-json"),
+    pytest.param('[{"rule": "luhn-number", "rule": "luhn-number"}]', id="duplicate-field"),
+]
+
+
+@pytest.mark.parametrize("entries", STALE_OR_INVALID)
+def test_stale_or_invalid_manifest_fails_closed(repo, manifest, capsys, entries):
+    commit(repo, CARD_PATH, "value = '" + CARD + "'\n")
+    commit(repo, "tests/test_clean.py", "# no numbers here\n")
+    manifest(entries)
+    result, rows, captured = financial_run(repo, capsys, "--repository", SYNTHETIC_REPOSITORY)
+    assert result == 2
+    assert captured.err == GENERIC_ERROR
+    assert rows == []
+
+
+def test_invalid_manifest_fails_closed_without_repository(repo, manifest, capsys):
+    commit(repo, CARD_PATH, "value = '" + CARD + "'\n")
+    manifest([entry("github-pat")])
+    result, _, captured = financial_run(repo, capsys)
+    assert result == 2
+    assert captured.err == GENERIC_ERROR
+
+
+def test_stale_entry_for_another_repository_is_not_checked(repo, manifest, capsys):
+    commit(repo, CARD_PATH, "value = '" + CARD + "'\n")
+    manifest([entry("luhn-number", 5, repository="synthetic-owner/other-repo")])
+    result, _, captured = financial_run(repo, capsys, "--repository", SYNTHETIC_REPOSITORY)
+    assert result == 1
+    assert captured.out.splitlines()[-1] == "secret-scan: 2 finding(s), 0 exempt"
+
+
+@pytest.mark.parametrize("mode", [[], ["--financial"]])
+def test_entries_cannot_cover_gitleaks_or_identifier_findings(repo, manifest, capsys, monkeypatch, mode):
+    base = git(repo, "rev-parse", "HEAD")
+    commit(repo, CARD_PATH, "value = '" + CARD + "'\nhost = 'fake-desktop'\n")
+    monkeypatch.setenv("SECRET_SCAN_DENYLIST_SHA256", scan.digest("fake-desktop"))
+    monkeypatch.setattr(scan, "scan_gitleaks", lambda *args: {(CARD_PATH, 1, "github-pat")})
+    entries = [entry("luhn-number"), entry("account-like-number")]
+    manifest(entries + [entry("github-pat"), entry("personal-identifier")] if not mode else entries)
+    monkeypatch.setenv("GITHUB_REPOSITORY", SYNTHETIC_REPOSITORY)
+    result, rows, captured = financial_run(repo, capsys, "--base", base, *mode)
+    assert result == 1
+    assert "fake-desktop" not in captured.out + captured.err
+    assert {(row["line"], row["rule"]) for row in rows} == {(1, "github-pat"), (2, "personal-identifier")}
+    summary = "secret-scan: 2 finding(s), 2 exempt" if mode else "secret-scan: 2 finding(s)"
+    assert captured.out.splitlines()[-1] == summary
+
+
+def test_committed_manifest_is_empty_and_loads():
+    path = ROOT / "config/secret-scan-exemptions.json"
+    assert scan.EXEMPTIONS == path
+    assert json.loads(path.read_text(encoding="utf-8")) == []
+    assert scan.load_exemptions() == []
