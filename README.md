@@ -194,8 +194,33 @@ base: the same head against a new base can bring hits the old base hid.
      GitHub's repository activity record, not from commit dates, which whoever
      makes the commit sets. A push makes the owner's label stale. If GitHub has
      no record of the push, the label doesn't count.
-   - the whole label history was read. A list longer than 30 pages of 100
-     fails the job rather than judge from its oldest part.
+   - for a `gate-change-approved` label the approve-gate workflow may have
+     applied, the owner's head record names the current head (below).
+   - the whole label history, and the whole comment list, was read. A list
+     longer than 30 pages of 100 fails the job rather than judge from its
+     oldest part.
+
+   **A label from `/approve-gate` needs the head record.** The approve-gate
+   workflow (`scripts/approve_gate.py`) applies `gate-change-approved` with
+   the owner's own token, so GitHub records the owner as the label's actor,
+   exactly as for a label the owner applies by hand. It labels, then posts the
+   head record `<!-- owner-label gate-change-approved head=SHA -->`, then reads
+   the head again and removes the label if a push landed meanwhile. A run that
+   dies, or an API outage, between the label and that re-read can leave the
+   label on a head the owner never named: the owner approves A, B is pushed,
+   the label lands after B's push and would date as B's. So the guard treats
+   the owner's newest `gate-change-approved` label as the workflow's when an
+   owner comment no newer than the label is an `/approve-gate` command (edited
+   or not) or the workflow's head record. That label counts only when the
+   owner's newest unedited head record for `gate-change-approved`, posted at
+   or after the label (so after the push), names the exact current head. No
+   record, a record for another SHA, an edited record or someone else's record
+   fails closed; the owner approves the current head again.
+
+   A label the owner applies by hand keeps the rule above, with or without
+   the record `ao owner-label apply` writes. Once the owner has used
+   `/approve-gate` on a pull request, a later hand label there needs that
+   record too. `findings-accepted` has no workflow and keeps the rule above.
 5. Ends the job with the verdict: the job fails when any of them has
    unapproved hits, as `gate-guard.yml` does. It also fails while
    `findings-accepted` is on a pull request but doesn't count, so nothing can
@@ -281,6 +306,13 @@ anything from the pull request:
 - **The owner's identity.** A label applied by the owner login counts, whoever
   was driving it. Owner-identity launches (`AO_WORKER_IDENTITY=owner`) and a
   leaked owner token are outside what this check can see.
+- **Deleted `/approve-gate` comments.** The guard can tell a workflow label
+  from a hand label only by the owner's command and the workflow's record.
+  Anyone with write access to the repository can delete comments, the owner's
+  included, and the API lists no deleted ones. Deleting both turns a workflow
+  label left by a failed run back into a hand label, judged by its time alone.
+  Requiring the head record for every owner label on a pull request, as `ao
+  ready` already does, would close this; that is the owner's decision.
 - **What a diff can't show.** A test made vacuous (`assert True`), a slower
   test, or a weaker assertion is not a hit. The guard looks for removals,
   skips, retries and config edits, not for meaning.

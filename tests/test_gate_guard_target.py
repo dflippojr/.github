@@ -596,8 +596,9 @@ class ApproveGateLabel(unittest.TestCase):
         self.assertFalse(counts)
 
     def test_the_newest_record_decides(self):
-        self.assertFalse(self.verdict([self.command(), self.record(), self.record(self.OTHER, "2026-10-16T13:05:00Z")])[0])
-        self.assertTrue(self.verdict([self.command(), self.record(self.OTHER), self.record(at="2026-10-16T13:05:00Z")])[0])
+        later = "2026-10-16T13:05:00Z"
+        self.assertFalse(self.verdict([self.command(), self.record(), self.record(self.OTHER, later)])[0])
+        self.assertTrue(self.verdict([self.command(), self.record(self.OTHER), self.record(at=later)])[0])
 
     def test_a_record_from_before_the_label_does_not_count(self):
         """A record older than the label covers an earlier approval, not this label."""
@@ -650,7 +651,8 @@ class ApproveGateLabel(unittest.TestCase):
         self.assertTrue(self.verdict([self.command()], label=gate_guard.FINDINGS_LABEL)[0])
 
     def test_a_workflow_label_is_still_dated_against_the_push(self):
-        counts, why = self.verdict([self.command(), self.record()], pushed=gate_guard.parse_time("2026-10-16T13:30:00Z"))
+        pushed = gate_guard.parse_time("2026-10-16T13:30:00Z")
+        counts, why = self.verdict([self.command(), self.record()], pushed=pushed)
         self.assertFalse(counts)
         self.assertIn("re-applies it after reviewing the new commits", why)
 
@@ -716,6 +718,22 @@ class TargetFailures(unittest.TestCase):
             code, body, _ = self.run_target(fake, self.EVENT)
         self.assertEqual(code, 2)
         self.assertIn("could not read the pull request's labels", body["summary"])
+
+    def test_cut_off_comments_fail_closed(self):
+        """A head record or an /approve-gate command past the page limit could change the verdict."""
+        fake = self.github()
+
+        def pages(path):
+            if path.endswith("/comments"):
+                raise gate_guard.IncompleteList(f"{path} has more than {gate_guard.MAX_API_PAGES} pages")
+            return [{"name": gate_guard.APPROVAL_LABEL}] if path.endswith("/labels") else []
+
+        fake.pages.side_effect = pages
+        with mock.patch.object(gate_guard, "fetch_diff", return_value=("", None)):
+            code, body, _ = self.run_target(fake, self.EVENT)
+        self.assertEqual(code, 2)
+        self.assertIn("could not read the pull request's labels", body["summary"])
+        self.assertIn("/comments has more than", body["summary"])
 
     def test_deleted_fork_cannot_date_the_label(self):
         fake = self.github()
