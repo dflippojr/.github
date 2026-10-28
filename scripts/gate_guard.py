@@ -36,11 +36,14 @@ one notice annotation states the verdict for pr_body_lint.py.
     python3 gate_guard.py --pull-request-target --guard-sha "$GUARD_SHA"
 """
 import argparse
+import ast
 import base64
 import bisect
 import collections
 import configparser
 import datetime
+import difflib
+import io
 import json
 import os
 import posixpath
@@ -50,9 +53,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tokenize
 import urllib.error
 import urllib.parse
 import urllib.request
+import warnings
 
 APPROVAL_LABEL = "gate-change-approved"
 FINDINGS_LABEL = "findings-accepted"
@@ -545,7 +550,13 @@ def removed_test_hits(files):
 # what they include. Anything else is a hit, whatever its content:
 #
 #   - a change to any platformio.ini (skip-marker, see platformio_hits);
-#   - a change to any file in or under a test directory, in either tree;
+#   - a change to any file in or under a test directory, in either tree,
+#     except a Python file in a test directory that holds no C/C++ source or
+#     header in either tree (a Python backend's tests/), when its change only
+#     replaces compared literals and comparison operators in assert statements
+#     of its existing tests (issue #40, see _python_unexempt). The guard does
+#     not model what pytest collects or skips, so any other change to such a
+#     file is a hit;
 #   - an added, deleted or renamed C/C++ source or header anywhere, or a
 #     changed submodule;
 #   - every pull request, when a platformio.ini names extra_configs or test_dir
@@ -562,6 +573,330 @@ def _at_test_dir(path):
     return any(d in TEST_DIRS for d in path.lower().split("/"))
 
 
+def _test_root(path):
+    """The outermost test directory path is in, lower-cased, or None."""
+    parts = path.lower().split("/")[:-1]
+    return next(("/".join(parts[:i + 1]) for i, d in enumerate(parts) if d in TEST_DIRS), None)
+
+
+def _python_test(path, facts):
+    """Whether path is a Python file outside test directories, or in one that holds no C/C++ source or header."""
+    return _ext(path) in PY_EXTS and _test_root(path) not in facts.c_test_roots
+
+
+# A source encoding declaration (PEP 263). The guard reads a file as UTF-8, so a
+# file that may declare another, on any line, is not exempt.
+PY_CODING = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
+# What a changed line may hold: printable ASCII. Python reads some other letters
+# as ASCII ones, and tabs and form feeds as indentation.
+PY_PRINTABLE = re.compile(r"[ -~]*")
+PY_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
+# The nodes ast.parse gives a literal, by name: Constant from Python 3.8; Num,
+# Str, Bytes, NameConstant and Ellipsis on 3.7, which 3.14 no longer has.
+PY_LITERALS = frozenset(("Constant", "Num", "Str", "Bytes", "NameConstant", "Ellipsis"))
+# Nodes a changed assertion may not hold, by name: they decide whether or how
+# often its other code runs (and, or, a conditional, a comprehension, a
+# lambda), bind a name (:=), suspend the test, or unpack an iterable.
+PY_UNSAFE = frozenset(("BoolOp", "IfExp", "ListComp", "SetComp", "DictComp", "GeneratorExp", "Lambda", "NamedExpr",
+                       "Await", "Yield", "YieldFrom", "Starred"))
+# pytest.approx(expected, rel, abs): the arguments an exempt change may give another literal.
+PY_TOLERANCES = ("rel", "abs")
+
+
+def _py_chain(node):
+    """node as a dotted name, such as os.path.join, or None when it is not one."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    return ".".join([node.id] + parts[::-1]) if isinstance(node, ast.Name) else None
+
+
+def _py_marks_only(node):
+    """Whether every decorator of node is a pytest mark, which leaves it collected."""
+    return all((_py_chain(d.func if isinstance(d, ast.Call) else d) or "").startswith(("pytest.mark.", "mark."))
+               for d in node.decorator_list)
+
+
+def _python_tests(tree):
+    """The tests pytest collects from a module, by name: top-level test_ functions, and test_ methods of
+    top-level Test classes that have no constructor, with no decorator but pytest marks."""
+    tests = []
+    for node in tree.body:
+        if isinstance(node, PY_DEFS) and node.name.startswith("test_") and _py_marks_only(node):
+            tests.append(node)
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test") and _py_marks_only(node):
+            methods = [n for n in node.body if isinstance(n, PY_DEFS) and n.name.startswith("test_")
+                       and _py_marks_only(n)]
+            rest = [n for n in node.body if n not in methods]
+            if not any(getattr(n, "name", getattr(n, "id", None)) in ("__init__", "__new__")
+                       for statement in rest for n in ast.walk(statement)):
+                tests += methods
+    return tests
+
+
+def _py_coding(lines):
+    """The encoding a line of lines declares that is not UTF-8, or None."""
+    names = (m.group(1) for m in map(PY_CODING.match, lines) if m)
+    return next((n for n in names if n.lower().replace("_", "-") not in ("utf-8", "utf8")), None)
+
+
+def _py_start(node):
+    """A statement's first line: its first decorator's, if it has any (Python 3.7 gives that line, later
+    versions the def or class line)."""
+    return min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+
+
+def _py_body_lines(tree, tests, lines):
+    """The numbers of the lines of lines, the text of tree, inside the body of one of tests.
+
+    A test reaches from its first line to the line before the next statement
+    outside it. Its body's lines are those indented deeper than its def, and
+    blank lines between two of them: indentation, not the line numbers of the
+    body's statements, which Python 3.7 gives as a multi-line string's last.
+    """
+    statements = [n for n in ast.walk(tree) if isinstance(n, ast.stmt)]
+    inside = set()
+    for test in tests:
+        own, start = set(ast.walk(test)), _py_start(test)
+        end = min((_py_start(n) for n in statements if n not in own and _py_start(n) > start),
+                  default=len(lines) + 1)
+        deeper = [i for i in range(start, end) if lines[i - 1].strip(" \t\f")
+                  and len(lines[i - 1]) - len(lines[i - 1].lstrip(" \t\f")) > test.col_offset]
+        if deeper:
+            inside.update(i for i in range(deeper[0], deeper[-1] + 1)
+                          if i in deeper or not lines[i - 1].strip(" \t\f"))
+    return inside
+
+
+def _py_binds_here(node):
+    """The names node itself binds or declares, not those of the nodes inside it, with '*' for a wildcard import."""
+    if isinstance(node, ast.Name):
+        return set() if isinstance(node.ctx, ast.Load) else {node.id}
+    if isinstance(node, ast.arg):
+        return {node.arg}
+    if isinstance(node, ast.alias):
+        return {(node.asname or node.name).split(".")[0]}
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return set(node.names)
+    return {v for f, v in ast.iter_fields(node) if f in ("name", "rest") and isinstance(v, str)}
+
+
+def _py_pytest(tree):
+    """Whether pytest in tree is the pytest module: one top-level import pytest is all that binds or declares
+    the name, nothing assigns or deletes an attribute of it, and no wildcard import may rebind it."""
+    imports = [a for n in tree.body if isinstance(n, ast.Import)
+               for a in n.names if a.name == "pytest" and not a.asname]
+    for n in ast.walk(tree):
+        if n not in imports and {"pytest", "*"} & _py_binds_here(n):
+            return False
+        if (isinstance(n, ast.Attribute) and not isinstance(n.ctx, ast.Load)
+                and (_py_chain(n) or "").startswith("pytest.")):
+            return False
+    return len(imports) == 1
+
+
+def _py_text(node):
+    """Whether node is a string literal."""
+    return type(node).__name__ == "Str" or (type(node).__name__ == "Constant" and isinstance(node.value, str))
+
+
+def _py_number(node):
+    """Whether node is an int or float literal, not a bool or a complex number (Num on Python 3.7)."""
+    if type(node).__name__ not in ("Constant", "Num"):
+        return False
+    return type(node.value if hasattr(node, "value") else node.n) in (int, float)
+
+
+def _py_leaves(node):
+    """The ids of the literals in node, a literal (see _py_masks), or None when it is not one.
+
+    A container's own node is not one of them, so its kind and length stay
+    compared; a minus on an int or float counts as part of the literal, so 5
+    may become -5, but no other unary operator or operand does.
+    """
+    if type(node).__name__ in PY_LITERALS:
+        return {id(node)}
+    if isinstance(node, ast.UnaryOp):
+        return {id(node)} if isinstance(node.op, ast.USub) and _py_number(node.operand) else None
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        parts = node.elts
+    elif isinstance(node, ast.Dict):
+        parts = node.keys + node.values
+    else:
+        return None
+    leaves = [_py_leaves(p) if p is not None else None for p in parts]
+    return None if None in leaves else set().union(*leaves)
+
+
+def _py_masks(node, approx):
+    """The ids of the nodes of the assert statement node an exempt change may give other literals.
+
+    They are its message if that is a string, and, where its test is a
+    comparison, the literals of each literal operand (a constant, a negated
+    number, or a list, tuple, set or dict of literals) and, when approx says
+    pytest is the pytest module, those of a pytest.approx operand's expected
+    value and its rel and abs.
+    """
+    masked = {id(node.msg)} if node.msg is not None and _py_text(node.msg) else set()
+    if not isinstance(node.test, ast.Compare):
+        return masked
+    for operand in [node.test.left] + node.test.comparators:
+        literal = [operand]
+        if approx and isinstance(operand, ast.Call) and _py_chain(operand.func) == "pytest.approx":
+            literal = operand.args[:3] + [k.value for k in operand.keywords if k.arg in PY_TOLERANCES]
+        for part in literal:
+            masked |= _py_leaves(part) or set()
+    return masked
+
+
+def _py_masked(node, masked):
+    """node as text without line numbers, with each node whose id is in masked, and each comparison
+    operator, as a placeholder."""
+    if isinstance(node, list):
+        return "[" + ", ".join(_py_masked(n, masked) for n in node) + "]"
+    if id(node) in masked:
+        return "<literal>"
+    if isinstance(node, ast.cmpop):
+        return "<comparison>"
+    if not isinstance(node, ast.AST):
+        return repr(node)
+    return f"{type(node).__name__}({', '.join(f'{f}={_py_masked(v, masked)}' for f, v in ast.iter_fields(node))})"
+
+
+def _py_assert_change(old, new, name, approx):
+    """Why changing the assert statement old of the test name to new is more than replacing its compared
+    literals, comparison operators and pytest.approx tolerances, or None."""
+    for node in (old, new):
+        if any(type(n).__name__ in PY_UNSAFE for n in ast.walk(node)):
+            return (f"it changes an assertion in {name} that holds an and, or, a conditional expression, a "
+                    "comprehension, a lambda, :=, await, yield or a starred item, which decide what else it runs")
+        if node.msg is not None and not _py_text(node.msg):
+            return (f"it changes an assertion in {name} whose message is not a plain string; the message runs only "
+                    "when the assertion fails")
+        test = node.test
+        if isinstance(test, ast.Compare) and len(test.ops) > 1 and not all(
+                isinstance(o, ast.Name) or _py_leaves(o) for o in [test.left] + test.comparators):
+            return (f"it changes a chained comparison in {name} with an operand that is not a name or a literal, "
+                    "which runs only while the links before it hold")
+    if _py_masked(old, _py_masks(old, approx)) != _py_masked(new, _py_masks(new, approx)):
+        rebound = "" if approx or "pytest.approx" not in {_py_chain(n) for n in ast.walk(new)} else (
+            "; pytest.approx counts only where a top-level import pytest is all that binds pytest")
+        return (f"it changes an assertion in {name} outside a comparison's literal operands, its operators and a "
+                f"pytest.approx tolerance: a name, an attribute, a call or its argument, or the expression's "
+                f"shape{rebound}")
+    return None
+
+
+def _python_test_change(old, new, approx):
+    """Why changing the test old to new is more than replacing assert statements of its own body, each by one
+    that differs only in compared literals, comparison operators and pytest.approx tolerances, or None."""
+    dumps = [[ast.dump(s) for s in test.body] for test in (old, new)]
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, *dumps, autojunk=False).get_opcodes():
+        if op == "equal":
+            continue
+        if i2 - i1 != j2 - j1:
+            return f"it adds, removes or moves a statement in {new.name}"
+        for a, b in zip(old.body[i1:i2], new.body[j1:j2]):
+            if not (isinstance(a, ast.Assert) and isinstance(b, ast.Assert)):
+                return (f"it changes a statement of {new.name} that is not an assert statement of a test's own "
+                        "body: a plain statement, a docstring, or an if, for, while, with or try, even around an "
+                        "assert")
+            why = _py_assert_change(a, b, new.name, approx)
+            if why:
+                return why
+    return None
+
+
+def _py_logical_lines(text):
+    """{line number: (first, last)} of each line of text in a logical line, which blank and comment lines
+    are not."""
+    found, first = {}, None
+    for token in tokenize.generate_tokens(io.StringIO(text).readline):
+        if token.type in (tokenize.COMMENT, tokenize.NL, tokenize.INDENT, tokenize.DEDENT, tokenize.ENDMARKER):
+            continue
+        first = token.start[0] if first is None else first
+        if token.type == tokenize.NEWLINE:
+            found.update((i, (first, token.end[0])) for i in range(first, token.end[0] + 1))
+            first = None
+    return found
+
+
+def _py_line_change(tree, tests, text, changed):
+    """Why changed, the numbers of the changed lines of text, parsed as tree with its tests, are more than the
+    lines of assert statements of the tests' own bodies and comments and blank lines inside them, or None."""
+    lines, logical = text.split("\n")[:-1], _py_logical_lines(text)
+    asserts = {s.lineno for test in tests for s in test.body if isinstance(s, ast.Assert)}
+    starts = collections.Counter(n.lineno for n in ast.walk(tree) if isinstance(n, ast.stmt))
+    bodies = _py_body_lines(tree, tests, lines)
+    for i in sorted(changed):
+        if i not in logical:
+            if i not in bodies:
+                return "it changes a comment or a blank line outside a test body"
+            continue
+        first, last = logical[i]
+        if first not in asserts:
+            return "it changes a line outside an assert statement of a test's own body"
+        if sum(starts[j] for j in range(first, last + 1)) != 1:
+            return "an assert statement it changes shares its line with other code"
+    return None
+
+
+def _python_unexempt(fd):
+    """Why fd, a Python file in a Python test directory of a C/C++ repository, is not exempt, or None.
+
+    Issue #40, the owner's assert-only rule: only an edit in place of a
+    test_*.py or *_test.py module that replaces assert statements of its
+    existing tests' own bodies is exempt, each new assert the removed one
+    with only its compared literals, comparison operators and pytest.approx
+    tolerances changed (_python_test_change). Every other line of the file
+    stays as it was, but for comments and blank lines inside a test body.
+    Every changed line holds only printable ASCII, and the file must be
+    UTF-8 as Python reads it, so the text the guard compares is the code
+    Python runs.
+    """
+    if not is_test_module(fd.path):
+        return "it is not a test_*.py or *_test.py module (a conftest.py or a helper can change any test)"
+    if fd.status != "modified" or fd.mode_changed:
+        return "only an edit in place can be exempt, not a rename, an addition, a deletion or a mode change"
+    sides = _whole_sides(fd)
+    if sides is None:
+        return "the diff does not show the whole file"
+    if any("\r" in text for text in sides):
+        return ("it holds a carriage return inside a line, which Python reads as a line break and git does not, "
+                "so the guard cannot tell which lines are inside a test")
+    coding = _py_coding(sides[0].split("\n") + sides[1].split("\n"))
+    if coding:
+        return f"it declares the source encoding {coding}; the guard reads only UTF-8"
+    if not all(PY_PRINTABLE.fullmatch(l.text) for l in fd.lines if l.kind != " "):
+        return ("a changed line holds a character that is not printable ASCII, such as a tab, a form feed or a "
+                "letter Python reads as an ASCII one")
+    texts = [text.lstrip("﻿") for text in sides]
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            trees = [ast.parse(text) for text in texts]
+            for text in texts:
+                _py_logical_lines(text)
+    except (SyntaxError, ValueError, tokenize.TokenError):
+        return "the guard cannot parse it"
+    tests, skeletons = [_python_tests(tree) for tree in trees], []
+    for tree, side in zip(trees, tests):
+        bodies = [t.body for t in side]
+        for t in side:
+            t.body = []
+        skeletons.append(ast.dump(tree))
+        for t, body in zip(side, bodies):
+            t.body = body
+    if skeletons[0] != skeletons[1]:
+        return ("it changes code outside a test body: a def or class line, a decorator, an import, or module- or "
+                "class-level code")
+    approx = all(_py_pytest(tree) for tree in trees)
+    why = next(filter(None, (_python_test_change(old, new, approx) for old, new in zip(*tests))), None)
+    changed = [{l.old for l in fd.lines if l.kind == "-"}, {l.new for l in fd.lines if l.kind == "+"}]
+    return why or next(filter(None, map(_py_line_change, trees, tests, texts, changed)), None)
+
+
 def c_cpp_hits(files, facts, flagged):
     """removed-tests hits for a C/C++ repository's changes that may change which tests run or what they include.
 
@@ -576,7 +911,15 @@ def c_cpp_hits(files, facts, flagged):
         if not _touched(fd) or fd.path in flagged or fd.path in facts.blind:
             continue
         if any(_at_test_dir(p) for p in fd.paths):
-            detail = f"{fd.status} a file in a test directory of a C/C++ repository"
+            if not all(_python_test(p, facts) for p in fd.paths):
+                detail = f"{fd.status} a file in a test directory of a C/C++ repository"
+            else:
+                why = _python_unexempt(fd)
+                if why:
+                    hits.append(Hit("removed-tests", fd.path, None, f"{fd.status} a Python test file of a C/C++ "
+                                    f"repository: {why}; only replacing compared literals or comparison operators in "
+                                    "assert statements of existing tests is exempt, so this needs approval"))
+                continue
         elif fd.modes & {"160000"}:
             detail = f"{fd.status} a submodule of a C/C++ repository, which may hold sources or headers"
         elif fd.status != "modified" and any(_ext(p) in C_FILE_EXTS for p in fd.paths):
@@ -988,9 +1331,12 @@ class GitTrees:
 # c_cpp: whether either tree has a platformio.ini or a C/C++ source or header;
 # open_configs: [(platformio.ini, why)] for those that name extra_configs or
 # test_dir, or that cannot be read; blind: symbolic links and submodules at or
-# in a test directory, in a C/C++ repository.
-TreeFacts = collections.namedtuple("TreeFacts", "c_cpp open_configs blind")
+# in a test directory, in a C/C++ repository; c_test_roots: the outermost test
+# directories (see _test_root) that hold a C/C++ source or header in either
+# tree, counting any file with no extension but git's own.
+TreeFacts = collections.namedtuple("TreeFacts", "c_cpp open_configs blind c_test_roots")
 PIO_OPEN_OPTION = re.compile(r"extra_configs|test_dir", re.IGNORECASE)
+GIT_FILES = {".gitignore", ".gitattributes", ".gitkeep", ".keep"}
 
 
 def tree_facts(trees):
@@ -1010,7 +1356,8 @@ def tree_facts(trees):
             open_configs[path] = f"names {' and '.join(sorted({m.lower() for m in PIO_OPEN_OPTION.findall(text)}))}"
     links = dict.fromkeys(link for side in ("-", "+") for link in trees.links(side))
     blind = [link for link in links if _at_test_dir(link)] if c_cpp else []
-    return TreeFacts(c_cpp, sorted(open_configs.items()), blind)
+    c_test_roots = {_test_root(p) for _, p in paths if _ext(p) in C_FILE_EXTS and _name(p) not in GIT_FILES} - {None}
+    return TreeFacts(c_cpp, sorted(open_configs.items()), blind, c_test_roots)
 
 
 def repo_hits(repo_dir, base, head):

@@ -47,7 +47,38 @@ whatever the change:
   `test_*` or `extends` option it changes, when the guard can read both sides);
 - any change to a file in or under a test directory (`test`, `tests`,
   `__tests__`, `e2e`, `spec`, `specs`), in either tree, whatever its extension
-  (`removed-tests`);
+  (`removed-tests`), except a Python file in a test directory whose outermost
+  test directory holds no C/C++ source or header in either tree (a file with no
+  extension counts, except `.gitignore`, `.gitattributes`, `.gitkeep` and
+  `.keep`), as in a Python backend's `backend/tests`. Such a file is exempt
+  only when its change edits a `test_*.py` or `*_test.py` module in place and
+  does nothing but replace `assert` statements of its existing tests' own
+  bodies (top-level `test_` functions, and `test_` methods of top-level `Test`
+  classes with no constructor, with no decorator but pytest marks), each new
+  `assert` the one it replaces with only these changed: a comparison's literal
+  operands (a constant, an int or float constant with a minus sign, such as
+  `-1` or `-0.5`, or a list, tuple, set or dict of literals of the same
+  shape; any other unary operator or operand, such as `-None`, `+1`, `~1` or
+  `not 1`, is a changed shape), its operators (`==`, `!=`, `<`, `<=`, `>`,
+  `>=`, `is`, `is not`, `in`, `not in`), a plain-string message, and a
+  `pytest.approx` operand's expected value, `rel` and `abs`, where one
+  top-level `import pytest` is all that binds `pytest`. So that a change can
+  alter only what is compared, never what runs, a changed `assert` may hold no
+  `and`, `or`, conditional expression, comprehension, lambda, `:=`, `await`,
+  `yield` or starred item, no message but a plain string, and no chained
+  comparison with an operand other than a name or a literal. Any other change
+  is a hit: an `assert` added, removed or moved, a name, attribute, call or
+  argument changed, any statement that is not an `assert` of the test's own
+  body (a plain statement, a docstring, or an `if`, `for`, `while`, `with` or
+  `try`, even around an `assert`), an `assert` that shares its line with other
+  code, code outside a test body, a comment or blank line outside a test body,
+  a `conftest.py` or helper, a rename, addition or deletion, a tab, a form feed
+  or a non-ASCII character in a changed line, and any change to a file that
+  declares a source encoding other than UTF-8 or holds a carriage return inside
+  a line. The guard does not follow the code a comparison reaches (an
+  object's `__eq__`, a `conftest.py` hook), so an exempt change can still give
+  code already in the file or its imports other values to compare. Removed
+  tests and new skips are hits as in any repository;
 - an added, deleted or renamed C/C++ source or header anywhere, including
   `.c++`, `.cp`, `.h++`, `.tpp`, `.tcc`, `.inl`, `.ino`, `.pde`, `.s` and files
   with no extension, which can shadow or drop an include; and any changed

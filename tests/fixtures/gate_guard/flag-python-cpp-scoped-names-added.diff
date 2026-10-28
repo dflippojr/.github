@@ -1,0 +1,24 @@
+# gate-guard fixture: in a C/C++ repository, lambdas and comprehensions added to a Python test, even ones that use only names the test had
+# expect: removed-tests
+# hits: 1
+# detail: adds, removes or moves a statement
+
+diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
+--- a/firmware/src/logic.cpp
++++ b/firmware/src/logic.cpp
+@@ -1 +1 @@
+-int limit = 120;
++int limit = 125;
+diff --git a/backend/tests/test_environment.py b/backend/tests/test_environment.py
+--- a/backend/tests/test_environment.py
++++ b/backend/tests/test_environment.py
+@@ -1,5 +1,9 @@
+ import os
+ 
+ 
+ def test_environment():
+     assert os.environ is not None
++    assert (lambda value=os.environ: value)() is os.environ
++    assert (lambda value: value)(os.environ) is os.environ
++    assert [k for k, (v, *rest) in [(1, (2, 3))] if v and rest] == [1]
++    assert {k: v for k, v in [(1, 2)]} == {1: 2}

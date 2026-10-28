@@ -1,0 +1,36 @@
+# gate-guard fixture: in a C/C++ repository, PR #41 review 3: the constant a skip condition reads through a second binding flipped
+# expect: removed-tests
+# hits: 1
+# detail: outside a test body
+
+diff --git a/backend/tests/test_api.py b/backend/tests/test_api.py
+index 0a67c4c..77812cf 100644
+--- a/backend/tests/test_api.py
++++ b/backend/tests/test_api.py
+@@ -1,16 +1,16 @@
+ import pytest
+ from backend.app import create_app
+ 
+ 
+ def test_health():
+     assert create_app()
+ 
+ 
+-SWITCH = False
++SWITCH = True
+ LATER = SWITCH
+ 
+ 
+ def test_height_limits():
+     if LATER:
+         pytest.skip("later")
+     assert create_app().max_height == 120
+diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
+index b384dce..3925a03 100644
+--- a/firmware/src/logic.cpp
++++ b/firmware/src/logic.cpp
+@@ -1,3 +1,3 @@
+ int clamp(int v, int lo, int hi) {
+-  return v < lo ? lo : v;
++  return v < lo ? lo : (v > hi ? hi : v);
+ }

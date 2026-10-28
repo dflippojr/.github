@@ -1,0 +1,23 @@
+# gate-guard fixture: a test whose for assigns to an attribute binds no name there; the guard does not follow it, so any change to the test is a hit
+# expect: removed-tests
+# hits: 1
+# detail: not an assert statement of a test's own body
+
+diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
+--- a/firmware/src/logic.cpp
++++ b/firmware/src/logic.cpp
+@@ -1 +1 @@
+-int limit = 120;
++int limit = 125;
+diff --git a/backend/tests/test_environment.py b/backend/tests/test_environment.py
+--- a/backend/tests/test_environment.py
++++ b/backend/tests/test_environment.py
+@@ -1,7 +1,7 @@
+ import os
+ 
+ 
+ def test_environment():
+     assert os.environ is not None
+     for os.review_probe in [None]:
+-        assert True
++        assert os.environ is not None

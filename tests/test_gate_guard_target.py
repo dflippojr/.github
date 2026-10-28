@@ -106,7 +106,10 @@ def commit_tree(root, files, message):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(text.encode("utf-8"))
     git(root, "add", "-A")
-    git(root, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", message, "--allow-empty")
+    # No auto maintenance: git commit starts it detached, and it can write to .git/objects while the caller's
+    # temporary directory is removed.
+    git(root, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "maintenance.auto=false", "commit", "-qm",
+        message, "--allow-empty")
     return git(root, "rev-parse", "HEAD")
 
 
