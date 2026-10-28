@@ -115,7 +115,7 @@ entry is an object with exactly these fields:
 | `repository` | `owner/name` of the caller |
 | `path_sha256` | The 64 lowercase hex characters inside `<redacted-path:…>` |
 | `rule` | `luhn-number`, `aba-routing-number`, `account-like-number` or `missing-synthetic-header` |
-| `max_count` | A positive integer: how many findings of that rule the file may have |
+| `max_count` | A positive integer: how many matching values of that rule the file may have |
 | `reason` | Why the values are deliberate synthetic test data |
 
 ```json
@@ -132,18 +132,20 @@ entry is an object with exactly these fields:
 
 Only entries whose `repository` matches `--repository` apply. It defaults to
 `GITHUB_REPOSITORY`, which in a reusable workflow names the caller. With neither
-set, no exemption applies. When the financial scan runs, the scanner drops up to
-`max_count` matching financial findings per entry; findings above the count,
-under another rule, and every gitleaks or identifier finding still fail.
-Exempt findings are never printed, and the summary becomes
-`secret-scan: N finding(s), M exempt`, where N counts only failing findings.
+set, no exemption applies. When the financial scan runs, the scanner exempts up
+to `max_count` matching values per entry. It counts every matching value, so
+two card numbers on one line spend two. Values above the count, values under
+another rule, and every gitleaks or identifier finding still fail. A line keeps
+its finding row while any of its values is unexempted. Exempt values are never
+printed, and the summary becomes `secret-scan: N finding(s), M exempt`, where N
+counts failing rows and M counts exempted values.
 
 The scan fails closed with exit 2 when the manifest is malformed (not a JSON
 array, missing or extra fields, a duplicate field, an unknown rule, a bad
 `repository` or `path_sha256`, a `max_count` that isn't a positive integer, an
 empty `reason`), when two entries share a (repository, path_sha256, rule) key,
 or when an entry for the scanned repository is stale: its file has fewer
-findings under that rule at head than `max_count`, including a file with no
+matching values under that rule at head than `max_count`, including a file with no
 findings or no file at all. Lower or remove the entry when the values go away.
 A missing manifest file applies no exemptions, so findings still fail.
 
