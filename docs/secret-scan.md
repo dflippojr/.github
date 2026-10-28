@@ -66,8 +66,9 @@ No PR code is checked out or executed. There are no submodules, LFS downloads,
 build scripts, hooks, textconv or external diff drivers from the PR. Gitleaks
 uses its trusted built-in rules, ignores inline `gitleaks:allow` comments and
 reads the bare object database, so PR `.gitleaksignore` and `.gitleaks.toml`
-files cannot suppress results. Local repository allowlists are deliberately
-unsupported. The token only has `contents: read` and is passed to Git via its
+files cannot suppress results. The scanned repository cannot allowlist
+anything; the only exemptions are reviewed entries in this repository's
+financial exemption manifest (see below). The token only has `contents: read` and is passed to Git via its
 environment, never a command-line argument or saved credential.
 
 Gitleaks stdout/stderr and its temporary report are never logged or uploaded.
@@ -96,13 +97,73 @@ It reports Luhn-valid 13–19 digit runs, ABA-checksum-valid nine-digit runs,
 and any account-like run of ten or more digits. Spaces and hyphens within a
 number are supported. These are checksum checks, not issuer/account validation:
 even all-zero numbers with valid checksums are flagged. A marker is mandatory provenance,
-**not an exemption**: synthetic examples with valid checksums still fail.
-An invalid Luhn checksum can still match the independent account rule.
+**not an exemption**: synthetic examples with valid checksums still fail unless a
+reviewed manifest entry covers them. An invalid Luhn checksum can still match the
+independent account rule, and every Luhn-valid number is also account-like, so
+exempting one needs an entry for each rule.
+
+### Reviewed exemptions
+
+`config/secret-scan-exemptions.json` in this repository holds the only
+exemptions. The scanner reads it from its own checkout
+(`<script dir>/../config/secret-scan-exemptions.json`), never from the scanned
+repository, and no CLI flag picks another file. It is committed as `[]`. Each
+entry is an object with exactly these fields:
+
+| Field | Value |
+| --- | --- |
+| `repository` | `owner/name` of the caller |
+| `path_sha256` | The 64 lowercase hex characters inside `<redacted-path:…>` |
+| `rule` | `luhn-number`, `aba-routing-number`, `account-like-number` or `missing-synthetic-header` |
+| `max_count` | A positive integer: how many findings of that rule the file may have |
+| `reason` | Why the values are deliberate synthetic test data |
+
+```json
+[
+  {
+    "repository": "owner/name",
+    "path_sha256": "<64 lowercase hex>",
+    "rule": "luhn-number",
+    "max_count": 2,
+    "reason": "Masking test needs a card-shaped synthetic value"
+  }
+]
+```
+
+Only entries whose `repository` matches `--repository` apply. It defaults to
+`GITHUB_REPOSITORY`, which in a reusable workflow names the caller. With neither
+set, no exemption applies. When the financial scan runs, the scanner drops up to
+`max_count` matching financial findings per entry; findings above the count,
+under another rule, and every gitleaks or identifier finding still fail.
+Exempt findings are never printed, and the summary becomes
+`secret-scan: N finding(s), M exempt`, where N counts only failing findings.
+
+The scan fails closed with exit 2 when the manifest is malformed (not a JSON
+array, missing or extra fields, a duplicate field, an unknown rule, a bad
+`repository` or `path_sha256`, a `max_count` that isn't a positive integer, an
+empty `reason`), when two entries share a (repository, path_sha256, rule) key,
+or when an entry for the scanned repository is stale: its file has fewer
+findings under that rule at head than `max_count`, including a file with no
+findings or no file at all. Lower or remove the entry when the values go away.
+A missing manifest file applies no exemptions, so findings still fail.
+
+Compute `path_sha256` privately in a trusted checkout of the caller:
+
+```sh
+printf %s "<repo-relative path>" | sha256sum
+```
+
+Don't publish the mapping from path to hash. Every exemption is reviewed in a
+pull request to this repository, followed by a caller `scanner-ref` bump to
+the merged commit. The scanned pull request can't change either. The trusted
+scanner checkout in `.github/workflows/secret-scan.yml` must include
+`config/secret-scan-exemptions.json` in its sparse-checkout list; without it,
+CI applies no exemptions and fails closed.
 
 Run the content scan independently against an existing checkout or bare clone:
 
 ```sh
-python scripts/secret_scan.py --repo-dir ../financial-planner --head origin/main --financial-only
+python scripts/secret_scan.py --repo-dir ../financial-planner --head origin/main --financial-only --repository dflippojr/financial-planner
 ```
 
 Existing findings require financial-planner remediation; this change neither

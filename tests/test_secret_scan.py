@@ -373,8 +373,8 @@ def manifest(tmp_path_factory, monkeypatch):
     return write
 
 
-def financial_run(repo, capsys, *extra):
-    result = scan.main(["--repo-dir", str(repo), "--financial-only", *extra])
+def financial_run(repo, capsys, *extra, mode="--financial-only"):
+    result = scan.main(["--repo-dir", str(repo), *([mode] if mode else []), *extra])
     captured = capsys.readouterr()
     assert CARD not in captured.out + captured.err, "exempted value must never be logged"
     assert CARD_PATH not in captured.out + captured.err, "raw path must never be logged"
@@ -525,7 +525,7 @@ def test_stale_entry_for_another_repository_is_not_checked(repo, manifest, capsy
     assert captured.out.splitlines()[-1] == "secret-scan: 2 finding(s), 0 exempt"
 
 
-@pytest.mark.parametrize("mode", [[], ["--financial"]])
+@pytest.mark.parametrize("mode", [None, "--financial"])
 def test_entries_cannot_cover_gitleaks_or_identifier_findings(repo, manifest, capsys, monkeypatch, mode):
     base = git(repo, "rev-parse", "HEAD")
     commit(repo, CARD_PATH, "value = '" + CARD + "'\nhost = 'fake-desktop'\n")
@@ -534,7 +534,7 @@ def test_entries_cannot_cover_gitleaks_or_identifier_findings(repo, manifest, ca
     entries = [entry("luhn-number"), entry("account-like-number")]
     manifest(entries + [entry("github-pat"), entry("personal-identifier")] if not mode else entries)
     monkeypatch.setenv("GITHUB_REPOSITORY", SYNTHETIC_REPOSITORY)
-    result, rows, captured = financial_run(repo, capsys, "--base", base, *mode)
+    result, rows, captured = financial_run(repo, capsys, "--base", base, mode=mode)
     assert result == 1
     assert "fake-desktop" not in captured.out + captured.err
     assert {(row["line"], row["rule"]) for row in rows} == {(1, "github-pat"), (2, "personal-identifier")}
