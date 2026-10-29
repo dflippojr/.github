@@ -7,7 +7,10 @@ Reads the pull request's unified diff and reports each hit:
     skip-marker    a new skip, focus or expected-failure marker
     retry          a new or raised retry or rerun setting
     gate-config    an edit to workflows, Sonar or coverage config, a lint
-                   rule disabled, or a size or performance budget raised
+                   rule disabled, or a size or performance budget raised;
+                   outside workflows, a coverage-config edit that only raises
+                   floors, or adds a floor line, is not a hit
+    floor-lowered  a coverage floor lowered or removed (see _floor_review)
 
 Moved lines are not hits: a test renamed or moved to another file, or a skip
 marker that moves with its test, cancels out. A repository with a
@@ -1220,11 +1223,312 @@ def _budget_hits(fd):
     return hits
 
 
+# ------------------------------------------------------------- coverage floors
+#
+# A floor is a number a coverage tool fails below. Each side of a file is read
+# whole, and its floors are compared by key: an ini section and key, a JSON
+# path, a JaCoCo rule's element, counter and value, or a flag or variable name.
+# A floor lowered or removed is a floor-lowered hit. A changed line that does
+# nothing but change floors, or add or remove a line that holds only a floor,
+# is not a gate-config hit; any other coverage-config edit still is.
+
+# key: what the floor gates; label: the key as a hit names it; raw: the number as
+# written; line: 0-based line on its side; start/end: the number's columns; pure:
+# the line holds nothing but this floor, so adding or removing it changes only the floor.
+Floor = collections.namedtuple("Floor", "key label raw value line start end pure")
+FLOOR_NUMBER = r"(\d+(?:\.\d+)?)"
+# A number that runs on into more of a value ("90${X}", "9.2e1", "80%" outside JaCoCo) is not a floor.
+FLOOR_END = r"(?![\w.%$])"
+INI_FLOOR_SECTIONS = {".coveragerc": ("report", "coverage:report"), "setup.cfg": ("coverage:report",),
+                      "tox.ini": ("coverage:report",), "pyproject.toml": ("tool.coverage.report",)}
+# An ini key starts its line (an indented line continues the value above); a TOML key may be indented.
+INI_FAIL_UNDER = re.compile(r"^fail_under\s*[=:]\s*" + FLOOR_NUMBER + r"\s*(?:[#;].*)?$", re.I)
+TOML_FAIL_UNDER = re.compile(r"^\s*fail_under\s*=\s*" + FLOOR_NUMBER + r"\s*(?:#.*)?$")
+# (label, pattern, pure line): floors written the same way in any file.
+FLAG_FLOORS = [
+    ("--cov-fail-under", re.compile(r"--cov-fail-under(?:=|\s+)[\"']?" + FLOOR_NUMBER + FLOOR_END), None),
+    (None, re.compile(r"(--fail-under-(?:lines?|branch(?:es)?|functions?|regions|decisions?))(?:=|\s+)[\"']?"
+                      + FLOOR_NUMBER + FLOOR_END), None),
+    ("COVERAGE_FLOOR", re.compile(r"\bCOVERAGE_FLOOR[\"']?\s*[:=]\s*[\"']?" + FLOOR_NUMBER + FLOOR_END
+                                  + r"|\$\{COVERAGE_FLOOR:-" + FLOOR_NUMBER + r"\}"),
+     re.compile(r"^\s*(?:export\s+)?COVERAGE_FLOOR\s*[:=]\s*([\"']?)\d+(?:\.\d+)?\1\s*(?:#.*)?$")),
+]
+COVERAGE_JSON = re.compile(r"^(\.c8rc|\.nycrc)(\.json)?$")
+THRESHOLD_KEYS = ("lines", "branches", "functions", "statements")
+JSON_TOKEN = re.compile(r'\s*(?:("(?:[^"\\]|\\.)*")|(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)|([{}\[\]:,])|(true|false|null))')
+JSON_FLOOR_LINE = re.compile(r'^\s*"\w+"\s*:\s*\d+(?:\.\d+)?\s*,?\s*$')
+CLI_COVERAGE = re.compile(r"\b(c8|nyc)\b.*--check-coverage\b|--check-coverage\b.*\b(c8|nyc)\b")
+CLI_FLOOR = re.compile(r"--(lines|branches|functions|statements)(?:=|\s+)" + FLOOR_NUMBER + FLOOR_END)
+XML_COMMENT = re.compile(r"<!--.*?-->", re.S)
+JACOCO_RULE = re.compile(r"<rule\b[^>]*>(.*?)</rule>", re.S)
+JACOCO_LIMIT = re.compile(r"<limit\b[^>]*>(.*?)</limit>", re.S)
+JACOCO_TAG = "<{0}>\\s*([\\w.]+)\\s*</{0}>"
+JACOCO_MINIMUM = re.compile(r"<minimum>\s*(?:" + FLOOR_NUMBER + r"(%?)|\$\{([\w.\-]+)\})\s*</minimum>")
+POM_PROPERTIES = re.compile(r"<properties>(.*?)</properties>", re.S)
+POM_PROPERTY = re.compile(r"<([\w.\-]+)>\s*" + FLOOR_NUMBER + r"(%?)\s*</\1>")
+# A child module sets the property its parent's <minimum> names, so a floor property is also known by its name.
+FLOOR_PROPERTY = re.compile(r"^(?!.*version)(?=.*(?:jacoco|coverage))(?=.*(?:min|floor|threshold))", re.I)
+XML_FLOOR_LINE = re.compile(r"^\s*<([\w.\-]+)>\s*\d+(?:\.\d+)?%?\s*</\1>\s*$")
+
+
+def _floor(key, label, i, m, group):
+    return Floor(key, label, m.group(group), float(m.group(group)), i, m.start(group), m.end(group), False)
+
+
+def _ini_floors(path, lines):
+    name = _name(path)
+    sections = INI_FLOOR_SECTIONS.get(name)
+    if sections is None:
+        return []
+    regex = TOML_FAIL_UNDER if name == "pyproject.toml" else INI_FAIL_UNDER
+    out, section = [], ""
+    for i, text in enumerate(lines):
+        m = SECTION_RE.match(text)
+        if m:
+            section = m.group(1)
+            continue
+        m = regex.match(text)
+        if m and section in sections:
+            out.append(_floor(("fail_under", section), f"fail_under in [{section}]", i, m, 1)._replace(
+                pure=True))
+    return out
+
+
+def _flag_floors(lines):
+    out = []
+    for i, text in enumerate(lines):
+        for label, regex, pure in FLAG_FLOORS:
+            for m in regex.finditer(text):
+                group = 2 if label is None or m.group(1) is None else 1
+                name = label or m.group(1)
+                out.append(_floor((name,), name, i, m, group)._replace(
+                    pure=bool(pure and pure.match(text))))
+    return out
+
+
+def _json_scalars(text):
+    """(path, token, offset) of each scalar of a JSON document that json.loads accepts."""
+    out, stack, pos, expect_key = [], [], 0, False
+    m = JSON_TOKEN.match(text, pos)
+    while m and m.end() > pos:
+        pos = m.end()
+        string, number, punct, literal = m.groups()
+        if punct in ("{", "["):
+            stack.append([punct, None if punct == "{" else 0])
+            expect_key = punct == "{"
+        elif punct in ("}", "]"):
+            stack.pop()
+            expect_key = False
+        elif punct == ":":
+            expect_key = False
+        elif punct == ",":
+            if stack[-1][0] == "[":
+                stack[-1][1] += 1
+            else:
+                expect_key = True
+        elif expect_key:
+            stack[-1][1] = json.loads(string)
+        else:
+            out.append((tuple(e[1] for e in stack), string or number or literal, m.start(m.lastindex)))
+        m = JSON_TOKEN.match(text, pos)
+    return out
+
+
+def _no_duplicate_keys(pairs):
+    keys = [k for k, _ in pairs]
+    if len(set(keys)) != len(keys):
+        raise ValueError("duplicate key")
+    return dict(pairs)
+
+
+def _json_floors(path, lines):
+    """c8/nyc floors of package.json, .c8rc or .nycrc; None when one of those is not plain JSON."""
+    name = _name(path)
+    if name != "package.json" and not COVERAGE_JSON.match(name):
+        return []
+    text = "\n".join(lines)
+    try:
+        json.loads(text, object_pairs_hook=_no_duplicate_keys)
+    except ValueError:
+        return None
+    starts = [0]
+    for text_line in lines:
+        starts.append(starts[-1] + len(text_line) + 1)
+    out = []
+    for path_keys, token, offset in _json_scalars(text):
+        i = bisect.bisect_right(starts, offset) - 1
+        col = offset - starts[i]
+        if name == "package.json" and len(path_keys) == 2 and path_keys[0] == "scripts" and token.startswith('"'):
+            tool = CLI_COVERAGE.search(token)
+            for m in CLI_FLOOR.finditer(token) if tool else ():
+                label = f"scripts.{path_keys[1]} {tool.group(1) or tool.group(2)} --{m.group(1)}"
+                out.append(Floor((label,), label, m.group(2), float(m.group(2)), i, col + m.start(2),
+                                 col + m.end(2), False))
+            continue
+        if not re.fullmatch(r"\d+(?:\.\d+)?", token):
+            continue
+        if name == "package.json":
+            if len(path_keys) != 2 or path_keys[0] not in ("c8", "nyc") or path_keys[1] not in THRESHOLD_KEYS:
+                continue
+            label = f"{path_keys[0]}.{path_keys[1]}"
+        elif len(path_keys) == 1 and path_keys[0] in THRESHOLD_KEYS:
+            label = f"{path_keys[0]} in {name}"
+        else:
+            continue
+        out.append(Floor((label,), label, token, float(token), i, col, col + len(token),
+                         bool(JSON_FLOOR_LINE.match(lines[i]))))
+    return out
+
+
+def _jacoco_floors(path, lines):
+    """JaCoCo <minimum> floors of a pom.xml, per rule element, counter and value, and its floor properties."""
+    if _name(path) != "pom.xml":
+        return []
+    # Comments become spaces, so a commented-out limit is no floor and offsets still match the lines.
+    text = XML_COMMENT.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), "\n".join(lines))
+    starts = [0]
+    for text_line in lines:
+        starts.append(starts[-1] + len(text_line) + 1)
+
+    def floor(key, label, raw, percent, offset, end):
+        i = bisect.bisect_right(starts, offset) - 1
+        return Floor(key, label, raw + percent, float(raw) / (100 if percent else 1), i, offset - starts[i],
+                     end - starts[i], bool(XML_FLOOR_LINE.match(lines[i])))
+
+    out, named = [], set()
+    for rule in JACOCO_RULE.finditer(text):
+        body = rule.group(1)
+        element = re.search(JACOCO_TAG.format("element"), JACOCO_LIMIT.sub("", body))
+        element = element.group(1) if element else "BUNDLE"
+        for lim in JACOCO_LIMIT.finditer(body):
+            counter = re.search(JACOCO_TAG.format("counter"), lim.group(1))
+            value = re.search(JACOCO_TAG.format("value"), lim.group(1))
+            counter = counter.group(1) if counter else "INSTRUCTION"
+            value = value.group(1) if value else "COVEREDRATIO"
+            m = JACOCO_MINIMUM.search(lim.group(1))
+            # A minimum on a missed count or ratio is a ceiling in disguise; the guard doesn't read it.
+            if not m or value not in ("COVEREDRATIO", "COVEREDCOUNT"):
+                continue
+            if m.group(3):
+                named.add(m.group(3))
+                continue
+            base = rule.start(1) + lim.start(1)
+            label = f"JaCoCo {element} {counter} {value} minimum"
+            out.append(floor(("jacoco", element, counter, value), label, m.group(1), m.group(2),
+                             base + m.start(1), base + m.end(2)))
+    for block in POM_PROPERTIES.finditer(text):
+        for m in POM_PROPERTY.finditer(block.group(1)):
+            name = m.group(1)
+            if name in named or FLOOR_PROPERTY.search(name):
+                base = block.start(1)
+                out.append(floor(("property", name), f"JaCoCo floor property {name}", m.group(2), m.group(3),
+                                 base + m.start(2), base + m.end(3)))
+    return out
+
+
+def _side_floors(path, lines):
+    """The floors of one side of a file, or None when it is coverage config the guard cannot read."""
+    if not path:
+        return []
+    found = _json_floors(path, lines)
+    if found is None:
+        return None
+    return found + _ini_floors(path, lines) + _jacoco_floors(path, lines) + _flag_floors(lines)
+
+
+FloorReview = collections.namedtuple("FloorReview", "hits floor_only")
+
+
+def _floor_only_lines(fd, old, new):
+    """Indexes into fd.lines of the changed lines that only change floors."""
+    by_line = {"-": collections.defaultdict(list), "+": collections.defaultdict(list)}
+    for side, floors in (("-", old), ("+", new)):
+        for f in floors:
+            by_line[side][f.line].append(f)
+
+    def side_floors(l):
+        return by_line[l.kind][(l.old if l.kind == "-" else l.new) - 1]
+
+    def masked(l):
+        text = l.text
+        for f in sorted(side_floors(l), key=lambda f: -f.start):
+            text = text[:f.start] + "\0" + text[f.end:]
+        return text
+
+    only = set()
+    i = 0
+    while i < len(fd.lines):
+        if fd.lines[i].kind == " ":
+            i += 1
+            continue
+        block = []
+        while i < len(fd.lines) and fd.lines[i].kind != " ":
+            block.append(i)
+            i += 1
+        removed = [j for j in block if fd.lines[j].kind == "-" and side_floors(fd.lines[j])]
+        added = [j for j in block if fd.lines[j].kind == "+" and side_floors(fd.lines[j])]
+        # A floor's number changed in place: the lines match once each floor's number is masked.
+        k = 0
+        for r in removed:
+            for n in range(k, len(added)):
+                if masked(fd.lines[added[n]]) == masked(fd.lines[r]):
+                    only.update((r, added[n]))
+                    k = n + 1
+                    break
+        only.update(j for j in removed + added if any(f.pure for f in side_floors(fd.lines[j])))
+    return only
+
+
+def _values(floors):
+    return ", ".join(f.raw for f in floors)
+
+
+def _floor_review(fd):
+    """The FloorReview of fd, or None when the diff doesn't show the file whole or a side can't be read."""
+    if any(is_doc(p) or is_test_file(p) for p in fd.paths):
+        return None
+    sides = _whole_sides(fd)
+    if sides is None:
+        return None
+    old = _side_floors(fd.old_path, [l.text for l in fd.lines if l.kind != "+"])
+    new = _side_floors(fd.new_path, [l.text for l in fd.lines if l.kind != "-"])
+    if old is None or new is None:
+        return None
+    before, after = collections.OrderedDict(), collections.defaultdict(list)
+    for f in old:
+        before.setdefault(f.key, []).append(f)
+    for f in new:
+        after[f.key].append(f)
+    hits = []
+    for key, olds in before.items():
+        news = after.get(key, [])
+        label = olds[0].label
+        if not news:
+            hits.append(Hit("floor-lowered", fd.path, None, f"coverage floor {label} removed (was {_values(olds)})"))
+        elif len(news) == len(olds):
+            hits += [Hit("floor-lowered", fd.path, n.line + 1,
+                         f"coverage floor {label} lowered from {o.raw} to {n.raw}")
+                     for o, n in zip(olds, news) if n.value < o.value]
+        elif len(news) < len(olds) or min(n.value for n in news) < max(o.value for o in olds):
+            # Set more or fewer times than before, the floors can't be paired; any floor below the old
+            # highest, or one fewer, may be the one the tool reads.
+            low = min(news, key=lambda n: n.value)
+            hits.append(Hit("floor-lowered", fd.path, low.line + 1,
+                            f"coverage floor {label} lowered: was {_values(olds)}, now {_values(news)}"))
+    return FloorReview(hits, _floor_only_lines(fd, old, new))
+
+
+def floor_lowered_hits(files):
+    return [h for fd in files for h in (_floor_review(fd) or FloorReview([], set())).hits]
+
+
 def gate_config_hits(files):
     hits = []
     for fd in files:
         paths = [p.lower() for p in fd.paths]
         names = {_name(p) for p in fd.paths}
+        review = _floor_review(fd)
+        floor_only = review.floor_only if review else set()
         if any(p.startswith(".github/workflows/") for p in paths):
             hits.append(Hit("gate-config", fd.path, None, f"workflow {fd.status}"))
             continue
@@ -1235,7 +1539,9 @@ def gate_config_hits(files):
             hits.append(Hit("gate-config", fd.path, None, f"CODEOWNERS {fd.status}"))
             continue
         if any(COVERAGE_FILES.match(n) for n in names):
-            hits.append(Hit("gate-config", fd.path, None, f"coverage config {fd.status}"))
+            changed = [i for i, l in enumerate(fd.lines) if l.kind != " "]
+            if fd.status != "modified" or not changed or not floor_only.issuperset(changed):
+                hits.append(Hit("gate-config", fd.path, None, f"coverage config {fd.status}"))
             continue
         if any(is_doc(p) for p in fd.paths):
             continue
@@ -1247,10 +1553,10 @@ def gate_config_hits(files):
         coverage, lint = [], []
         js_config = (_ext(fd.path) in JS_EXTS and is_config(fd.path)) or bool(JS_CONFIG_JSON.match(_name(fd.path)))
         gradle = ".gradle" in _name(fd.path)
-        for l, section in zip(fd.lines, sections):
+        for i, (l, section) in enumerate(zip(fd.lines, sections)):
             if section.startswith(LINT_SECTIONS):
                 lint.append(l)
-            if l.kind == " ":
+            if l.kind == " " or i in floor_only:
                 continue
             if (section.startswith(COVERAGE_SECTIONS) or COVERAGE_LINE.search(l.text)
                     or (js_config and JS_THRESHOLD.search(l.text))
@@ -1384,7 +1690,7 @@ def analyze(files, facts=None):
     facts = facts or tree_facts(DiffTrees(files))
     removed = removed_test_hits(files)
     hits = (removed + c_cpp_hits(files, facts, {h.path for h in removed}) + skip_hits(files, facts)
-            + retry_hits(files) + gate_config_hits(files))
+            + retry_hits(files) + gate_config_hits(files) + floor_lowered_hits(files))
     seen = set()
     unique = []
     for h in hits:
