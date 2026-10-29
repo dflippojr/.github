@@ -14,6 +14,7 @@ Default community health files for repositories owned by dflippojr. GitHub appli
 - `scripts/sync_labels.py`: shows or applies label differences across repositories. See `CONTRIBUTING.md`.
 - `.github/workflows/gate-guard.yml` and `scripts/gate_guard.py`: the reusable gate guard. See below.
 - `.github/workflows/gate-guard-target.yml`, `templates/gate-guard-target-caller.yml` and `.github/workflows/gate-guard-base.yml`: the gate guard on the default branch, its caller template, and this repository's own caller. See "Gate guard on the default branch".
+- `.github/workflows/approve-gate.yml`, `scripts/approve_gate.py`, `templates/approve-gate-caller.yml` and `.github/workflows/approve-gate-base.yml`: the owner's one-comment gate approval, its caller template, and this repository's own caller. See "Approve a gate change by comment".
 - `tests/`: tests for the label configuration, the issue forms and PR template, and the scripts. `tests/fixtures/gate_guard/` holds the gate guard's fixture diffs and `tests/fixtures/gate_guard_target/` its owner-label scenarios.
 
 ## Secret scan
@@ -340,6 +341,171 @@ anything from the pull request:
   default-branch ruleset (agent-ops `config/rulesets.yaml`) blocks them.
 - **`gate-guard.yml` callers.** Repositories still on the `pull_request`
   version keep the old hole until they move.
+
+## Approve a gate change by comment
+
+The owner approves a pull request's gate change with one comment on it:
+
+```
+/approve-gate <full 40-character head SHA>
+```
+
+`approve-gate.yml` then applies `gate-change-approved` and posts the head
+record `ao owner-label apply` writes (`<!-- owner-label gate-change-approved
+head=SHA -->`), label first, so the agent-ops `ao ready` rule and the gate
+guard both count it. There is no ordering to get wrong. `ao owner-label apply`
+still works and does the same from the owner's terminal.
+
+It runs on `issue_comment` `created`, which always takes the workflow from the
+repository's default branch. It never checks out or runs pull request code: it
+loads `scripts/approve_gate.py` from this repository at the full SHA in
+`approve-ref`. The job's `if:` keeps every other comment off a runner. The
+script then reads the comment and the pull request again from the API and acts
+only when all of these hold:
+
+- The comment's author is the repository owner, by login and by user id
+  (`GITHUB_REPOSITORY_OWNER`, `GITHUB_REPOSITORY_OWNER_ID`), and is a user.
+  Another account, a look-alike login, or a renamed account with the old login
+  doesn't count, and neither does a collaborator saying "approved".
+- The comment was never edited (`updated_at` equals `created_at`). Callers
+  listen for `created` only, and the script refuses any other action.
+- The body is exactly `/approve-gate`, one space and the full lowercase SHA;
+  trailing whitespace is ignored. A short SHA or any extra text is refused,
+  and the job's `if:` skips a body that does not start with `/approve-gate `.
+- The comment is on a pull request, not an issue. The pull request is open,
+  its base is this repository, and its head branch is in this repository, so
+  fork pull requests (and ones whose fork was deleted) are refused.
+- The SHA is the pull request's current head.
+- `OWNER_GATE_TOKEN` belongs to the owner (`GET /user`). Otherwise nothing is
+  written.
+
+It then removes `gate-change-approved` if the pull request already has it and
+adds it again. Adding a label that is already on records no event, and the
+gate guard dates the label by its newest event: a re-approval after a push
+would still look older than the push. Then it posts the head record. Last, it
+reads the head again. If a push landed meanwhile, it removes the label again,
+because the gate guard would date the label after that push and count it for
+a commit the owner never named. For the same reason it removes the label
+again when anything fails once the label request is sent: the label write
+itself (GitHub may have applied it), the record, or the final read. If that
+removal fails too, the run fails with an error line saying the label is still
+on the pull request, and the owner removes it by hand before anything merges.
+A refused comment from the owner gets a reply
+saying why. Anyone else's gets nothing. The job fails on a refusal, so the
+owner also sees a failed run.
+
+A later push invalidates the approval in both checks: `ao ready` needs the
+record to name the current head, and the gate guard needs the label applied
+after the newest push.
+
+### The token
+
+The label and the record are made with `OWNER_GATE_TOKEN`, the owner's own
+token, so GitHub records the owner as the actor of both. The checks need no
+new trusted identity. A label applied through the default `GITHUB_TOKEN`
+would be `github-actions[bot]`'s. Any workflow with `issues: write` can act as
+that bot, and its events start no other workflow, so the gate guard would
+never re-judge.
+
+The token lives in an `approve-gate` **environment**, never as a repository
+secret. Any workflow a pull request from a branch in the repository adds or
+edits runs with the repository's secrets, so a repository secret is one
+workflow edit away from a leak. An environment secret reaches only a job that
+declares the environment, and the environment's deployment branch policy lets
+only runs from the default branch in.
+
+The owner sets up, once per repository with a caller (repository Settings):
+
+1. **Environments → New environment**, named `approve-gate`.
+2. **Deployment branches and tags → Selected branches and tags**, then one
+   branch rule naming the repository's default branch (`main` here, `master`
+   in agent-ops). No tag rules. Leave required reviewers and wait timers off.
+3. A fine-grained personal access token. Resource owner `dflippojr`.
+   Repository access: only this repository. Permissions:
+   **Pull requests: Read and write** (labels and comments on pull requests),
+   plus the mandatory Metadata: Read. If GitHub refuses the label call with
+   403, add **Issues: Read and write**. Set an expiry and renew it.
+4. In the `approve-gate` environment, **Environment secrets → Add secret**,
+   named `OWNER_GATE_TOKEN`, holding the token.
+5. If a repository secret named `OWNER_GATE_TOKEN` exists (Settings → Secrets
+   and variables → Actions → Repository secrets), delete it. Otherwise every
+   pull request workflow can still read that copy.
+
+A private repository needs GitHub Pro (or Team) for environment secrets and
+deployment branch rules. On GitHub Free they work in public repositories only.
+
+Don't give the workers' App, or any other identity, the right to apply owner
+labels for this. Only this workflow, acting on the owner's own comment, uses
+the token.
+
+### Callers
+
+Copy `templates/approve-gate-caller.yml` to
+`.github/workflows/approve-gate.yml` in each repository and put the same full
+SHA of this repository's `main` in both places it asks for one. Set up the
+environment and its secret first. This repository calls the local copy through `approve-gate-base.yml`,
+with `approve-ref: ${{ github.sha }}`, which under `issue_comment` is the
+default branch's newest commit.
+
+| Input or secret | Meaning |
+| --- | --- |
+| `approve-ref` | Full commit SHA of this repository to load the script from; the SHA in the caller's `uses:` line. |
+| `OWNER_GATE_TOKEN` | The owner's token, from the caller repository's `approve-gate` environment (above). Pass it by name, never with `secrets: inherit`. |
+
+GitHub's wiring for an environment secret in a reusable workflow decides
+which job declares the environment:
+
+- A job that calls a reusable workflow can't use the `environment` keyword, so
+  the called `approve` job in `approve-gate.yml` declares
+  `environment: approve-gate`.
+- The caller must still pass the secret, by name or with `secrets: inherit`,
+  and may pass a name that exists only in the environment. The job that
+  declares the environment receives the environment's value.
+- The run belongs to the caller repository (the `github` context is the
+  caller's), so each caller repository has its own `approve-gate` environment
+  and token.
+- The deployment branch rule matches the run's `GITHUB_REF`. For
+  `issue_comment` that is the default branch, so the rule admits it.
+
+### Why it is safe
+
+- **The judge comes from the default branch.** `issue_comment` runs the
+  caller as it is on the default branch. The reusable workflow and the script
+  are pinned by SHA. Workers can't change workflow files (the workers' App has
+  no workflows permission), and an edit to one is a `gate-config` hit.
+- **No pull request code runs.** The only checkout is this repository's
+  script. The job reads the event payload and the API as data. No `run:` step
+  interpolates the comment.
+- **The token stays in one step.** Only the step that runs the script gets
+  `OWNER_GATE_TOKEN`. The job runs on `ubuntu-latest`, never a self-hosted
+  runner: the tower's warm runners keep state between jobs and run pull
+  request code. `GITHUB_TOKEN` has `contents: read` only.
+- **No pull request workflow can reach the token.** It is an environment
+  secret, so only a job that declares `approve-gate` gets it. The deployment
+  branch rule admits only runs whose `GITHUB_REF` is the default branch. A
+  `pull_request` run has `refs/pull/N/merge`, and a push or a
+  `workflow_dispatch` on a pull request's branch has that branch, so a
+  workflow a pull request adds or edits is refused before its job starts.
+  Only a workflow already on the default branch can declare the environment,
+  and getting one there is a `gate-config` change the owner approves.
+
+### Threats it still doesn't cover
+
+- **The owner's identity.** A comment from the owner login counts, whoever
+  typed it. The orchestrator and owner-identity workers run as the owner. The
+  agent-ops action guard denies agents posting `/approve-gate`, and every
+  worker prompt forbids it, but those catch accidents, not intent.
+- **A leaked `OWNER_GATE_TOKEN`.** It can label and comment as the owner on
+  the repositories it covers, as `ao owner-label apply` can. Keep its
+  repository list short and its expiry near.
+- **Default-branch workflows.** Any job on the default branch that declares
+  `approve-gate` gets the token: an `issue_comment`, `pull_request_target` or
+  `workflow_dispatch` job there passes the branch rule. Only
+  `approve-gate.yml`'s `approve` job may declare it; the tests check that in
+  this repository, and agent-ops checks its own workflows.
+- **`gate-guard.yml` callers.** The `pull_request` gate guard checks only who
+  applied the label, not when, so in a repository still on it a push does not
+  void an approval there; `ao ready` still does, through the head record.
 
 ## Workflow lint
 
