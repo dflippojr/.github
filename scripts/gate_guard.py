@@ -1748,16 +1748,17 @@ def gate_config_hits(files, facts):
             if fd.status != "modified" or not changed or not floor_only.issuperset(changed):
                 hits.append(Hit("gate-config", fd.path, None, f"coverage config {fd.status}"))
             continue
+        # A tool finds its config by name and place, so a config that moves may drop its floors and settings,
+        # even to a doc or lint name.
+        moved = fd.status == "renamed" and bool(
+            {("-", fd.old_path), ("+", fd.new_path)} & facts.coverage_configs)
+        if moved:
+            hits.append(Hit("gate-config", fd.path, None, "coverage config renamed"))
         if any(is_doc(p) for p in fd.paths):
             continue
         if any(LINT_FILES.match(n) for n in names):
             hits.extend(_lint_hits(fd, fd.lines))
             continue
-        # A tool finds its config by name and place, so a config that moves may drop its floors and settings.
-        moved = fd.status == "renamed" and bool(
-            {("-", fd.old_path), ("+", fd.new_path)} & facts.coverage_configs)
-        if moved:
-            hits.append(Hit("gate-config", fd.path, None, "coverage config renamed"))
         if review is None and _unfollowed_floors(fd):
             hits.append(Hit("gate-config", fd.path, None,
                             "coverage floor in a string or heredoc the guard can't follow"))
