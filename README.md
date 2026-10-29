@@ -66,9 +66,10 @@ is no floor, so commenting one out removes it. A quoted floor counts only as a
 whole TOML or YAML value or list item (`addopts = "--cov-fail-under=85"`) or
 as `${COVERAGE_FLOOR:-N}` in double quotes; any other (`echo
 "COVERAGE_FLOOR=95"`) is not a floor, and no line that sets that floor in the
-file is exempt. In a file where a string or comment spans lines (a docstring,
-a heredoc, an unclosed quote) the guard reads no `COVERAGE_FLOOR` or flag
-floor at all.
+file is exempt. A file where a string or comment spans lines (a docstring,
+a heredoc, an unclosed quote) and that holds a `COVERAGE_FLOOR` or flag floor
+on either side is a `gate-config` hit whatever its change, since wrapping a
+floor in one makes it inactive without changing its line.
 
 A changed line that only changes a floor's number, or adds or removes a line
 that holds only a floor, is then not a `gate-config` hit; any other change to

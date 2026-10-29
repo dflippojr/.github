@@ -1714,6 +1714,15 @@ def _floor_review(fd):
     return FloorReview(hits, floor_only, blocks)
 
 
+def _unfollowed_floors(fd):
+    """Whether a side of fd holds a floor in a string or heredoc the guard can't follow (see _flag_floors):
+    wrapping a floor in one may change no line that names it."""
+    if any(is_doc(p) or is_test_file(p) for p in fd.paths) or _whole_sides(fd) is None:
+        return False
+    return any(path and _flag_floors(path, [l.text for l in fd.lines if l.kind != other]) is None
+               for path, other in ((fd.old_path, "+"), (fd.new_path, "-")))
+
+
 def floor_lowered_hits(files):
     return [h for fd in files for h in (_floor_review(fd) or FloorReview([], set(), set())).hits]
 
@@ -1749,6 +1758,9 @@ def gate_config_hits(files, facts):
             {("-", fd.old_path), ("+", fd.new_path)} & facts.coverage_configs)
         if moved:
             hits.append(Hit("gate-config", fd.path, None, "coverage config renamed"))
+        if review is None and _unfollowed_floors(fd):
+            hits.append(Hit("gate-config", fd.path, None,
+                            "coverage floor in a string or heredoc the guard can't follow"))
 
         sections = line_sections(fd) if is_ini(fd.path) else [""] * len(fd.lines)
         coverage, lint = [], []
