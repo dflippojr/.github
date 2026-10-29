@@ -34,6 +34,7 @@ request; anyone else's comment is refused silently.
 
     OWNER_GATE_TOKEN=... python3 approve_gate.py
 """
+import http.client
 import json
 import os
 import re
@@ -219,7 +220,8 @@ def main():
         code, message = run(github, os.environ.get("GITHUB_EVENT_NAME"), event, repo, owner, int(owner_id))
     except LabelLeft as e:
         code, message = 2, str(e)
-    except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+    except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError, KeyError, TypeError,
+            AttributeError) as e:
         code, message = 2, f"could not read or write the pull request ({e})"
     print(("::notice::" if code == 0 else "::error::") + escape(message))
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
