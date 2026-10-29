@@ -62,7 +62,8 @@ A changed line that only changes a floor's number, or adds or removes a line
 that holds only a floor, is then not a `gate-config` hit; any other change to
 coverage config still is, beside a raise or not: an `omit`, a `check-coverage`
 switch, a floor the guard can't read (`9.2e1`, `${prop}`, `"$FLOOR"`, a Jest
-threshold, YAML or JavaScript config, JSON with comments or a repeated key),
+threshold, YAML or JavaScript config, JSON with comments or a repeated key, a
+JaCoCo `<limit>` with two `<minimum>`s),
 and every edit to a workflow, whose floors are compared only to report a
 lowering. A coverage config file added, deleted or renamed stays a hit. A
 floor set more or fewer times in a file than before is a hit when one is

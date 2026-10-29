@@ -1755,6 +1755,13 @@ class FloorLowered(unittest.TestCase):
         self.assertIn(("floor-lowered", "pom.xml",
                        "coverage floor JaCoCo BUNDLE BRANCH COVEREDRATIO minimum removed (was 0.70)"), hits)
 
+    def test_a_second_minimum_in_a_limit_stays_gate_config(self):
+        pom = ("<project>\n<properties>\n<jacoco.minimum.line>0.90</jacoco.minimum.line>\n</properties>\n<rules><rule>"
+               "<limits>\n<limit>\n<counter>LINE</counter>\n{}<minimum>${{jacoco.minimum.line}}</minimum>\n</limit>\n"
+               "</limits></rule></rules>\n</project>\n")
+        hits = self.floor_hits({"pom.xml": pom.format("")}, {"pom.xml": pom.format("<minimum>0.10</minimum>\n")})
+        self.assertEqual(hits, [("gate-config", "pom.xml", "coverage config edited: <minimum>0.10</minimum>")])
+
     def test_version_and_unrelated_properties_are_not_floors(self):
         pom = "<project>\n<properties>\n<jacoco.version>{}</jacoco.version>\n<retries>{}</retries>\n</properties>\n</project>\n"
         self.assertEqual(self.floor_hits({"pom.xml": pom.format("0.8.12", "3")}, {"pom.xml": pom.format("0.8", "1")}),

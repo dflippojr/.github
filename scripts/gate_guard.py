@@ -1406,8 +1406,9 @@ def _jacoco_floors(path, lines):
             counter = counter.group(1) if counter else "INSTRUCTION"
             value = value.group(1) if value else "COVEREDRATIO"
             m = JACOCO_MINIMUM.search(lim.group(1))
-            # A minimum on a missed count or ratio is a ceiling in disguise; the guard doesn't read it.
-            if not m or value not in ("COVEREDRATIO", "COVEREDCOUNT"):
+            # A minimum on a missed count or ratio is a ceiling in disguise, and of two minimums in one
+            # limit either may be the one Maven keeps; the guard reads neither.
+            if not m or value not in ("COVEREDRATIO", "COVEREDCOUNT") or lim.group(1).count("<minimum>") > 1:
                 continue
             if m.group(3):
                 named.add(m.group(3))
