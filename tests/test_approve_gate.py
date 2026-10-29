@@ -1,4 +1,5 @@
 """approve_gate.py: only the owner's own unedited `/approve-gate <head sha>` on a same-repo PR labels it."""
+import http.client
 import io
 import json
 import os
@@ -284,6 +285,54 @@ class FailureAfterTheLabel(unittest.TestCase):
                 self.assertIn(LABEL, github.labels, "the fake's label really is still on")
                 self.assertRegex(out, rf"(?m)^::error::{LABEL} is still on {re.escape(REPO)}#{NUMBER}")
                 self.assertIn("remove it by hand", out)
+
+
+def fail_call(github, method, suffix, error, nth=1, acted=False):
+    """The nth call to method ("get", "post" or "delete") on a path ending in suffix raises error; with acted,
+    GitHub does the write first and only the response is lost."""
+    real = getattr(github, method)
+    seen = []
+
+    def call(path, *args):
+        if path.endswith(suffix):
+            seen.append(path)
+            if len(seen) == nth:
+                if acted:
+                    real(path, *args)
+                raise error
+        return real(path, *args)
+
+    setattr(github, method, call)
+
+
+class HttpExceptions(unittest.TestCase):
+    """Issue #47: an http.client.HTTPException that is not an OSError (IncompleteRead, BadStatusLine) escaped main() as
+    a traceback and exit 1. RemoteDisconnected is an OSError, so main() already reported it."""
+
+    def test_remote_disconnected_on_the_record_post_exits_2_and_removes_the_label(self):
+        github = FakeGitHub()
+        fail_call(github, "post", "/comments", http.client.RemoteDisconnected("Remote end closed connection"))
+        code, out = main_with(self, github)
+        self.assertEqual(code, 2, out)
+        self.assertIn("::error::could not read or write the pull request", out)
+        self.assertNotIn(LABEL, github.labels)
+        self.assertIn(("DELETE", f"/repos/{REPO}/issues/{NUMBER}/labels/{LABEL}", None), github.writes)
+
+    def test_other_http_exceptions_exit_2_with_the_label_off(self):
+        points = [("the comment GET", "get", "/issues/comments/55", 1, False),
+                  ("the label POST, applied but the response lost", "post", "/labels", 1, True),
+                  ("the record POST", "post", "/comments", 1, False),
+                  ("the record POST, posted but the response lost", "post", "/comments", 1, True),
+                  ("the final head GET", "get", f"/pulls/{NUMBER}", 2, False)]
+        for point, method, suffix, nth, acted in points:
+            for error in (http.client.IncompleteRead(b""), http.client.BadStatusLine("")):
+                with self.subTest(point=point, error=type(error).__name__):
+                    github = FakeGitHub()
+                    fail_call(github, method, suffix, error, nth, acted)
+                    code, out = main_with(self, github)
+                    self.assertEqual(code, 2, out)
+                    self.assertIn(f"::error::could not read or write the pull request ({error})", out)
+                    self.assertNotIn(LABEL, github.labels)
 
 
 def main_with(test, github):
