@@ -1,0 +1,48 @@
+# gate-guard fixture: floors the parser can't read stay gate-config: YAML .nycrc, a commented .c8rc.json, and a Jest threshold
+# expect: gate-config
+# hits: 3
+# detail: coverage config modified
+# detail: coverage config edited
+
+diff --git a/.c8rc.json b/.c8rc.json
+index 213a64d..9f59370 100644
+--- a/.c8rc.json
++++ b/.c8rc.json
+@@ -1,4 +1,5 @@
+ {
++  // floor
+   "check-coverage": true,
+   "statements": 75
+ }
+diff --git a/.nycrc.yml b/.nycrc.yml
+index d5f9df5..49d3575 100644
+--- a/.nycrc.yml
++++ b/.nycrc.yml
+@@ -1,2 +1,2 @@
+ check-coverage: true
+-lines: 90
++lines: 95
+diff --git a/package.json b/package.json
+index 6dc60eb..133ac0c 100644
+--- a/package.json
++++ b/package.json
+@@ -1,18 +1,18 @@
+ {
+   "name": "shop",
+   "scripts": {
+     "test": "c8 --check-coverage --lines 90 --branches 80 node --test"
+   },
+   "nyc": {
+     "check-coverage": true,
+     "functions": 70,
+     "lines": 85
+   },
+   "jest": {
+     "coverageThreshold": {
+       "global": {
+-        "lines": 60
++        "lines": 65
+       }
+     }
+   }
+ }

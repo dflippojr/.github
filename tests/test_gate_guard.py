@@ -111,7 +111,7 @@ class Fixtures(unittest.TestCase):
         flagged = set()
         for p in FIXTURES.glob("flag-*.diff"):
             flagged |= fixture_expectations(p)[0]
-        self.assertEqual(flagged, {"removed-tests", "skip-marker", "retry", "gate-config"})
+        self.assertEqual(flagged, {"removed-tests", "skip-marker", "retry", "gate-config", "floor-lowered"})
         self.assertTrue(any(n.startswith("pass-") for n in names))
 
     def test_fixture_verdicts(self):
@@ -1713,6 +1713,90 @@ def _trees(diff_text):
     return before, after
 
 
+class FloorLowered(unittest.TestCase):
+    """Issue #21: a coverage floor may rise without the owner's label; lowering or removing one is a hit."""
+    PYPROJECT = '[project]\nname = "calc"\n\n[tool.coverage.report]\nfail_under = {}\n'
+
+    def floor_hits(self, base, head):
+        return [(h.rule, h.path, h.detail) for h in judge_commits(base, head)]
+
+    def test_raise_passes_and_lowering_fails_through_git(self):
+        base = {"pyproject.toml": self.PYPROJECT.format("90"), "calc.py": "x = 1\n"}
+        self.assertEqual(self.floor_hits(base, {"pyproject.toml": self.PYPROJECT.format("92"), "calc.py": "x = 1\n"}),
+                         [])
+        self.assertEqual(self.floor_hits(base, {"pyproject.toml": self.PYPROJECT.format("89.5"), "calc.py": "x = 1\n"}),
+                         [("floor-lowered", "pyproject.toml",
+                           "coverage floor fail_under in [tool.coverage.report] lowered from 90 to 89.5")])
+
+    def test_cli_exit_status_for_a_raise_and_a_lowering(self):
+        for floor, expected in (("91", 0), ("85", 1)):
+            with self.subTest(floor=floor), tempfile.TemporaryDirectory() as tmp:
+                subprocess.run(["git", "init", "-q", tmp], check=True, capture_output=True)
+                git_commit(tmp, {".coveragerc": "[report]\nfail_under = 90\n"}, "base")
+                git_commit(tmp, {".coveragerc": f"[report]\nfail_under = {floor}\n"}, "head")
+                code, out = run_main(["--repo-dir", tmp, "--base", "HEAD^1", "--head", "HEAD"])
+                self.assertEqual(code, expected, out)
+
+    def test_equal_values_written_differently_are_unchanged(self):
+        limit = ("<project><build><plugins><plugin><configuration><rules><rule><limits>\n<limit>\n"
+                 "<counter>LINE</counter>\n<minimum>{}</minimum>\n</limit>\n</limits></rule></rules>"
+                 "</configuration></plugin></plugins></build></project>\n")
+        self.assertEqual(self.floor_hits({"pom.xml": limit.format("0.80")}, {"pom.xml": limit.format("80%")}), [])
+        self.assertEqual(self.floor_hits({"pom.xml": limit.format("0.80")}, {"pom.xml": limit.format("79%")}),
+                         [("floor-lowered", "pom.xml", "coverage floor JaCoCo BUNDLE LINE COVEREDRATIO minimum "
+                           "lowered from 0.80 to 79%")])
+
+    def test_commented_out_jacoco_limit_is_a_removed_floor(self):
+        lines = ["<project><build><plugins><plugin><configuration><rules><rule><limits>", "<limit>",
+                 "<counter>BRANCH</counter>", "<value>COVEREDRATIO</value>", "<minimum>0.70</minimum>", "</limit>",
+                 "</limits></rule></rules></configuration></plugin></plugins></build></project>", ""]
+        commented = lines[:1] + ["<!--"] + lines[1:6] + ["-->"] + lines[6:]
+        hits = self.floor_hits({"pom.xml": "\n".join(lines)}, {"pom.xml": "\n".join(commented)})
+        self.assertIn(("floor-lowered", "pom.xml",
+                       "coverage floor JaCoCo BUNDLE BRANCH COVEREDRATIO minimum removed (was 0.70)"), hits)
+
+    def test_version_and_unrelated_properties_are_not_floors(self):
+        pom = "<project>\n<properties>\n<jacoco.version>{}</jacoco.version>\n<retries>{}</retries>\n</properties>\n</project>\n"
+        self.assertEqual(self.floor_hits({"pom.xml": pom.format("0.8.12", "3")}, {"pom.xml": pom.format("0.8", "1")}),
+                         [])
+
+    def test_indented_ini_fail_under_is_not_a_floor(self):
+        # configparser reads an indented line as part of the value above it.
+        base = {".coveragerc": "[report]\nfail_under = 90\n"}
+        hits = self.floor_hits(base, {".coveragerc": "[report]\nfail_under = 90\n  fail_under = 95\n"})
+        self.assertEqual(hits, [("gate-config", ".coveragerc", "coverage config modified")])
+
+    def test_duplicate_json_keys_cannot_be_read(self):
+        base = {".nycrc": '{\n  "lines": 90\n}\n'}
+        hits = self.floor_hits(base, {".nycrc": '{\n  "lines": 95,\n  "lines": 10\n}\n'})
+        self.assertEqual(hits, [("gate-config", ".nycrc", "coverage config modified")])
+
+    def test_floors_in_docs_and_tests_are_not_read(self):
+        base = {"README.md": "COVERAGE_FLOOR=90\n", "tests/test_floor.py": "COVERAGE_FLOOR = 90\n"}
+        head = {"README.md": "COVERAGE_FLOOR=10\n", "tests/test_floor.py": "COVERAGE_FLOOR = 10\n"}
+        self.assertEqual(self.floor_hits(base, head), [])
+
+    def test_a_new_floor_line_passes(self):
+        base = {"scripts/check.sh": "#!/bin/sh\npytest\n", "setup.cfg": "[coverage:report]\nshow_missing = true\n"}
+        head = {"scripts/check.sh": "#!/bin/sh\nexport COVERAGE_FLOOR=80\npytest\n",
+                "setup.cfg": "[coverage:report]\nfail_under = 80\nshow_missing = true\n"}
+        self.assertEqual(self.floor_hits(base, head), [])
+
+    def test_a_floor_read_from_a_variable_stays_gate_config(self):
+        base = {"scripts/check.sh": "#!/bin/sh\npytest --cov-fail-under=80\n"}
+        head = {"scripts/check.sh": "#!/bin/sh\npytest --cov-fail-under=\"$COVERAGE_FLOOR\"\n"}
+        self.assertEqual(self.floor_hits(base, head), [
+            ("floor-lowered", "scripts/check.sh", "coverage floor --cov-fail-under removed (was 80)"),
+            ("gate-config", "scripts/check.sh", "coverage config edited: pytest --cov-fail-under=80 (+1 more)")])
+
+    def test_a_partial_diff_file_keeps_the_gate_config_hit(self):
+        # Without full context the guard can't read the sections, so a raise needs approval as before.
+        diff = ("diff --git a/pyproject.toml b/pyproject.toml\n--- a/pyproject.toml\n+++ b/pyproject.toml\n"
+                "@@ -8,3 +8,3 @@\n [tool.coverage.report]\n-fail_under = 90\n+fail_under = 95\n show_missing = true\n")
+        self.assertEqual([(h.rule, h.detail) for h in analyze_text(diff)],
+                         [("gate-config", "coverage config edited: fail_under = 90 (+1 more)")])
+
+
 class GitEndToEnd(unittest.TestCase):
     """The CLI diffs two real commits the way the workflow does and reaches the same verdict."""
 
@@ -1731,7 +1815,7 @@ class GitEndToEnd(unittest.TestCase):
                      "flag-python-cpp-collect-ignore-multiline", "pass-python-cpp-assert-approx-tolerance",
                      "pass-python-cpp-assert-beside-skipif", "flag-python-cpp-computed-globals-key",
                      "flag-python-cpp-assert-in-with", "flag-python-cpp-assert-unary-none",
-                     "pass-python-cpp-assert-negative-literal"]:
+                     "pass-python-cpp-assert-negative-literal"] + sorted(p.stem for p in FIXTURES.glob("*-floor-*.diff")):
             with self.subTest(fixture=name), tempfile.TemporaryDirectory() as tmp:
                 subprocess.run(["git", "init", "-q", tmp], check=True, capture_output=True)
                 text = (FIXTURES / f"{name}.diff").read_text(encoding="utf-8")
