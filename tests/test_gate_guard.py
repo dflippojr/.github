@@ -1890,6 +1890,17 @@ class FloorLowered(unittest.TestCase):
                                {".gitlab-ci.yml": "script:\n  - echo \"COVERAGE_FLOOR=95\"\n  - make check\n"})
         self.assertEqual({h[0] for h in hits}, {"floor-lowered", "gate-config"})
 
+    def test_an_unchanged_floor_wrapped_in_a_string_or_heredoc_stays_gate_config(self):
+        # Only the wrapper lines change, and none of them names a floor.
+        for path, active, wrapped in (
+                ("noxfile.py", "COVERAGE_FLOOR = 90\n", '"""\nCOVERAGE_FLOOR = 90\n"""\n'),
+                ("scripts/check.sh", "COVERAGE_FLOOR=90\npytest\n", ": <<'EOF'\nCOVERAGE_FLOOR=90\nEOF\npytest\n"),
+                ("pyproject.toml", '[tool.pytest.ini_options]\naddopts = "--cov-fail-under=85"\n',
+                 "[tool.pytest.ini_options]\nx = '''\naddopts = \"--cov-fail-under=85\"\n'''\n")):
+            with self.subTest(path=path):
+                self.assertIn(("gate-config", path, "coverage floor in a string or heredoc the guard can't follow"),
+                              self.floor_hits({path: active}, {path: wrapped}))
+
     def test_a_floor_in_a_docstring_or_heredoc_stays_gate_config(self):
         for path, active, inactive in (
                 ("noxfile.py", "COVERAGE_FLOOR = 90\n", 'DOC = """\nCOVERAGE_FLOOR = 95\n"""\n'),
