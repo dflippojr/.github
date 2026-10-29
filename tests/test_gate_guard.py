@@ -1820,6 +1820,15 @@ class FloorLowered(unittest.TestCase):
                     hits = self.floor_hits({name: text, "calc.py": "x = 1\n"}, {moved: text, "calc.py": "x = 1\n"})
                     self.assertIn(("gate-config", moved, "coverage config renamed"), hits)
 
+    def test_a_pure_move_of_a_coverage_config_to_a_doc_or_lint_name_needs_approval(self):
+        # Round 3: a doc or lint destination must not exempt the move, though the diff has no lines to read.
+        text = self.COVERAGE_CONFIGS["pyproject.toml"]
+        for moved in ("pyproject.toml.txt", ".eslintrc.json"):
+            with self.subTest(moved=moved):
+                hits = self.floor_hits({"pyproject.toml": text, "calc.py": "x = 1\n"},
+                                       {moved: text, "calc.py": "x = 1\n"})
+                self.assertIn(("gate-config", moved, "coverage config renamed"), hits)
+
     def test_a_pure_move_between_directories_of_a_nested_config_needs_approval(self):
         text = self.COVERAGE_CONFIGS["package.json"]
         hits = self.floor_hits({"web/package.json": text}, {"site/web/package.json": text})
