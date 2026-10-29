@@ -1,0 +1,23 @@
+# gate-guard fixture: an nyc floor raised beside a new exclude in the same block of package.json stays gate-config
+# expect: gate-config
+# hits: 1
+# detail: coverage config edited: "exclude": []
+
+diff --git a/package.json b/package.json
+index db5134e..2cc09aa 100644
+--- a/package.json
++++ b/package.json
+@@ -1,11 +1,11 @@
+ {
+   "name": "shop",
+   "scripts": {
+     "test": "nyc node --test"
+   },
+   "nyc": {
+     "check-coverage": true,
+-    "lines": 90,
+-    "exclude": []
++    "lines": 95,
++    "exclude": ["src/critical/**"]
+   }
+ }

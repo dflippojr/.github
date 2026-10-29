@@ -1,0 +1,15 @@
+# gate-guard fixture: an active COVERAGE_FLOOR commented out beside a higher value: the floor is removed, so the command falls back to 0
+# expect: floor-lowered gate-config
+# hits: 2
+# detail: COVERAGE_FLOOR lowered: was 90, 0, now 0
+# detail: coverage config edited: # COVERAGE_FLOOR=95
+
+diff --git a/scripts/coverage.sh b/scripts/coverage.sh
+index a9a6ed8..326849f 100644
+--- a/scripts/coverage.sh
++++ b/scripts/coverage.sh
+@@ -1,3 +1,3 @@
+ #!/bin/sh
+-COVERAGE_FLOOR=90
++# COVERAGE_FLOOR=95
+ pytest --cov=app --cov-fail-under="${COVERAGE_FLOOR:-0}"

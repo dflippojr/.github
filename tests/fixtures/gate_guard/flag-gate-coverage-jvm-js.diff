@@ -1,5 +1,5 @@
-# gate-guard fixture: JaCoCo minimum, c8 --check-coverage, a Jest threshold and .nycrc edits
-# expect: gate-config
+# gate-guard fixture: JaCoCo minimum, c8 --check-coverage, a Jest threshold and .nycrc edits (floors lowered are floor-lowered hits)
+# expect: floor-lowered gate-config
 # hits: 4
 
 diff --git a/.nycrc.json b/.nycrc.json

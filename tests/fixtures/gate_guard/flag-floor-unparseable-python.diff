@@ -1,0 +1,30 @@
+# gate-guard fixture: floors the parser can't read stay gate-config: an exponent and an interpolation
+# expect: floor-lowered gate-config
+# hits: 3
+# detail: fail_under in [report] removed (was 90)
+# detail: coverage config modified
+# detail: coverage config edited: fail_under
+
+diff --git a/.coveragerc b/.coveragerc
+index f924547..dc7ec80 100644
+--- a/.coveragerc
++++ b/.coveragerc
+@@ -1,6 +1,6 @@
+ [run]
+ source = calc
+ 
+ [report]
+-fail_under = 90
++fail_under = 9.2e1
+ show_missing = true
+diff --git a/setup.cfg b/setup.cfg
+index 6c7752f..6ba05ed 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -1,5 +1,5 @@
+ [metadata]
+ name = calc
+ 
+ [coverage:report]
+-fail_under = %(floor)s
++fail_under = %(floor2)s

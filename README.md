@@ -33,7 +33,65 @@ merging the pull request would change and reports each hit in the job summary:
 | `removed-tests` | A deleted test file, or fewer test functions in a file (`def test_`, `test(`/`it(`, `@Test`, `#[test]`, `func Test`, and in a C/C++ source or header under a test directory, Unity `RUN_TEST(name)` and `void test_name(void)`, counted over the whole file); in a C/C++ or PlatformIO repository, any change that could change which tests run or what they include (see below). |
 | `skip-marker` | A new `pytest.mark.skip`/`skipif`/`xfail`, `unittest.skip`, `.skip(`/`.only(`/`test.fixme`/`xit(`/`xdescribe(`, `@Disabled`, `#[ignore]`, any change to a PlatformIO `platformio.ini` (see below), or pytest `--deselect`/`-k "not …"` in config. `pytest.skip()` and Go `t.Skip()` count when unconditional or when the condition checks `CI`. |
 | `retry` | New or raised Playwright `retries`, `--reruns`, `pytest-rerunfailures`, `flaky`, `jest.retryTimes`, Surefire `rerunFailingTestsCount`. |
-| `gate-config` | Any edit to `.github/workflows/**`, `sonar-project.properties`, `CODEOWNERS` or coverage config (`.coveragerc`, `[tool.coverage]`, `fail_under`, JaCoCo rules, c8/nyc/Jest thresholds); a lint rule disabled; a size or performance budget raised. |
+| `gate-config` | Any edit to `.github/workflows/**`, `sonar-project.properties`, `CODEOWNERS` or coverage config (`.coveragerc`, `[tool.coverage]`, `fail_under`, JaCoCo rules, c8/nyc/Jest thresholds), except a coverage-config edit outside workflows that only changes floors the guard reads (see `floor-lowered`); a lint rule disabled; a size or performance budget raised. |
+| `floor-lowered` | A coverage floor lowered or removed. A raised floor, or a new line that holds only a floor, needs no approval. |
+
+Floors only ratchet up, so raising one is not a hit. The guard reads both sides
+of each changed file whole and compares these floors by what they gate:
+
+- pytest-cov: `fail_under` in `[report]` or `[coverage:report]` of
+  `.coveragerc`, `[coverage:report]` of `setup.cfg` or `tox.ini`, and
+  `[tool.coverage.report]` of `pyproject.toml`; and `--cov-fail-under=N` in any
+  file;
+- JaCoCo: each `<limit>`'s numeric `<minimum>` (`0.80` or `80%`) in a
+  `pom.xml`, per rule scope (the profile, `pluginManagement` and execution
+  `<id>` around it, its `<element>`, and its `<includes>` and `<excludes>`,
+  in any order), counter and `COVEREDRATIO` or `COVEREDCOUNT` value, so rules
+  that swap places or scopes keep their own floors; and a numeric
+  `<properties>` entry that a `<minimum>` names as
+  `${name}` in the same file, or whose name says jacoco or coverage and min,
+  floor or threshold (not version), as a child module's
+  `<jacoco.minimum.line>`;
+- c8/nyc: `lines`, `branches`, `functions` and `statements` in the `c8` or
+  `nyc` block of `package.json` and at the top of `.c8rc`, `.c8rc.json`,
+  `.nycrc` or `.nycrc.json`, and the same flags of a `package.json` script
+  that runs `c8` or `nyc` with `--check-coverage`;
+- `COVERAGE_FLOOR` set to a number (`COVERAGE_FLOOR=N`, `COVERAGE_FLOOR: N`,
+  `${COVERAGE_FLOOR:-N}`) in any file;
+- `--fail-under-line`, `--fail-under-branch` and the other
+  `--fail-under-*` flags of gcovr and cargo-llvm-cov, in any file.
+
+A floor in a comment (`#`, `//`, `/* */`, `<!-- -->`, or `;` in an ini file)
+is no floor, so commenting one out removes it. A quoted floor counts only as a
+whole TOML or YAML value or list item (`addopts = "--cov-fail-under=85"`) or
+as `${COVERAGE_FLOOR:-N}` in double quotes; any other (`echo
+"COVERAGE_FLOOR=95"`) is not a floor, and no line that sets that floor in the
+file is exempt. A file where a string or comment spans lines (a docstring,
+a heredoc, an unclosed quote) and that holds a `COVERAGE_FLOOR` or flag floor
+on either side is a `gate-config` hit whatever its change, since wrapping a
+floor in one makes it inactive without changing its line.
+
+A changed line that only changes a floor's number, or adds or removes a line
+that holds only a floor, is then not a `gate-config` hit; any other change to
+coverage config still is, beside a raise or not: an `omit`, a `check-coverage`
+switch, any other changed line in the `nyc` or `c8` block of `package.json`
+(an `exclude`), in a JaCoCo plugin (a `<goal>`, `<skip>`, `<excludes>` or
+`<include>`; its `<version>` line aside) or in a `<properties>` entry such a
+plugin names, a changed line that names `COVERAGE_FLOOR` outside a test file,
+a floor the guard can't read (`9.2e1`, `${prop}`, `"$FLOOR"`, a Jest
+threshold, YAML or JavaScript config, JSON with comments or a repeated key, a
+JaCoCo `<limit>` with two `<minimum>`s, a JaCoCo rule whose scope names a
+property or that shares its scope with another rule),
+and every edit to a workflow, whose floors are compared only to report a
+lowering. A coverage config file added, deleted or renamed stays a hit, and so
+does a `pyproject.toml`, `setup.cfg`, `tox.ini`, `package.json`, `pom.xml`,
+`build.gradle` or Jest, Vitest or Karma config that is moved or renamed while
+it holds coverage settings, even unchanged: its tool finds it by name and
+place, so the move can drop its floors. With `--diff-file` a rename the diff
+shows no content of is a hit. A floor set more or fewer times in a file than
+before is a hit when one is gone or any is below the old highest. Docs and
+test files are not read for floors, and with `--diff-file` only files the diff
+shows whole are.
 
 C/C++ and PlatformIO repositories fail closed instead. Ten review rounds each
 found another way a model of the preprocessor or of PlatformIO's config missed

@@ -1,0 +1,46 @@
+# gate-guard fixture: pytest-cov floors lowered in .coveragerc, pyproject.toml and setup.cfg
+# expect: floor-lowered
+# hits: 4
+# detail: fail_under in [report] lowered from 90 to 88
+# detail: --cov-fail-under lowered from 85 to 80
+# detail: fail_under in [tool.coverage.report] lowered from 90.5 to 90
+# detail: fail_under in [coverage:report] lowered from 80 to 79
+
+diff --git a/.coveragerc b/.coveragerc
+index f924547..c835f58 100644
+--- a/.coveragerc
++++ b/.coveragerc
+@@ -1,6 +1,6 @@
+ [run]
+ source = calc
+ 
+ [report]
+-fail_under = 90
++fail_under = 88
+ show_missing = true
+diff --git a/pyproject.toml b/pyproject.toml
+index 614912b..d5789c5 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,8 +1,8 @@
+ [project]
+ name = "calc"
+ 
+ [tool.pytest.ini_options]
+-addopts = "--cov=calc --cov-fail-under=85"
++addopts = "--cov=calc --cov-fail-under=80"
+ 
+ [tool.coverage.report]
+-fail_under = 90.5
++fail_under = 90
+diff --git a/setup.cfg b/setup.cfg
+index d147418..88e16b9 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -1,5 +1,5 @@
+ [metadata]
+ name = calc
+ 
+ [coverage:report]
+-fail_under = 80
++fail_under = 79

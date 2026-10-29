@@ -1,0 +1,28 @@
+# gate-guard fixture: c8/nyc floors unchanged beside a package rename
+# expect: 
+# hits: 0
+
+diff --git a/package.json b/package.json
+index 6dc60eb..5dea30f 100644
+--- a/package.json
++++ b/package.json
+@@ -1,18 +1,18 @@
+ {
+-  "name": "shop",
++  "name": "store",
+   "scripts": {
+     "test": "c8 --check-coverage --lines 90 --branches 80 node --test"
+   },
+   "nyc": {
+     "check-coverage": true,
+     "functions": 70,
+     "lines": 85
+   },
+   "jest": {
+     "coverageThreshold": {
+       "global": {
+         "lines": 60
+       }
+     }
+   }
+ }

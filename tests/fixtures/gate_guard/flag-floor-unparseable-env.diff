@@ -1,0 +1,19 @@
+# gate-guard fixture: floors the parser can't read: COVERAGE_FLOOR from a file, gcovr from a variable
+# expect: floor-lowered gate-config
+# hits: 2
+# detail: COVERAGE_FLOOR removed (was 83.07)
+# detail: coverage config edited
+
+diff --git a/scripts/check.sh b/scripts/check.sh
+index b6b0be2..6bc3e68 100644
+--- a/scripts/check.sh
++++ b/scripts/check.sh
+@@ -1,6 +1,6 @@
+ #!/bin/sh
+ set -e
+-COVERAGE_FLOOR=83.07
++COVERAGE_FLOOR=$(cat .floor)
+ cargo llvm-cov report --fail-under-lines "$COVERAGE_FLOOR"
+-gcovr --root .. --print-summary --fail-under-line "$LINE_FLOOR"
++gcovr --root .. --print-summary --fail-under-line "$FLOOR"
+ echo "done"

@@ -111,7 +111,7 @@ class Fixtures(unittest.TestCase):
         flagged = set()
         for p in FIXTURES.glob("flag-*.diff"):
             flagged |= fixture_expectations(p)[0]
-        self.assertEqual(flagged, {"removed-tests", "skip-marker", "retry", "gate-config"})
+        self.assertEqual(flagged, {"removed-tests", "skip-marker", "retry", "gate-config", "floor-lowered"})
         self.assertTrue(any(n.startswith("pass-") for n in names))
 
     def test_fixture_verdicts(self):
@@ -1713,6 +1713,212 @@ def _trees(diff_text):
     return before, after
 
 
+class FloorLowered(unittest.TestCase):
+    """Issue #21: a coverage floor may rise without the owner's label; lowering or removing one is a hit."""
+    PYPROJECT = '[project]\nname = "calc"\n\n[tool.coverage.report]\nfail_under = {}\n'
+
+    def floor_hits(self, base, head):
+        return [(h.rule, h.path, h.detail) for h in judge_commits(base, head)]
+
+    def test_raise_passes_and_lowering_fails_through_git(self):
+        base = {"pyproject.toml": self.PYPROJECT.format("90"), "calc.py": "x = 1\n"}
+        self.assertEqual(self.floor_hits(base, {"pyproject.toml": self.PYPROJECT.format("92"), "calc.py": "x = 1\n"}),
+                         [])
+        self.assertEqual(self.floor_hits(base, {"pyproject.toml": self.PYPROJECT.format("89.5"), "calc.py": "x = 1\n"}),
+                         [("floor-lowered", "pyproject.toml",
+                           "coverage floor fail_under in [tool.coverage.report] lowered from 90 to 89.5")])
+
+    def test_cli_exit_status_for_a_raise_and_a_lowering(self):
+        for floor, expected in (("91", 0), ("85", 1)):
+            with self.subTest(floor=floor), tempfile.TemporaryDirectory() as tmp:
+                subprocess.run(["git", "init", "-q", tmp], check=True, capture_output=True)
+                git_commit(tmp, {".coveragerc": "[report]\nfail_under = 90\n"}, "base")
+                git_commit(tmp, {".coveragerc": f"[report]\nfail_under = {floor}\n"}, "head")
+                code, out = run_main(["--repo-dir", tmp, "--base", "HEAD^1", "--head", "HEAD"])
+                self.assertEqual(code, expected, out)
+
+    def test_equal_values_written_differently_are_unchanged(self):
+        limit = ("<project><build><plugins><plugin><configuration><rules><rule><limits>\n<limit>\n"
+                 "<counter>LINE</counter>\n<minimum>{}</minimum>\n</limit>\n</limits></rule></rules>"
+                 "</configuration></plugin></plugins></build></project>\n")
+        self.assertEqual(self.floor_hits({"pom.xml": limit.format("0.80")}, {"pom.xml": limit.format("80%")}), [])
+        self.assertEqual(self.floor_hits({"pom.xml": limit.format("0.80")}, {"pom.xml": limit.format("79%")}),
+                         [("floor-lowered", "pom.xml", "coverage floor JaCoCo BUNDLE LINE COVEREDRATIO minimum "
+                           "lowered from 0.80 to 79%")])
+
+    def test_commented_out_jacoco_limit_is_a_removed_floor(self):
+        lines = ["<project><build><plugins><plugin><configuration><rules><rule><limits>", "<limit>",
+                 "<counter>BRANCH</counter>", "<value>COVEREDRATIO</value>", "<minimum>0.70</minimum>", "</limit>",
+                 "</limits></rule></rules></configuration></plugin></plugins></build></project>", ""]
+        commented = lines[:1] + ["<!--"] + lines[1:6] + ["-->"] + lines[6:]
+        hits = self.floor_hits({"pom.xml": "\n".join(lines)}, {"pom.xml": "\n".join(commented)})
+        self.assertIn(("floor-lowered", "pom.xml",
+                       "coverage floor JaCoCo BUNDLE BRANCH COVEREDRATIO minimum removed (was 0.70)"), hits)
+
+    def test_a_second_minimum_in_a_limit_stays_gate_config(self):
+        pom = ("<project>\n<properties>\n<jacoco.minimum.line>0.90</jacoco.minimum.line>\n</properties>\n<rules><rule>"
+               "<limits>\n<limit>\n<counter>LINE</counter>\n{}<minimum>${{jacoco.minimum.line}}</minimum>\n</limit>\n"
+               "</limits></rule></rules>\n</project>\n")
+        hits = self.floor_hits({"pom.xml": pom.format("")}, {"pom.xml": pom.format("<minimum>0.10</minimum>\n")})
+        self.assertEqual(hits, [("gate-config", "pom.xml", "coverage config edited: <minimum>0.10</minimum>")])
+
+    def test_version_and_unrelated_properties_are_not_floors(self):
+        pom = "<project>\n<properties>\n<jacoco.version>{}</jacoco.version>\n<retries>{}</retries>\n</properties>\n</project>\n"
+        self.assertEqual(self.floor_hits({"pom.xml": pom.format("0.8.12", "3")}, {"pom.xml": pom.format("0.8", "1")}),
+                         [])
+
+    def test_indented_ini_fail_under_is_not_a_floor(self):
+        # configparser reads an indented line as part of the value above it.
+        base = {".coveragerc": "[report]\nfail_under = 90\n"}
+        hits = self.floor_hits(base, {".coveragerc": "[report]\nfail_under = 90\n  fail_under = 95\n"})
+        self.assertEqual(hits, [("gate-config", ".coveragerc", "coverage config modified")])
+
+    def test_duplicate_json_keys_cannot_be_read(self):
+        base = {".nycrc": '{\n  "lines": 90\n}\n'}
+        hits = self.floor_hits(base, {".nycrc": '{\n  "lines": 95,\n  "lines": 10\n}\n'})
+        self.assertEqual(hits, [("gate-config", ".nycrc", "coverage config modified")])
+
+    def test_floors_in_docs_and_tests_are_not_read(self):
+        base = {"README.md": "COVERAGE_FLOOR=90\n", "tests/test_floor.py": "COVERAGE_FLOOR = 90\n"}
+        head = {"README.md": "COVERAGE_FLOOR=10\n", "tests/test_floor.py": "COVERAGE_FLOOR = 10\n"}
+        self.assertEqual(self.floor_hits(base, head), [])
+
+    def test_a_new_floor_line_passes(self):
+        base = {"scripts/check.sh": "#!/bin/sh\npytest\n", "setup.cfg": "[coverage:report]\nshow_missing = true\n"}
+        head = {"scripts/check.sh": "#!/bin/sh\nexport COVERAGE_FLOOR=80\npytest\n",
+                "setup.cfg": "[coverage:report]\nfail_under = 80\nshow_missing = true\n"}
+        self.assertEqual(self.floor_hits(base, head), [])
+
+    def test_a_floor_read_from_a_variable_stays_gate_config(self):
+        base = {"scripts/check.sh": "#!/bin/sh\npytest --cov-fail-under=80\n"}
+        head = {"scripts/check.sh": "#!/bin/sh\npytest --cov-fail-under=\"$COVERAGE_FLOOR\"\n"}
+        self.assertEqual(self.floor_hits(base, head), [
+            ("floor-lowered", "scripts/check.sh", "coverage floor --cov-fail-under removed (was 80)"),
+            ("gate-config", "scripts/check.sh", "coverage config edited: pytest --cov-fail-under=80 (+1 more)")])
+
+    def test_a_partial_diff_file_keeps_the_gate_config_hit(self):
+        # Without full context the guard can't read the sections, so a raise needs approval as before.
+        diff = ("diff --git a/pyproject.toml b/pyproject.toml\n--- a/pyproject.toml\n+++ b/pyproject.toml\n"
+                "@@ -8,3 +8,3 @@\n [tool.coverage.report]\n-fail_under = 90\n+fail_under = 95\n show_missing = true\n")
+        self.assertEqual([(h.rule, h.detail) for h in analyze_text(diff)],
+                         [("gate-config", "coverage config edited: fail_under = 90 (+1 more)")])
+
+    # Round 2 of PR #50: the four bypasses of the Codex review.
+
+    COVERAGE_CONFIGS = {
+        "pyproject.toml": PYPROJECT.format("90"),
+        "setup.cfg": "[metadata]\nname = calc\n\n[coverage:run]\nomit = calc/slow.py\n",
+        "package.json": '{\n  "name": "shop",\n  "nyc": {\n    "lines": 90\n  }\n}\n',
+        "pom.xml": ("<project>\n<build><plugins><plugin>\n<artifactId>jacoco-maven-plugin</artifactId>\n"
+                    "</plugin></plugins></build>\n</project>\n"),
+    }
+
+    def test_a_pure_move_of_a_coverage_config_needs_approval(self):
+        for name, text in self.COVERAGE_CONFIGS.items():
+            for moved in (f"retired/{name}", f"{name}.bak"):
+                with self.subTest(moved=moved):
+                    hits = self.floor_hits({name: text, "calc.py": "x = 1\n"}, {moved: text, "calc.py": "x = 1\n"})
+                    self.assertIn(("gate-config", moved, "coverage config renamed"), hits)
+
+    def test_a_pure_move_of_a_coverage_config_to_a_doc_or_lint_name_needs_approval(self):
+        # Round 3: a doc or lint destination must not exempt the move, though the diff has no lines to read.
+        text = self.COVERAGE_CONFIGS["pyproject.toml"]
+        for moved in ("pyproject.toml.txt", ".eslintrc.json"):
+            with self.subTest(moved=moved):
+                hits = self.floor_hits({"pyproject.toml": text, "calc.py": "x = 1\n"},
+                                       {moved: text, "calc.py": "x = 1\n"})
+                self.assertIn(("gate-config", moved, "coverage config renamed"), hits)
+
+    def test_a_pure_move_between_directories_of_a_nested_config_needs_approval(self):
+        text = self.COVERAGE_CONFIGS["package.json"]
+        hits = self.floor_hits({"web/package.json": text}, {"site/web/package.json": text})
+        self.assertEqual(hits, [("gate-config", "site/web/package.json", "coverage config renamed")])
+
+    def test_a_pure_move_of_a_config_without_coverage_passes(self):
+        text = '{\n  "name": "shop",\n  "scripts": {\n    "test": "node --test"\n  }\n}\n'
+        self.assertEqual(self.floor_hits({"web/package.json": text}, {"site/package.json": text}), [])
+
+    def test_a_pure_rename_in_a_diff_file_fails_closed(self):
+        # The diff shows no content, so the guard can't tell whether the moved file holds coverage settings.
+        diff = ("diff --git a/pyproject.toml b/retired/pyproject.toml\nsimilarity index 100%\n"
+                "rename from pyproject.toml\nrename to retired/pyproject.toml\n")
+        self.assertEqual([(h.rule, h.path, h.detail) for h in analyze_text(diff)],
+                         [("gate-config", "retired/pyproject.toml", "coverage config renamed")])
+
+    JACOCO_RULE = ("<rule>\n<element>CLASS</element>\n<includes>\n<include>{}</include>\n</includes>\n<limits>\n"
+                   "<limit>\n<counter>LINE</counter>\n<value>COVEREDRATIO</value>\n<minimum>{}</minimum>\n</limit>\n"
+                   "</limits>\n</rule>\n")
+
+    def jacoco_pom(self, *executions):
+        out = ["<project>\n<build><plugins><plugin>\n<artifactId>jacoco-maven-plugin</artifactId>\n<executions>\n"]
+        for exec_id, rules in executions:
+            out.append(f"<execution>\n<id>{exec_id}</id>\n<configuration><rules>\n")
+            out += [self.JACOCO_RULE.format(*rule) for rule in rules]
+            out.append("</rules></configuration>\n</execution>\n")
+        out.append("</executions>\n</plugin></plugins></build>\n</project>\n")
+        return {"pom.xml": "".join(out)}
+
+    def test_jacoco_rules_in_swapped_executions_keep_their_identity(self):
+        base = self.jacoco_pom(("unit", [("*", "0.90")]), ("integration", [("*", "0.50")]))
+        head = self.jacoco_pom(("integration", [("*", "0.95")]), ("unit", [("*", "0.60")]))
+        hits = self.floor_hits(base, head)
+        self.assertIn(("floor-lowered", "pom.xml",
+                       "coverage floor JaCoCo CLASS LINE COVEREDRATIO minimum in execution unit for includes * "
+                       "lowered from 0.90 to 0.60"), hits)
+        self.assertIn("gate-config", [h[0] for h in hits])
+
+    def test_jacoco_rule_scope_from_a_property_stays_gate_config(self):
+        base = self.jacoco_pom(("check", [("${critical.classes}", "0.90")]))
+        head = self.jacoco_pom(("check", [("${critical.classes}", "0.95")]))
+        self.assertEqual(self.floor_hits(base, head),
+                         [("gate-config", "pom.xml", "coverage config edited: <minimum>0.90</minimum> (+1 more)")])
+
+    def test_jacoco_rules_with_one_identity_stay_gate_config(self):
+        base = self.jacoco_pom(("check", [("*", "0.90"), ("*", "0.50")]))
+        head = self.jacoco_pom(("check", [("*", "0.95"), ("*", "0.60")]))
+        self.assertEqual(self.floor_hits(base, head),
+                         [("gate-config", "pom.xml", "coverage config edited: <minimum>0.90</minimum> (+3 more)")])
+
+    def test_commented_out_floors_are_removed(self):
+        for path, active, commented in (
+                (".gitlab-ci.yml", "variables:\n  COVERAGE_FLOOR: 90\n", "variables:\n  # COVERAGE_FLOOR: 95\n"),
+                ("scripts/check.mjs", "const COVERAGE_FLOOR = 90;\n", "// const COVERAGE_FLOOR = 95;\n"),
+                ("scripts/check.mjs", "const COVERAGE_FLOOR = 90;\n", "/*\nconst COVERAGE_FLOOR = 95;\n*/\n"),
+                ("Makefile", "check:\n\tpytest --cov-fail-under=90\n", "check:\n\tpytest  # --cov-fail-under=95\n")):
+            with self.subTest(path=path, commented=commented):
+                rules = {h[0] for h in self.floor_hits({path: active}, {path: commented})}
+                self.assertEqual(rules, {"floor-lowered", "gate-config"})
+
+    def test_quoted_floors_count_only_as_whole_values(self):
+        addopts = '[tool.pytest.ini_options]\naddopts = ["--cov", "--cov-fail-under={}"]\n'
+        self.assertEqual(self.floor_hits({"pyproject.toml": addopts.format(80)}, {"pyproject.toml": addopts.format(85)}),
+                         [])
+        script = "#!/bin/sh\npytest --cov-fail-under=\"${{COVERAGE_FLOOR:-{}}}\"\n"
+        self.assertEqual(self.floor_hits({"check.sh": script.format(80)}, {"check.sh": script.format(85)}), [])
+        hits = self.floor_hits({".gitlab-ci.yml": "script:\n  - COVERAGE_FLOOR=90 make check\n"},
+                               {".gitlab-ci.yml": "script:\n  - echo \"COVERAGE_FLOOR=95\"\n  - make check\n"})
+        self.assertEqual({h[0] for h in hits}, {"floor-lowered", "gate-config"})
+
+    def test_an_unchanged_floor_wrapped_in_a_string_or_heredoc_stays_gate_config(self):
+        # Only the wrapper lines change, and none of them names a floor.
+        for path, active, wrapped in (
+                ("noxfile.py", "COVERAGE_FLOOR = 90\n", '"""\nCOVERAGE_FLOOR = 90\n"""\n'),
+                ("scripts/check.sh", "COVERAGE_FLOOR=90\npytest\n", ": <<'EOF'\nCOVERAGE_FLOOR=90\nEOF\npytest\n"),
+                ("pyproject.toml", '[tool.pytest.ini_options]\naddopts = "--cov-fail-under=85"\n',
+                 "[tool.pytest.ini_options]\nx = '''\naddopts = \"--cov-fail-under=85\"\n'''\n")):
+            with self.subTest(path=path):
+                self.assertIn(("gate-config", path, "coverage floor in a string or heredoc the guard can't follow"),
+                              self.floor_hits({path: active}, {path: wrapped}))
+
+    def test_a_floor_in_a_docstring_or_heredoc_stays_gate_config(self):
+        for path, active, inactive in (
+                ("noxfile.py", "COVERAGE_FLOOR = 90\n", 'DOC = """\nCOVERAGE_FLOOR = 95\n"""\n'),
+                ("scripts/check.sh", "COVERAGE_FLOOR=90\n", "cat <<EOF\nCOVERAGE_FLOOR=95\nEOF\n")):
+            with self.subTest(path=path):
+                rules = {h[0] for h in self.floor_hits({path: active}, {path: inactive})}
+                self.assertIn("gate-config", rules)
+
+
 class GitEndToEnd(unittest.TestCase):
     """The CLI diffs two real commits the way the workflow does and reaches the same verdict."""
 
@@ -1731,7 +1937,7 @@ class GitEndToEnd(unittest.TestCase):
                      "flag-python-cpp-collect-ignore-multiline", "pass-python-cpp-assert-approx-tolerance",
                      "pass-python-cpp-assert-beside-skipif", "flag-python-cpp-computed-globals-key",
                      "flag-python-cpp-assert-in-with", "flag-python-cpp-assert-unary-none",
-                     "pass-python-cpp-assert-negative-literal"]:
+                     "pass-python-cpp-assert-negative-literal"] + sorted(p.stem for p in FIXTURES.glob("*-floor-*.diff")):
             with self.subTest(fixture=name), tempfile.TemporaryDirectory() as tmp:
                 subprocess.run(["git", "init", "-q", tmp], check=True, capture_output=True)
                 text = (FIXTURES / f"{name}.diff").read_text(encoding="utf-8")
