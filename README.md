@@ -44,8 +44,11 @@ of each changed file whole and compares these floors by what they gate:
   `[tool.coverage.report]` of `pyproject.toml`; and `--cov-fail-under=N` in any
   file;
 - JaCoCo: each `<limit>`'s numeric `<minimum>` (`0.80` or `80%`) in a
-  `pom.xml`, per rule element, counter and `COVEREDRATIO` or `COVEREDCOUNT`
-  value; and a numeric `<properties>` entry that a `<minimum>` names as
+  `pom.xml`, per rule scope (the profile, `pluginManagement` and execution
+  `<id>` around it, its `<element>`, and its `<includes>` and `<excludes>`,
+  in any order), counter and `COVEREDRATIO` or `COVEREDCOUNT` value, so rules
+  that swap places or scopes keep their own floors; and a numeric
+  `<properties>` entry that a `<minimum>` names as
   `${name}` in the same file, or whose name says jacoco or coverage and min,
   floor or threshold (not version), as a child module's
   `<jacoco.minimum.line>`;
@@ -58,17 +61,36 @@ of each changed file whole and compares these floors by what they gate:
 - `--fail-under-line`, `--fail-under-branch` and the other
   `--fail-under-*` flags of gcovr and cargo-llvm-cov, in any file.
 
+A floor in a comment (`#`, `//`, `/* */`, `<!-- -->`, or `;` in an ini file)
+is no floor, so commenting one out removes it. A quoted floor counts only as a
+whole TOML or YAML value or list item (`addopts = "--cov-fail-under=85"`) or
+as `${COVERAGE_FLOOR:-N}` in double quotes; any other (`echo
+"COVERAGE_FLOOR=95"`) is not a floor, and no line that sets that floor in the
+file is exempt. In a file where a string or comment spans lines (a docstring,
+a heredoc, an unclosed quote) the guard reads no `COVERAGE_FLOOR` or flag
+floor at all.
+
 A changed line that only changes a floor's number, or adds or removes a line
 that holds only a floor, is then not a `gate-config` hit; any other change to
 coverage config still is, beside a raise or not: an `omit`, a `check-coverage`
-switch, a floor the guard can't read (`9.2e1`, `${prop}`, `"$FLOOR"`, a Jest
+switch, any other changed line in the `nyc` or `c8` block of `package.json`
+(an `exclude`), in a JaCoCo plugin (a `<goal>`, `<skip>`, `<excludes>` or
+`<include>`; its `<version>` line aside) or in a `<properties>` entry such a
+plugin names, a changed line that names `COVERAGE_FLOOR` outside a test file,
+a floor the guard can't read (`9.2e1`, `${prop}`, `"$FLOOR"`, a Jest
 threshold, YAML or JavaScript config, JSON with comments or a repeated key, a
-JaCoCo `<limit>` with two `<minimum>`s),
+JaCoCo `<limit>` with two `<minimum>`s, a JaCoCo rule whose scope names a
+property or that shares its scope with another rule),
 and every edit to a workflow, whose floors are compared only to report a
-lowering. A coverage config file added, deleted or renamed stays a hit. A
-floor set more or fewer times in a file than before is a hit when one is
-gone or any is below the old highest. Docs and test files are not read for
-floors, and with `--diff-file` only files the diff shows whole are.
+lowering. A coverage config file added, deleted or renamed stays a hit, and so
+does a `pyproject.toml`, `setup.cfg`, `tox.ini`, `package.json`, `pom.xml`,
+`build.gradle` or Jest, Vitest or Karma config that is moved or renamed while
+it holds coverage settings, even unchanged: its tool finds it by name and
+place, so the move can drop its floors. With `--diff-file` a rename the diff
+shows no content of is a hit. A floor set more or fewer times in a file than
+before is a hit when one is gone or any is below the old highest. Docs and
+test files are not read for floors, and with `--diff-file` only files the diff
+shows whole are.
 
 C/C++ and PlatformIO repositories fail closed instead. Ten review rounds each
 found another way a model of the preprocessor or of PlatformIO's config missed

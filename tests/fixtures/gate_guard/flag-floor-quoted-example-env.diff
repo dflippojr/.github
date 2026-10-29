@@ -2,7 +2,7 @@
 # expect: floor-lowered gate-config
 # hits: 2
 # detail: COVERAGE_FLOOR removed (was 90)
-# detail: coverage config edited: echo "COVERAGE_FLOOR=95"
+# detail: coverage config edited: COVERAGE_FLOOR=90 (+1 more)
 
 diff --git a/scripts/check.sh b/scripts/check.sh
 index c4da92c..519fc91 100644

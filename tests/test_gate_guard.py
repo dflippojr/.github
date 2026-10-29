@@ -1880,6 +1880,16 @@ class FloorLowered(unittest.TestCase):
                 rules = {h[0] for h in self.floor_hits({path: active}, {path: commented})}
                 self.assertEqual(rules, {"floor-lowered", "gate-config"})
 
+    def test_quoted_floors_count_only_as_whole_values(self):
+        addopts = '[tool.pytest.ini_options]\naddopts = ["--cov", "--cov-fail-under={}"]\n'
+        self.assertEqual(self.floor_hits({"pyproject.toml": addopts.format(80)}, {"pyproject.toml": addopts.format(85)}),
+                         [])
+        script = "#!/bin/sh\npytest --cov-fail-under=\"${{COVERAGE_FLOOR:-{}}}\"\n"
+        self.assertEqual(self.floor_hits({"check.sh": script.format(80)}, {"check.sh": script.format(85)}), [])
+        hits = self.floor_hits({".gitlab-ci.yml": "script:\n  - COVERAGE_FLOOR=90 make check\n"},
+                               {".gitlab-ci.yml": "script:\n  - echo \"COVERAGE_FLOOR=95\"\n  - make check\n"})
+        self.assertEqual({h[0] for h in hits}, {"floor-lowered", "gate-config"})
+
     def test_a_floor_in_a_docstring_or_heredoc_stays_gate_config(self):
         for path, active, inactive in (
                 ("noxfile.py", "COVERAGE_FLOOR = 90\n", 'DOC = """\nCOVERAGE_FLOOR = 95\n"""\n'),
