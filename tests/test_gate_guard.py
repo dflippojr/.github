@@ -1521,6 +1521,30 @@ class RuleDetails(unittest.TestCase):
         self.assertEqual(details, ['budget changed: "maxImages": "14 tiles"', 'budget raised: "maxGzipBytes": 1e3,'])
         self.assertEqual(self.hits("pass-budget-file-lowered"), [])
 
+    def test_budget_exponents_beyond_a_float_compare_exactly_or_fail_closed(self):
+        details = sorted(h.detail for h in self.hits("flag-gate-budget-file-exponent-range"))
+        self.assertEqual(details, ['budget changed: "maxHeap": "9e9999 GiB",', 'budget changed: "maxIdle": 2e-99999',
+                                   'budget raised: "maxBytes": 2e400,', 'budget raised: "maxTime": 2e-400,'])
+        # Lowered the same way, they compare exactly and are no hit.
+        path = "checks/perf-budget.json"
+        diff = (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,4 +1,4 @@\n {{\n"
+                '-  "maxTime": 2e-400,\n-  "maxBytes": 2e400\n+  "maxTime": 1e-400,\n+  "maxBytes": 1e400\n }\n')
+        self.assertEqual(analyze_text(diff), [])
+
+    def test_a_padded_budget_value_with_an_inline_comment_is_read_in_bounded_time(self):
+        # A YAML value on the line after its key, padded with a long run of spaces before its comment, once
+        # backtracked cubically; the guard reads it in a child process that is killed if it runs long.
+        path = "checks/perf-budget.yaml"
+        pad = " " * 3000
+        diff = (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,2 +1,2 @@\n maxBytes:\n"
+                f"-  100{pad}# explanation\n+  200{pad}# explanation\n")
+        code = ("import json, sys\nsys.path.insert(0, sys.argv[1])\nimport gate_guard\n"
+                "files = gate_guard.parse_diff(sys.stdin.read())\n"
+                "print(json.dumps([h.detail for h in gate_guard.analyze(files)]))\n")
+        out = subprocess.run([sys.executable, "-c", code, str(pathlib.Path(gate_guard.__file__).parent)],
+                             input=diff, capture_output=True, text=True, timeout=5, check=True).stdout
+        self.assertEqual(json.loads(out), ["budget raised: " + gate_guard._snippet(f"200{pad}# explanation")])
+
     def test_budget_keys_pair_with_values_on_later_lines(self):
         details = sorted(h.detail for h in self.hits("flag-gate-budget-file-split"))
         self.assertEqual(details, ["budget changed: - 120", "budget changed: 9000", "budget raised: 350",
