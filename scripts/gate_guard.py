@@ -1164,6 +1164,11 @@ BUDGET_KEYS = "maxAssetSize|maxEntrypointSize|maximumWarning|maximumError|maxNum
 BUDGET_FILE_KEYS = "limit|budget|maxSize|maxBytes|max_bytes"
 BUDGET_FILES = re.compile(
     r"^(\.size-limit.*|package\.json|\.?bundlewatch.*|\.bundlesizerc.*|budgets?\..*|\.?lighthouserc.*)$")
+# A file named for budgets ("size-budget.json", "perf_budgets.yaml") holds nothing else, so any numeric key in it is one.
+BUDGET_WORD_FILES = re.compile(r"(?:^|[-_.])budgets?(?:[-_.]|$)", re.I)
+# A JaCoCo floor set as a property, in a pom.xml's <properties> or a .properties file. Where the floor
+# parser reads a pom.xml whole, a change to one is judged by its value instead (see _jacoco_floors).
+JACOCO_PROPERTY_LINE = re.compile(r"\bjacoco\.minimum\.\w")
 JS_CONFIG_JSON = re.compile(r"^(package\.json|.*(config|rc)\.jsonc?)$")
 KEY_LINE = re.compile(r"^\s*[\"']?([\w.\-/@]+)[\"']?\s*[:=]")
 SIZE_UNITS = {"": 1, "b": 1, "kb": 1e3, "kib": 1024, "mb": 1e6, "mib": 2 ** 20, "gb": 1e9,
@@ -1171,8 +1176,12 @@ SIZE_UNITS = {"": 1, "b": 1, "kb": 1e3, "kib": 1024, "mb": 1e6, "mib": 2 ** 20, 
 
 
 def _budget_re(path):
+    value = r"[\"']?\s*[:=]\s*[\"']?(-?\d+(?:\.\d+)?)\s*([A-Za-z]*)"
+    if BUDGET_WORD_FILES.search(_name(path)):
+        # Any key, as KEY_LINE spells one, where a key may start: a line, a flow mapping or a list.
+        return re.compile(r"(?:^|(?<=[\s{,\[]))[\"']?([\w.\-/@]+)" + value)
     keys = BUDGET_KEYS + ("|" + BUDGET_FILE_KEYS if BUDGET_FILES.match(_name(path)) else "")
-    return re.compile(r"[\"']?\b(" + keys + r")[\"']?\s*[:=]\s*[\"']?(-?\d+(?:\.\d+)?)\s*([A-Za-z]*)")
+    return re.compile(r"[\"']?\b(" + keys + r")" + value)
 
 
 def _budget_value(number, unit):
@@ -1767,6 +1776,7 @@ def gate_config_hits(files, facts):
         coverage, lint = [], []
         js_config = (_ext(fd.path) in JS_EXTS and is_config(fd.path)) or bool(JS_CONFIG_JSON.match(_name(fd.path)))
         gradle = ".gradle" in _name(fd.path)
+        jacoco_properties = _name(fd.path) == "pom.xml" or _ext(fd.path) == ".properties"
         for i, (l, section) in enumerate(zip(fd.lines, sections)):
             if section.startswith(LINT_SECTIONS):
                 lint.append(l)
@@ -1775,7 +1785,8 @@ def gate_config_hits(files, facts):
             if (i in blocks or section.startswith(COVERAGE_SECTIONS) or COVERAGE_LINE.search(l.text)
                     or (COVERAGE_FLOOR_NAME.search(l.text) and not is_test_file(fd.path))
                     or (js_config and JS_THRESHOLD.search(l.text))
-                    or (gradle and GRADLE_MINIMUM.search(l.text))):
+                    or (gradle and GRADLE_MINIMUM.search(l.text))
+                    or (jacoco_properties and JACOCO_PROPERTY_LINE.search(l.text))):
                 coverage.append(l)
         if coverage and not moved:
             first = coverage[0]
