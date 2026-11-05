@@ -1497,6 +1497,109 @@ class RuleDetails(unittest.TestCase):
         details = [h.detail for h in self.hits("flag-gate-budget")]
         self.assertEqual(sum("maximumWarning" in d for d in details), 1)
 
+    def test_a_budget_file_flags_each_raised_numeric_key_and_a_removed_one(self):
+        # In a file named for budgets, any numeric key is a budget, listed or not; an unchanged one is no hit.
+        details = sorted(h.detail for h in self.hits("flag-gate-budget-file"))
+        self.assertEqual(details, ['budget raised: "limit": 200000,', 'budget raised: "maxGzipBytes": 40000,',
+                                   "budget removed: maxImages"])
+
+    def test_budget_files_are_named_for_budgets_as_a_word(self):
+        def raised(path):
+            diff = (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,3 +1,3 @@\n"
+                    " {{\n-  \"maxKb\": 10\n+  \"maxKb\": 20\n }}\n")
+            return [h.detail for h in analyze_text(diff)]
+        for path in ("checks/size-budget.json", "perf_budgets.json", "budget.json", "web/js.budget.json"):
+            with self.subTest(path=path):
+                self.assertEqual(raised(path), ['budget raised: "maxKb": 20'])
+        for path in ("checks/budgeting.json", "checks/nobudget.json", "checks/sizes.json"):
+            with self.subTest(path=path):
+                self.assertEqual(raised(path), [])
+
+    def test_budget_numbers_are_read_whole_with_their_exponent(self):
+        # 9e2 to 1e3 raises 900 to 1000; a unit the guard doesn't know is compared as nothing, so it's a hit.
+        details = sorted(h.detail for h in self.hits("flag-gate-budget-file-exponent"))
+        self.assertEqual(details, ['budget changed: "maxImages": "14 tiles"', 'budget raised: "maxGzipBytes": 1e3,'])
+        self.assertEqual(self.hits("pass-budget-file-lowered"), [])
+
+    def test_budget_exponents_beyond_a_float_compare_exactly_or_fail_closed(self):
+        details = sorted(h.detail for h in self.hits("flag-gate-budget-file-exponent-range"))
+        self.assertEqual(details, ['budget changed: "maxHeap": "9e9999 GiB",', 'budget changed: "maxIdle": 2e-99999',
+                                   'budget raised: "maxBytes": 2e400,', 'budget raised: "maxTime": 2e-400,'])
+        # Lowered the same way, they compare exactly and are no hit.
+        path = "checks/perf-budget.json"
+        diff = (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,4 +1,4 @@\n {{\n"
+                '-  "maxTime": 2e-400,\n-  "maxBytes": 2e400\n+  "maxTime": 1e-400,\n+  "maxBytes": 1e400\n }\n')
+        self.assertEqual(analyze_text(diff), [])
+
+    def test_a_budget_value_on_its_own_line_may_space_its_comma_and_quotes(self):
+        # A listed-key file has no fallback for values it can't pair, so these must pair with their key.
+        path = ".size-limit.json"
+        diff = (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,8 +1,8 @@\n [\n  {{\n"
+                '    "limit":\n-    200000 ,\n+    300000 ,\n    "maxSize":\n-    "500kb" ,\n+    "900kb" ,\n'
+                '    "budget":\n-    "500 "\n+    "700 "\n')
+        self.assertEqual(sorted(h.detail for h in analyze_text(diff)),
+                         ['budget raised: "700 "', 'budget raised: "900kb" ,', "budget raised: 300000 ,"])
+        # The review's one-line reproduction of an exponent past a float's range.
+        path = "checks/perf-budget.json"
+        diff = (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n"
+                '-{"maxTime": 1e-400}\n+{"maxTime": 2e-400}\n')
+        self.assertEqual([h.detail for h in analyze_text(diff)], ['budget raised: {"maxTime": 2e-400}'])
+
+    def test_a_padded_budget_value_with_an_inline_comment_is_read_in_bounded_time(self):
+        # A YAML value on the line after its key, padded with a long run of spaces before its comment, once
+        # backtracked cubically; the guard reads it in a child process that is killed if it runs long.
+        path = "checks/perf-budget.yaml"
+        pad = " " * 3000
+        diff = (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,2 +1,2 @@\n maxBytes:\n"
+                f"-  100{pad}# explanation\n+  200{pad}# explanation\n")
+        code = ("import json, sys\nsys.path.insert(0, sys.argv[1])\nimport gate_guard\n"
+                "files = gate_guard.parse_diff(sys.stdin.read())\n"
+                "print(json.dumps([h.detail for h in gate_guard.analyze(files)]))\n")
+        out = subprocess.run([sys.executable, "-c", code, str(pathlib.Path(gate_guard.__file__).parent)],
+                             input=diff, capture_output=True, text=True, timeout=5, check=True).stdout
+        self.assertEqual(json.loads(out), ["budget raised: " + gate_guard._snippet(f"200{pad}# explanation")])
+
+    def test_budget_keys_pair_with_values_on_later_lines(self):
+        details = sorted(h.detail for h in self.hits("flag-gate-budget-file-split"))
+        self.assertEqual(details, ["budget changed: - 120", "budget changed: 9000", "budget raised: 350",
+                                   "budget raised: 40000,", "budget removed: maxImages"])
+
+    def test_jacoco_property_values_on_their_own_lines_are_coverage_edits(self):
+        for name, paths in (("flag-gate-coverage-jacoco-continued",
+                             ["app/gradle.properties", "config/coverage.properties", "gradle.properties"]),
+                            ("flag-gate-coverage-jacoco-multiline-xml",
+                             ["api/pom.xml", "child/pom.xml", "lib/pom.xml", "web/pom.xml"])):
+            with self.subTest(fixture=name):
+                hits = self.hits(name)
+                self.assertEqual(sorted(h.path for h in hits), paths)
+                self.assertTrue(all(h.detail.startswith("coverage config edited: ") for h in hits), hits)
+
+    def test_a_jacoco_property_tag_split_over_lines_holds_its_value(self):
+        diff = ("diff --git a/lib/pom.xml b/lib/pom.xml\n--- a/lib/pom.xml\n+++ b/lib/pom.xml\n@@ -40,6 +40,6 @@\n"
+                "   <properties>\n     <jacoco.minimum.line\n         combine.self=\"override\">\n-      0.87\n"
+                "+      0.50\n     </jacoco.minimum.line>\n   </properties>\n")
+        self.assertEqual([h.detail for h in analyze_text(diff)], ["coverage config edited: 0.87 (+1 more)"])
+
+    def test_lines_outside_a_jacoco_property_are_not_coverage_edits(self):
+        def hits(path, body):
+            return analyze_text(f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n{body}")
+        # An even run of trailing backslashes is literal: the next line starts a key of its own.
+        self.assertEqual(hits("gradle.properties", "@@ -1,3 +1,3 @@\n dir=C:\\\\\n-retries=2\n+retries=3\n"
+                                                   " jacoco.minimum.line=0.87\n"), [])
+        # A changed line after a jacoco property's closing tag is no part of it.
+        self.assertEqual(hits("lib/pom.xml", "@@ -40,5 +40,5 @@\n     <jacoco.minimum.line>\n       0.87\n"
+                                             "     </jacoco.minimum.line>\n-    <java.version>17</java.version>\n"
+                                             "+    <java.version>21</java.version>\n"), [])
+        # A multiline floor the parser reads, raised in a pom.xml shown whole, only changes the floor.
+        pom = ("@@ -1,7 +1,7 @@\n <project>\n   <properties>\n     <jacoco.minimum.line>\n-      0.80\n"
+               "+      0.90\n     </jacoco.minimum.line>\n   </properties>\n </project>\n")
+        self.assertEqual(hits("pom.xml", pom), [])
+        # A property's tag named in an XML comment opens nothing, so a later edit is no part of a value.
+        commented = ("@@ -1,6 +1,6 @@\n <project>\n   <!-- set <jacoco.minimum.line> in the parent -->\n"
+                     "   <dependencies>\n-    <version>1.0</version>\n+    <version>1.1</version>\n"
+                     "   </dependencies>\n </project>\n")
+        self.assertEqual(hits("child/pom.xml", commented), [])
+
 
 class Parser(unittest.TestCase):
     def test_removed_lines_that_look_like_headers(self):
@@ -1672,6 +1775,14 @@ class Main(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("**Failing with 2 hits:** no label.", out)
         self.assertIn("::error file=.github/workflows/ci.yml,title=gate-guard gate-config::workflow modified", out)
+
+    def test_a_lowered_jacoco_property_fails_without_the_label(self):
+        with mock.patch.object(gate_guard, "approval", return_value=(False, "no label")):
+            code, out = run_main(["--diff-file", str(FIXTURES / "flag-gate-coverage-jacoco-property.diff")],
+                                 {"GITHUB_ACTIONS": "true"})
+        self.assertEqual(code, 1)
+        self.assertIn("**Failing with 2 hits:** no label.", out)
+        self.assertIn("::error file=gradle.properties,title=gate-guard gate-config::coverage config edited", out)
 
     def test_clean_diff_skips_the_label_lookup(self):
         with mock.patch.object(gate_guard, "approval") as approval:

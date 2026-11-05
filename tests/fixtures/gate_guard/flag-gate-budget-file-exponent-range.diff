@@ -1,0 +1,27 @@
+# gate-guard fixture: budget numbers whose exponents a float can't hold, compared exactly or not at all
+# expect: gate-config
+# hits: 4
+# detail: budget raised: "maxTime": 2e-400,
+# detail: budget raised: "maxBytes": 2e400,
+# detail: budget changed: "maxHeap": "9e9999 GiB",
+# detail: budget changed: "maxIdle": 2e-99999
+#
+# 1e-400 to 2e-400 and 1e400 to 2e400 are raises; as floats both sides would be 0.0 or infinity, so they
+# are compared as exact decimals. A value too large or too small to hold exactly once scaled by its unit
+# (9e9999 GiB, 2e-99999) can't be compared, so any change to it is a hit.
+
+diff --git a/checks/perf-budget.json b/checks/perf-budget.json
+index 3b1d2e4..4c2e3f5 100644
+--- a/checks/perf-budget.json
++++ b/checks/perf-budget.json
+@@ -1,6 +1,6 @@
+ {
+-  "maxTime": 1e-400,
+-  "maxBytes": 1e400,
+-  "maxHeap": "8e9999 GiB",
+-  "maxIdle": 1e-99999
++  "maxTime": 2e-400,
++  "maxBytes": 2e400,
++  "maxHeap": "9e9999 GiB",
++  "maxIdle": 2e-99999
+ }

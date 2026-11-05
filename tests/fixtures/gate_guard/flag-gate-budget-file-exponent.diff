@@ -1,0 +1,23 @@
+# gate-guard fixture: budget file numbers in scientific notation, and one with a unit the guard can't compare
+# expect: gate-config
+# hits: 2
+# detail: budget raised: "maxGzipBytes": 1e3,
+# detail: budget changed: "maxImages": "14 tiles"
+#
+# A number is read whole, exponent and all, before its unit: 9e2 to 1e3 raises 900 to 1000. A number
+# followed by a unit the guard doesn't know can't be compared, so any change to it is a hit. The lowered
+# exponent (2E+3 to 1.5e3) is no hit (see pass-budget-file-lowered).
+
+diff --git a/checks/size-budget.json b/checks/size-budget.json
+index 9a1c2e4..1f2e3d4 100644
+--- a/checks/size-budget.json
++++ b/checks/size-budget.json
+@@ -1,5 +1,5 @@
+ {
+-  "maxGzipBytes": 9e2,
+-  "maxBytes": 2E+3,
+-  "maxImages": "12 tiles"
++  "maxGzipBytes": 1e3,
++  "maxBytes": 1.5e3,
++  "maxImages": "14 tiles"
+ }

@@ -33,7 +33,7 @@ merging the pull request would change and reports each hit in the job summary:
 | `removed-tests` | A deleted test file, or fewer test functions in a file (`def test_`, `test(`/`it(`, `@Test`, `#[test]`, `func Test`, and in a C/C++ source or header under a test directory, Unity `RUN_TEST(name)` and `void test_name(void)`, counted over the whole file); in a C/C++ or PlatformIO repository, any change that could change which tests run or what they include (see below). |
 | `skip-marker` | A new `pytest.mark.skip`/`skipif`/`xfail`, `unittest.skip`, `.skip(`/`.only(`/`test.fixme`/`xit(`/`xdescribe(`, `@Disabled`, `#[ignore]`, any change to a PlatformIO `platformio.ini` (see below), or pytest `--deselect`/`-k "not …"` in config. `pytest.skip()` and Go `t.Skip()` count when unconditional or when the condition checks `CI`. |
 | `retry` | New or raised Playwright `retries`, `--reruns`, `pytest-rerunfailures`, `flaky`, `jest.retryTimes`, Surefire `rerunFailingTestsCount`. |
-| `gate-config` | Any edit to `.github/workflows/**`, `sonar-project.properties`, `CODEOWNERS` or coverage config (`.coveragerc`, `[tool.coverage]`, `fail_under`, JaCoCo rules, c8/nyc/Jest thresholds), except a coverage-config edit outside workflows that only changes floors the guard reads (see `floor-lowered`); a lint rule disabled; a size or performance budget raised. |
+| `gate-config` | Any edit to `.github/workflows/**`, `sonar-project.properties`, `CODEOWNERS` or coverage config (`.coveragerc`, `[tool.coverage]`, `fail_under`, JaCoCo rules, a `jacoco.minimum.*` property in a `pom.xml` or `.properties` file, c8/nyc/Jest thresholds), except a coverage-config edit outside workflows that only changes floors the guard reads (see `floor-lowered`); a lint rule disabled; a size or performance budget raised or removed. In a budget file, one whose name has `budget` or `budgets` as a word split on `-`, `_` or `.` (`size-budget.json`, `perf_budgets.yaml`), every numeric key counts as a budget, and so does a value alone on the line after its key; a changed number there that the guard can't pair with a key (a list item, or a value whose key the diff doesn't show) is a hit whatever its direction. A budget number is read whole, exponent included (`9e2` to `1e3` is raised); one whose unit the guard doesn't know (`b`, `kb`, `kib`, `mb`, `mib`, `gb`, `gib`, `ms`, `s`) is a hit whenever it changes. |
 | `floor-lowered` | A coverage floor lowered or removed. A raised floor, or a new line that holds only a floor, needs no approval. |
 
 Floors only ratchet up, so raising one is not a hit. The guard reads both sides
@@ -89,7 +89,12 @@ does a `pyproject.toml`, `setup.cfg`, `tox.ini`, `package.json`, `pom.xml`,
 it holds coverage settings, even unchanged: its tool finds it by name and
 place, so the move can drop its floors. With `--diff-file` a rename the diff
 shows no content of is a hit. A floor set more or fewer times in a file than
-before is a hit when one is gone or any is below the old highest. Docs and
+before is a hit when one is gone or any is below the old highest. A
+`jacoco.minimum.*` property the guard can't read as a floor (in a `.properties` file, or in a `pom.xml`
+that a `--diff-file` diff doesn't show whole) is a `gate-config` hit whatever its change. That covers a
+value on a continuation line of a `.properties` key, every line from a `pom.xml` property's opening tag
+to its closing tag, a line that folds a property into another key's value, and, where a partial hunk
+may start inside a property's value (a continued line, or lines above its closing tag), those lines too. Docs and
 test files are not read for floors, and with `--diff-file` only files the diff
 shows whole are.
 
