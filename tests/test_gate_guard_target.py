@@ -10,6 +10,8 @@ import unittest
 import urllib.parse
 from unittest import mock
 
+import yaml
+
 from test_gate_guard import FIXTURES, _trees, clean_env, gate_guard, run_main
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -1378,6 +1380,46 @@ class WorkflowSafety(unittest.TestCase):
             with self.subTest(caller=path.name):
                 self.assertRegex(self.text(path), r"(?m)^jobs:\n  gate-guard-target:\n    uses: ")
         self.assertEqual(gate_guard.REQUIRED_CHECK, "gate-guard-target / gate-guard")
+
+    def test_both_reusable_workflows_take_extra_gate_paths(self):
+        """Issue #29: gate-guard-target.yml and gate-guard.yml take the same input and hand it to the script whole,
+        through the environment and one quoted value, never interpolated into the shell or globbed by it."""
+        for name in ("gate-guard-target.yml", "gate-guard.yml"):
+            with self.subTest(workflow=name):
+                flow = yaml.safe_load(self.text(WORKFLOWS / name))
+                spec = flow[True]["workflow_call"]["inputs"]["extra-gate-paths"]
+                self.assertEqual((spec["type"], spec["default"]), ("string", ""))
+                [step] = [s for job in flow["jobs"].values() for s in job["steps"]
+                          if "gate_guard.py" in s.get("run", "")]
+                self.assertEqual(step["env"]["EXTRA_GATE_PATHS"], "${{ inputs.extra-gate-paths }}")
+                self.assertNotIn("inputs.", step["run"])
+                self.assertTrue(step["run"].endswith(' ${EXTRA_GATE_PATHS:+"--extra-gate-path=$EXTRA_GATE_PATHS"}'),
+                                step["run"])
+
+    def test_the_run_line_passes_the_globs_unexpanded(self):
+        """The step's own shell line, with the script swapped for an argument printer, in a tree the globs match."""
+        for name in ("gate-guard-target.yml", "gate-guard.yml"):
+            flow = yaml.safe_load(self.text(WORKFLOWS / name))
+            [run] = [s["run"] for job in flow["jobs"].values() for s in job["steps"] if "gate_guard.py" in s.get("run", "")]
+            line = run.replace("python3 gate-guard/scripts/gate_guard.py", "printf '%s\\0'")
+            # An empty input passes no flag at all, so a guard-ref from before the flag still runs.
+            for value, expected in (("tests/golden/**\n*.snap", "--extra-gate-path=tests/golden/**\n*.snap"),
+                                    ("", None)):
+                with self.subTest(workflow=name, value=value), tempfile.TemporaryDirectory() as tmp:
+                    pathlib.Path(tmp, "tests", "golden").mkdir(parents=True)
+                    pathlib.Path(tmp, "tests", "golden", "a.snap").write_text("", encoding="utf-8")
+                    pathlib.Path(tmp, "b.snap").write_text("", encoding="utf-8")
+                    out = subprocess.run(["bash", "-e", "-c", line], cwd=tmp, check=True, capture_output=True,
+                                         env={"PATH": os.environ["PATH"], "EXTRA_GATE_PATHS": value,
+                                              "GUARD_REF": "a" * 40}).stdout.decode()
+                    args = out.split("\0")[:-1]
+                    parsed = gate_guard.parse_args(args).extra_gate_path
+                    if expected is None:
+                        self.assertFalse([a for a in args if a.startswith("--extra-gate-path")], args)
+                        self.assertIsNone(parsed)
+                    else:
+                        self.assertEqual(args[-1], expected)
+                        self.assertEqual(parsed, [expected.split("=", 1)[1]])
 
     def test_reusable_workflow_edit_is_a_gate_change(self):
         diff = ("diff --git a/.github/workflows/gate-guard-target.yml b/.github/workflows/gate-guard-target.yml\n"

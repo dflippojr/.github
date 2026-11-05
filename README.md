@@ -197,6 +197,7 @@ jobs:
 | `runs-on` | `'"ubuntu-latest"'` | Runner as JSON: a label string or a list of labels. |
 | `require-owner-label-actor` | `false` | Accept the label only when the repository owner applied it, checked through the issue-events API. Turn it on once workers act under their own identity (dflippojr/agent-ops#44). |
 | `guard-ref` | `main` | Ref of this repository to load `scripts/gate_guard.py` from. If you pin `uses:` to a SHA or tag, set `guard-ref` to the same value. |
+| `extra-gate-paths` | `''` | Repository-specific gate paths, one glob per line, passed as `--extra-gate-path` (see "Extra gate paths"). Under `pull_request` the caller is the pull request's own copy, but editing it is itself a `gate-config` hit. |
 
 The check appears as `gate-guard / gate-guard`; make it a required status check
 to enforce it. On events other than `pull_request` the job only prints a notice.
@@ -364,6 +365,7 @@ default branch's newest commit.
 | `guard-ref` | required | Full commit SHA of this repository to load the script from; the SHA in the caller's `uses:` line. |
 | `runs-on` | `'"ubuntu-latest"'` | Runner as JSON. Private repositories pass the tower's labels. |
 | `owner` | repository owner | Login whose labels count. |
+| `extra-gate-paths` | `''` | Repository-specific gate paths, one glob per line, such as `tests/golden/**`, passed as `--extra-gate-path` (see "Extra gate paths"). The caller on the default branch sets them, so a pull request can't drop its own. |
 
 Every edit to `.github/workflows/**` is a `gate-config` hit, so a pull request
 that edits its caller or `gate-guard-target.yml` itself needs the owner's
