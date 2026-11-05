@@ -1,0 +1,40 @@
+# gate-guard fixture: jacoco.minimum.* values in .properties continuation lines, where no changed line names the key
+# expect: gate-config
+# hits: 3
+# detail: coverage config edited: 0.87 (+1 more)
+# detail: coverage config edited: org.gradle.caching=true (+1 more)
+# detail: coverage config edited: 0.75 (+1 more)
+#
+# A .properties value continues onto the next line after an odd number of trailing backslashes, so a
+# changed line belongs to the key its logical line starts with. In gradle.properties only the continued
+# value changes. In app/gradle.properties a backslash added to the line before folds the jacoco key into
+# another key's value, so the floor is gone. In config/coverage.properties the hunk starts on a changed
+# line that may continue a key above it the diff doesn't show; the guard can't tell, so it fails closed.
+
+diff --git a/gradle.properties b/gradle.properties
+index 5d2e9a1..b7c40f3 100644
+--- a/gradle.properties
++++ b/gradle.properties
+@@ -1,4 +1,4 @@
+ org.gradle.jvmargs=-Xmx2g
+ jacoco.minimum.line=\
+-  0.87
++  0.50
+ version=1.4.0
+diff --git a/app/gradle.properties b/app/gradle.properties
+index 1a2b3c4..4d5e6f7 100644
+--- a/app/gradle.properties
++++ b/app/gradle.properties
+@@ -1,3 +1,3 @@
+-org.gradle.caching=true
++org.gradle.caching=true\
+ jacoco.minimum.branch=0.82
+ version=1.4.0
+diff --git a/config/coverage.properties b/config/coverage.properties
+index 7e8f9a0..0b1c2d3 100644
+--- a/config/coverage.properties
++++ b/config/coverage.properties
+@@ -12,2 +12,2 @@
+-  0.75
++  0.50
+ report.format=xml

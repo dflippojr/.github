@@ -1,0 +1,46 @@
+# gate-guard fixture: budget file keys and values on separate lines, raised and removed
+# expect: gate-config
+# hits: 5
+# detail: budget raised: 40000,
+# detail: budget removed: maxImages
+# detail: budget raised: 350
+# detail: budget changed: - 120
+# detail: budget changed: 9000
+#
+# A key whose value is on a following line (JSON or YAML) is read with it. A changed number the guard
+# can't pair with a key (a list item, or a value whose key is above the hunk) is a hit whatever its
+# direction: in a budget file, every number is a budget.
+
+diff --git a/checks/perf-budget.json b/checks/perf-budget.json
+index 1a2b3c4..5d6e7f8 100644
+--- a/checks/perf-budget.json
++++ b/checks/perf-budget.json
+@@ -1,8 +1,6 @@
+ {
+   "maxGzipBytes":
+-    30000,
+-  "maxImages":
+-    12,
++    40000,
+   "maxRequests":
+     40
+ }
+diff --git a/checks/perf_budgets.yaml b/checks/perf_budgets.yaml
+index 2b3c4d5..6e7f8a9 100644
+--- a/checks/perf_budgets.yaml
++++ b/checks/perf_budgets.yaml
+@@ -1,4 +1,4 @@
+ maxScriptKb:
+-  300
++  350
+ limits:
+-  - 100
++  - 120
+diff --git a/web/budgets.yml b/web/budgets.yml
+index 3c4d5e6..7f8a9b0 100644
+--- a/web/budgets.yml
++++ b/web/budgets.yml
+@@ -20,2 +20,2 @@
+-  8000
++  9000
+ maxFonts: 4

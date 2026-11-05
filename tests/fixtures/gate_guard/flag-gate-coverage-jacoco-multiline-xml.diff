@@ -1,0 +1,64 @@
+# gate-guard fixture: multiline jacoco.minimum.* pom.xml properties lowered, where no changed line names the property
+# expect: gate-config
+# hits: 4
+# detail: coverage config edited: 0.87 (+1 more)
+# detail: coverage config edited: 0.82 (+1 more)
+# detail: coverage config edited: 0.80 (+1 more)
+# detail: coverage config edited: 0.75 (+1 more)
+#
+# A changed line between a jacoco.minimum.* property's opening and closing tags is part of its value.
+# child/pom.xml is shown whole, but its opening tag has a space before ">", which the floor parser
+# doesn't read, so nothing reads the floor. lib/pom.xml and api/pom.xml are partial hunks (an ordinary
+# multiline element, and one whose opening tag carries an attribute); web/pom.xml's hunk starts below the
+# opening tag, and only the closing tag shows whose value the changed line is.
+
+diff --git a/child/pom.xml b/child/pom.xml
+index 2b3c4d5..6e7f8a9 100644
+--- a/child/pom.xml
++++ b/child/pom.xml
+@@ -1,11 +1,11 @@
+ <project>
+   <parent>
+     <artifactId>parent</artifactId>
+   </parent>
+   <artifactId>child</artifactId>
+   <properties>
+     <jacoco.minimum.line >
+-      0.87
++      0.50
+     </jacoco.minimum.line>
+   </properties>
+ </project>
+diff --git a/lib/pom.xml b/lib/pom.xml
+index 3c4d5e6..7f8a9b0 100644
+--- a/lib/pom.xml
++++ b/lib/pom.xml
+@@ -40,6 +40,6 @@
+   <properties>
+     <java.version>21</java.version>
+     <jacoco.minimum.branch>
+-      0.82
++      0.40
+     </jacoco.minimum.branch>
+   </properties>
+diff --git a/api/pom.xml b/api/pom.xml
+index 4d5e6f7..8a9b0c1 100644
+--- a/api/pom.xml
++++ b/api/pom.xml
+@@ -40,6 +40,6 @@
+   <properties>
+     <java.version>21</java.version>
+     <jacoco.minimum.instruction combine.self="override">
+-      0.80
++      0.60
+     </jacoco.minimum.instruction>
+   </properties>
+diff --git a/web/pom.xml b/web/pom.xml
+index 5e6f7a8..9b0c1d2 100644
+--- a/web/pom.xml
++++ b/web/pom.xml
+@@ -44,3 +44,3 @@
+-      0.75
++      0.55
+     </jacoco.minimum.complexity>
+   </properties>

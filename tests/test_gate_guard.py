@@ -1515,6 +1515,42 @@ class RuleDetails(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(raised(path), [])
 
+    def test_budget_numbers_are_read_whole_with_their_exponent(self):
+        # 9e2 to 1e3 raises 900 to 1000; a unit the guard doesn't know is compared as nothing, so it's a hit.
+        details = sorted(h.detail for h in self.hits("flag-gate-budget-file-exponent"))
+        self.assertEqual(details, ['budget changed: "maxImages": "14 tiles"', 'budget raised: "maxGzipBytes": 1e3,'])
+        self.assertEqual(self.hits("pass-budget-file-lowered"), [])
+
+    def test_budget_keys_pair_with_values_on_later_lines(self):
+        details = sorted(h.detail for h in self.hits("flag-gate-budget-file-split"))
+        self.assertEqual(details, ["budget changed: - 120", "budget changed: 9000", "budget raised: 350",
+                                   "budget raised: 40000,", "budget removed: maxImages"])
+
+    def test_jacoco_property_values_on_their_own_lines_are_coverage_edits(self):
+        for name, paths in (("flag-gate-coverage-jacoco-continued",
+                             ["app/gradle.properties", "config/coverage.properties", "gradle.properties"]),
+                            ("flag-gate-coverage-jacoco-multiline-xml",
+                             ["api/pom.xml", "child/pom.xml", "lib/pom.xml", "web/pom.xml"])):
+            with self.subTest(fixture=name):
+                hits = self.hits(name)
+                self.assertEqual(sorted(h.path for h in hits), paths)
+                self.assertTrue(all(h.detail.startswith("coverage config edited: ") for h in hits), hits)
+
+    def test_lines_outside_a_jacoco_property_are_not_coverage_edits(self):
+        def hits(path, body):
+            return analyze_text(f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n{body}")
+        # An even run of trailing backslashes is literal: the next line starts a key of its own.
+        self.assertEqual(hits("gradle.properties", "@@ -1,3 +1,3 @@\n dir=C:\\\\\n-retries=2\n+retries=3\n"
+                                                   " jacoco.minimum.line=0.87\n"), [])
+        # A changed line after a jacoco property's closing tag is no part of it.
+        self.assertEqual(hits("lib/pom.xml", "@@ -40,5 +40,5 @@\n     <jacoco.minimum.line>\n       0.87\n"
+                                             "     </jacoco.minimum.line>\n-    <java.version>17</java.version>\n"
+                                             "+    <java.version>21</java.version>\n"), [])
+        # A multiline floor the parser reads, raised in a pom.xml shown whole, only changes the floor.
+        pom = ("@@ -1,7 +1,7 @@\n <project>\n   <properties>\n     <jacoco.minimum.line>\n-      0.80\n"
+               "+      0.90\n     </jacoco.minimum.line>\n   </properties>\n </project>\n")
+        self.assertEqual(hits("pom.xml", pom), [])
+
 
 class Parser(unittest.TestCase):
     def test_removed_lines_that_look_like_headers(self):
