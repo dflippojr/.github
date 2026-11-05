@@ -1249,6 +1249,8 @@ class ExtraGatePaths(unittest.TestCase):
             ("tests/golden/case.json", "tests/golden/case.json", True),
             ("tests/golden/case.json", "tests/golden/case.json.bak", False),
             ("**", "anything/at/all", True),
+            ("tests/**/**/golden/*.json", "tests/golden/case.json", True),
+            ("tests/**/**/golden/*.json", "tests/a/b/golden/case.json", True),
         ]
         for glob, path, expected in cases:
             with self.subTest(glob=glob, path=path):

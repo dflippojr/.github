@@ -13,6 +13,10 @@ Reads the pull request's unified diff and reports each hit:
                    moving or renaming a coverage config is
     floor-lowered  a coverage floor lowered or removed (see _floor_review)
 
+A repository can name more gate paths with --extra-gate-path (goldens that a
+refresh rewrites, say): any change to a file whose old or new path matches one
+of those globs is a gate-config hit too (see parse_extra_paths).
+
 Moved lines are not hits: a test renamed or moved to another file, or a skip
 marker that moves with its test, cancels out. A repository with a
 platformio.ini or a C/C++ source or header fails closed instead: any change
@@ -2115,19 +2119,94 @@ def tree_facts(trees):
     return TreeFacts(c_cpp, sorted(open_configs.items()), blind, c_test_roots, coverage_configs)
 
 
-def repo_hits(repo_dir, base, head):
+def repo_hits(repo_dir, base, head, extra=()):
     """The hits from base to head of a git repository, reading its trees beyond the diff."""
-    return analyze(parse_diff(git_diff(repo_dir, base, head)), tree_facts(GitTrees(repo_dir, base, head)))
+    return analyze(parse_diff(git_diff(repo_dir, base, head)), tree_facts(GitTrees(repo_dir, base, head)), extra)
+
+
+# ------------------------------------------------------------ extra gate paths
+
+# A glob names repository paths from the root: * and ? match within one path
+# segment, dotfiles included, and ** as a whole segment matches any number of
+# segments, none included. Everything else is literal. The guard refuses what
+# it might read differently from the caller (classes, braces, escapes,
+# negation, empty, . and .. segments, a leading or trailing /, and ** inside a
+# segment), so a typo fails the job instead of quietly matching nothing.
+GLOB_REFUSED = re.compile(r"[\[\]{}\\!]")
+
+
+class ExtraPath(collections.namedtuple("ExtraPath", "glob regex")):
+    """One --extra-gate-path glob and the regex that matches the whole of a path it names."""
+
+    def matches(self, path):
+        return self.regex.fullmatch(path) is not None
+
+
+def _glob_segment(segment):
+    if segment in ("", ".", ".."):
+        raise ValueError(f"it has an empty, . or .. segment ({segment!r})")
+    if "**" in segment:
+        raise ValueError("it has ** inside a segment; ** stands alone between slashes, as in tests/golden/**")
+    return "".join("[^/]*" if c == "*" else "[^/]" if c == "?" else re.escape(c) for c in segment)
+
+
+def _glob_regex(glob):
+    refused = GLOB_REFUSED.search(glob)
+    if refused:
+        raise ValueError(f"it has {refused.group()!r}; only *, ? and ** are wildcards")
+    parts = glob.split("/")
+    out = []
+    for i, part in enumerate(parts):
+        last = i == len(parts) - 1
+        if part != "**":
+            out.append(_glob_segment(part) + ("" if last else "/"))
+        elif i == 0 or parts[i - 1] != "**":
+            # ** after ** adds nothing, and a run of them would only backtrack.
+            out.append(".*" if last else "(?:[^/]+/)*")
+    return re.compile("".join(out), re.S)
+
+
+def parse_extra_paths(values):
+    """The ExtraPath of each glob in values, one glob per line of each value; blank lines name nothing.
+
+    Raises ValueError, naming the glob, for one the guard refuses (see GLOB_REFUSED)."""
+    globs = []
+    for value in values or ():
+        for line in value.split("\n"):
+            glob = line.strip()
+            if not glob:
+                continue
+            try:
+                globs.append(ExtraPath(glob, _glob_regex(glob)))
+            except ValueError as e:
+                raise ValueError(f"extra gate path {glob!r} is malformed: {e}") from None
+    return globs
+
+
+def extra_path_hits(files, extra):
+    """A gate-config hit for each changed file whose new or old path matches an extra gate path, whatever the change."""
+    hits = []
+    for fd in files:
+        for path in [fd.path] + [p for p in fd.paths if p != fd.path]:
+            glob = next((g.glob for g in extra if g.matches(path)), None)
+            if glob is not None:
+                detail = f"matches extra gate path `{glob}`"
+                hits.append(Hit("gate-config", fd.path, None,
+                                detail if path == fd.path else f"{fd.status} from {path}, which {detail}"))
+                break
+    return hits
 
 
 # ------------------------------------------------------------------ reporting
 
-def analyze(files, facts=None):
-    """The hits of a diff. facts come from the base and head trees; without them, from the files the diff shows."""
+def analyze(files, facts=None, extra=()):
+    """The hits of a diff. facts come from the base and head trees; without them, from the files the diff shows.
+    extra holds the repository's own gate paths (parse_extra_paths)."""
     facts = facts or tree_facts(DiffTrees(files))
     removed = removed_test_hits(files)
     hits = (removed + c_cpp_hits(files, facts, {h.path for h in removed}) + skip_hits(files, facts)
-            + retry_hits(files) + gate_config_hits(files, facts) + floor_lowered_hits(files))
+            + retry_hits(files) + gate_config_hits(files, facts) + floor_lowered_hits(files)
+            + extra_path_hits(files, extra))
     seen = set()
     unique = []
     for h in hits:
@@ -2581,13 +2660,13 @@ def _write_outputs(values):
             f.writelines(f"{k}={v}\n" for k, v in values.items())
 
 
-def _target_hits(github, repo, base_ref, sha, server, token):
+def _target_hits(github, repo, base_ref, sha, server, token, extra=()):
     """(hits, error) for what the pull request changes since its merge base."""
     try:
         compare = github.get(f"/repos/{repo}/compare/{urllib.parse.quote(base_ref, safe='/')}...{sha}?per_page=1")
         merge_base = compare["merge_base_commit"]["sha"]
         diff, facts = fetch_diff(f"{server}/{repo}.git", token, merge_base, sha)
-        return analyze(parse_diff(diff), facts), None
+        return analyze(parse_diff(diff), facts, extra), None
     except subprocess.CalledProcessError as e:
         detail = (e.stderr or b"").decode("utf-8", "replace").strip()
         return [], f"could not fetch the pull request's commits ({detail or e})"
@@ -2617,10 +2696,10 @@ def _target_labels(github, repo, number, head, sha, owner):
                     for label in OWNER_LABELS}
 
 
-def judge_pull_request(github, repo, pr, sha, owner, server, token):
+def judge_pull_request(github, repo, pr, sha, owner, server, token, extra=()):
     """The Judgment of one pull request whose head is sha, against the base pr names."""
     base, head = pr["base"]["ref"], pr.get("head") or {}
-    hits, error = _target_hits(github, repo, base, sha, server, token)
+    hits, error = _target_hits(github, repo, base, sha, server, token, extra)
     try:
         labels, verdicts = _target_labels(github, repo, pr["number"], head, sha, owner)
     except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as e:
@@ -2678,7 +2757,8 @@ def run_target(args, github=None):
     server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
     github = github or GitHub(os.environ.get("GITHUB_API_URL", "https://api.github.com"), token)
     prs, list_error = pull_requests_with_head(github, repo, sha, pr)
-    judgments = [judge_pull_request(github, repo, p, sha, owner, server, token) for p in prs]
+    extra = getattr(args, "extra", ())
+    judgments = [judge_pull_request(github, repo, p, sha, owner, server, token, extra) for p in prs]
     if list_error:
         # Without the whole list, another pull request's failure could go unseen.
         judgments = [j._replace(error=j.error or list_error) for j in judgments]
@@ -2709,8 +2789,8 @@ def read_hits(args):
     """The hits of the diff file, or of base to head in the repository, whose trees are read too."""
     if args.diff_file:
         with open(args.diff_file, encoding="utf-8", errors="replace") as f:
-            return analyze(parse_diff(f.read()))
-    return repo_hits(args.repo_dir, args.base, args.head)
+            return analyze(parse_diff(f.read()), extra=args.extra)
+    return repo_hits(args.repo_dir, args.base, args.head, args.extra)
 
 
 def parse_args(argv):
@@ -2731,6 +2811,10 @@ def parse_args(argv):
                    help="judge the pull request of the pull_request_target event in $GITHUB_EVENT_PATH, "
                         "date owner labels against the head push, and exit with the verdict")
     p.add_argument("--guard-sha", help="commit of this script, named in the report")
+    p.add_argument("--extra-gate-path", action="append", metavar="GLOB",
+                   help="a repository path glob whose changes are gate-config hits, such as tests/golden/**; "
+                        "repeat it, or give several globs one per line. * and ? stay within a segment, ** "
+                        "stands alone for any segments, and a glob the guard refuses exits 2")
     return p.parse_args(argv)
 
 
@@ -2739,6 +2823,14 @@ def main(argv=None):
     if reconfigure:
         reconfigure(errors="replace")
     args = parse_args(argv)
+    try:
+        args.extra = parse_extra_paths(args.extra_gate_path)
+    except ValueError as e:
+        # Fail closed: a glob read as matching nothing would let the changes it names pass unapproved.
+        print(f"gate-guard: {e}", file=sys.stderr)
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            print(f"::error title=gate-guard::{_escape_data(str(e))}")
+        return 2
     if args.pull_request_target:
         return run_target(args)
     try:
