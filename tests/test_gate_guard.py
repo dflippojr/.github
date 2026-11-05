@@ -1536,6 +1536,12 @@ class RuleDetails(unittest.TestCase):
                 self.assertEqual(sorted(h.path for h in hits), paths)
                 self.assertTrue(all(h.detail.startswith("coverage config edited: ") for h in hits), hits)
 
+    def test_a_jacoco_property_tag_split_over_lines_holds_its_value(self):
+        diff = ("diff --git a/lib/pom.xml b/lib/pom.xml\n--- a/lib/pom.xml\n+++ b/lib/pom.xml\n@@ -40,6 +40,6 @@\n"
+                "   <properties>\n     <jacoco.minimum.line\n         combine.self=\"override\">\n-      0.87\n"
+                "+      0.50\n     </jacoco.minimum.line>\n   </properties>\n")
+        self.assertEqual([h.detail for h in analyze_text(diff)], ["coverage config edited: 0.87 (+1 more)"])
+
     def test_lines_outside_a_jacoco_property_are_not_coverage_edits(self):
         def hits(path, body):
             return analyze_text(f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n{body}")

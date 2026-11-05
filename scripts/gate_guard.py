@@ -1169,23 +1169,47 @@ BUDGET_WORD_FILES = re.compile(r"(?:^|[-_.])budgets?(?:[-_.]|$)", re.I)
 # A JaCoCo floor set as a property, in a pom.xml's <properties> or a .properties file. Where the floor
 # parser reads a pom.xml whole, a change to one is judged by its value instead (see _jacoco_floors).
 JACOCO_PROPERTY_LINE = re.compile(r"\bjacoco\.minimum\.\w")
+# A jacoco.minimum.* property's opening or closing tag in a pom.xml, which may carry whitespace or attributes,
+# or run on past the end of its line.
+JACOCO_PROPERTY_TAG = re.compile(r"<(/?)jacoco\.minimum\.[\w.\-]+(?:\b[^>]*?(/?)>|[^>]*$)")
+# In a .properties file, a line that continues onto the next (an odd run of trailing backslashes), and one
+# that starts a key or a comment rather than continuing a value.
+PROPERTIES_CONTINUED = re.compile(r"(?<!\\)(?:\\\\)*\\$")
+PROPERTIES_KEY = re.compile(r"^\s*(?:[A-Za-z_][\w.\-]*(?:\s*[:=]|\s+\S|\s*$)|[#!])")
 JS_CONFIG_JSON = re.compile(r"^(package\.json|.*(config|rc)\.jsonc?)$")
 KEY_LINE = re.compile(r"^\s*[\"']?([\w.\-/@]+)[\"']?\s*[:=]")
 SIZE_UNITS = {"": 1, "b": 1, "kb": 1e3, "kib": 1024, "mb": 1e6, "mib": 2 ** 20, "gb": 1e9,
               "gib": 2 ** 30, "ms": 1, "s": 1000}
 
 
+# A number read whole, exponent and all, then its unit and anything else that runs on from it; a number
+# followed by more than a unit the guard knows ("12 tiles", "1.2.3", "0x1F") can't be compared.
+BUDGET_NUMBER = r"(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
+BUDGET_UNIT = r"(\s*[\w.%]*)"
+# A value alone on its line, which belongs to an empty-valued key on the line before it (JSON or YAML).
+BUDGET_BARE = re.compile(r"^\s*[\"']?" + BUDGET_NUMBER + BUDGET_UNIT + r"[\"']?\s*,?\s*$")
+# A number standing as a value, not part of a name or a longer token ("v2", "es2020").
+BUDGET_ANY_NUMBER = re.compile(r"(?<![\w.\-])-?(?:\d+(?:\.\d*)?|\.\d+)")
+BUDGET_COMMENT = re.compile(r"(?:^|\s)(?:#|//).*$")
+
+
 def _budget_re(path):
-    value = r"[\"']?\s*[:=]\s*[\"']?(-?\d+(?:\.\d+)?)\s*([A-Za-z]*)"
+    """(a key and its value on one line, a key whose value is on the next) for the budget keys path holds."""
     if BUDGET_WORD_FILES.search(_name(path)):
         # Any key, as KEY_LINE spells one, where a key may start: a line, a flow mapping or a list.
-        return re.compile(r"(?:^|(?<=[\s{,\[]))[\"']?([\w.\-/@]+)" + value)
-    keys = BUDGET_KEYS + ("|" + BUDGET_FILE_KEYS if BUDGET_FILES.match(_name(path)) else "")
-    return re.compile(r"[\"']?\b(" + keys + r")" + value)
+        start, key = r"(?:^|(?<=[\s{,\[]))[\"']?", r"([\w.\-/@]+)"
+    else:
+        keys = BUDGET_KEYS + ("|" + BUDGET_FILE_KEYS if BUDGET_FILES.match(_name(path)) else "")
+        start, key = r"[\"']?\b", r"(" + keys + r")"
+    sep = r"[\"']?\s*[:=]\s*"
+    return (re.compile(start + key + sep + r"[\"']?" + BUDGET_NUMBER + BUDGET_UNIT),
+            re.compile(r"^\s*(?:-\s+)?" + start + key + sep + "$"))
 
 
 def _budget_value(number, unit):
-    return float(number) * SIZE_UNITS.get(unit.lower(), 1)
+    """The number in bytes or milliseconds, or None when its unit is one the guard doesn't know."""
+    unit = unit.strip().lower()
+    return float(number) * SIZE_UNITS[unit] if unit in SIZE_UNITS else None
 
 
 def _lint_hits(fd, lines):
@@ -1221,21 +1245,92 @@ def _lint_hits(fd, lines):
     return hits
 
 
+def _side_runs(fd, side):
+    """The lines of one side of fd ("-" or "+"), as (index, line) runs the diff shows unbroken,
+    each with whether it starts at the file's first line."""
+    runs, last = [], None
+    for i, l in enumerate(fd.lines):
+        if l.kind not in (" ", side):
+            continue
+        n = l.old if side == "-" else l.new
+        if last is None or n != last + 1:
+            runs.append((n == 1, []))
+        runs[-1][1].append((i, l))
+        last = n
+    return runs
+
+
+def _budget_entries(fd, regex, key_only):
+    """Each changed side's budget values, as (key, value line text, value, index, number's span) by side.
+
+    A value is a key's with it on the line, or alone on the line right after a key with none; the
+    second counts when either of its two lines changed.
+    """
+    out = {"-": [], "+": []}
+    for side in out:
+        for _, run in _side_runs(fd, side):
+            key = None
+            for i, l in run:
+                bare = BUDGET_BARE.match(l.text) if key else None
+                if bare and (l.kind != " " or key[1].kind != " "):
+                    out[side].append((key[0], l.text.strip(), _budget_value(bare.group(1), bare.group(2)), i,
+                                      bare.span(1)))
+                if l.kind != " ":
+                    out[side] += [(m.group(1), l.text.strip(), _budget_value(m.group(2), m.group(3)), i, m.span(2))
+                                  for m in regex.finditer(l.text)]
+                m = key_only.match(l.text)
+                key = (m.group(1), l) if m else None
+    return out
+
+
 def _budget_hits(fd):
-    regex = _budget_re(fd.path)
-    removed, added = _cancel_pairs(fd.changed("-"), fd.changed("+"), key=lambda l: l.text.strip())
+    regex, key_only = _budget_re(fd.path)
+    entries = _budget_entries(fd, regex, key_only)
+    removed, added = _cancel_pairs(entries["-"], entries["+"], key=lambda e: e[:2])
     old, new = collections.defaultdict(list), collections.defaultdict(list)
-    for lines, out in ((removed, old), (added, new)):
-        for l in lines:
-            for m in regex.finditer(l.text):
-                out[m.group(1)].append((_budget_value(m.group(2), m.group(3)), l))
+    for items, out in ((removed, old), (added, new)):
+        for e in items:
+            out[e[0]].append(e)
     hits = []
     for key in sorted(set(old) | set(new)):
-        for (before, _), (after, l) in zip(old[key], new[key]):
-            if after > before:
+        for before, after in zip(old[key], new[key]):
+            l = fd.lines[after[3]]
+            if before[2] is None or after[2] is None:
+                if before[1] != after[1]:
+                    hits.append(Hit("gate-config", fd.path, l.new, f"budget changed: {_snippet(l.text)}"))
+            elif after[2] > before[2]:
                 hits.append(Hit("gate-config", fd.path, l.new, f"budget raised: {_snippet(l.text)}"))
         if len(old[key]) > len(new[key]):
             hits.append(Hit("gate-config", fd.path, None, f"budget removed: {key}"))
+    if BUDGET_WORD_FILES.search(_name(fd.path)):
+        hits += _unread_budget_hits(fd, entries)
+    return hits
+
+
+def _unread_budget_hits(fd, entries):
+    """In a budget file every number is a budget: a changed number the guard can't pair with a key (a list
+    item, a value whose key the diff doesn't show) is a hit whatever its direction, once per change block."""
+    read = collections.defaultdict(list)
+    for side in entries.values():
+        for e in side:
+            read[e[3]].append(e[4])
+    removed, added = _cancel_pairs(fd.changed("-"), fd.changed("+"), key=lambda l: l.text.strip())
+    kept = set(map(id, removed + added))
+
+    def unread(i, l):
+        text = BUDGET_COMMENT.sub("", l.text)
+        return id(l) in kept and any(not any(a <= m.start() < b for a, b in read[i])
+                                     for m in BUDGET_ANY_NUMBER.finditer(text))
+    hits, block = [], []
+    for i, l in enumerate(fd.lines + [Line(" ", None, None, "")]):
+        if l.kind != " ":
+            block.append((i, l))
+            continue
+        flagged = [b for b in block if unread(*b)]
+        if flagged:
+            first = next((b for _, b in flagged if b.kind == "+"), flagged[0][1])
+            hits.append(Hit("gate-config", fd.path, first.new, f"budget changed: {_snippet(first.text)}"))
+        block = []
     return hits
 
 
@@ -1736,6 +1831,60 @@ def floor_lowered_hits(files):
     return [h for fd in files for h in (_floor_review(fd) or FloorReview([], set(), set())).hits]
 
 
+def _change_blocks(fd):
+    """Indexes into fd.lines of each run of changed lines."""
+    blocks, block = [], []
+    for i, l in enumerate(fd.lines):
+        if l.kind != " ":
+            block.append(i)
+        elif block:
+            blocks.append(block)
+            block = []
+    return blocks + [block] if block else blocks
+
+
+def _jacoco_property_lines(fd):
+    """Indexes into fd.lines of the lines, on their side, that are part of a jacoco.minimum.* property.
+
+    In a .properties file that is a logical line whose text names one, joined over continuations; in a
+    pom.xml, a line from the property's opening tag to its closing tag. Where a run the diff shows may
+    start inside one (it starts below line 1 on a continued value, or at a closing tag), the guard
+    can't tell and counts those lines too.
+    """
+    out = set()
+    properties = _ext(fd.path) == ".properties"
+    for side in "-+":
+        for from_top, run in _side_runs(fd, side):
+            if properties:
+                groups, continued = [], False
+                for i, l in run:
+                    if not continued:
+                        groups.append([])
+                    groups[-1].append((i, l))
+                    comment = not continued and l.text.lstrip().startswith(("#", "!"))
+                    continued = not comment and bool(PROPERTIES_CONTINUED.search(l.text))
+                for n, group in enumerate(groups):
+                    text = "".join(PROPERTIES_CONTINUED.sub("", l.text).lstrip() for _, l in group)
+                    first = group[0][1].text
+                    unknown = n == 0 and not from_top and first.strip() and not PROPERTIES_KEY.match(first)
+                    # Joined as Java joins them, so no word boundary is asked for where two lines meet.
+                    if unknown or re.search(r"jacoco\.minimum\.\w", text):
+                        out.update(i for i, _ in group)
+            elif _name(fd.path) == "pom.xml":
+                inside, seen = False, from_top
+                for k, (i, l) in enumerate(run):
+                    tags = [m for m in JACOCO_PROPERTY_TAG.finditer(l.text) if not m.group(2)]
+                    if not seen and tags and tags[0].group(1):
+                        # The run starts inside a property: its first lines are part of the value.
+                        out.update(j for j, _ in run[:k])
+                    seen = seen or bool(tags)
+                    if inside or tags or JACOCO_PROPERTY_LINE.search(l.text):
+                        out.add(i)
+                    if tags:
+                        inside = not tags[-1].group(1)
+    return out
+
+
 def gate_config_hits(files, facts):
     hits = []
     for fd in files:
@@ -1776,7 +1925,13 @@ def gate_config_hits(files, facts):
         coverage, lint = [], []
         js_config = (_ext(fd.path) in JS_EXTS and is_config(fd.path)) or bool(JS_CONFIG_JSON.match(_name(fd.path)))
         gradle = ".gradle" in _name(fd.path)
-        jacoco_properties = _name(fd.path) == "pom.xml" or _ext(fd.path) == ".properties"
+        jacoco = _jacoco_property_lines(fd) if _name(fd.path) == "pom.xml" or _ext(fd.path) == ".properties" else set()
+        # A change block that touches a jacoco.minimum.* property is read whole: its other lines may be what
+        # folds the property into another's value, or out of its own.
+        jacoco_blocks = set()
+        for block in _change_blocks(fd):
+            if any(j in jacoco and j not in floor_only for j in block):
+                jacoco_blocks.update(block)
         for i, (l, section) in enumerate(zip(fd.lines, sections)):
             if section.startswith(LINT_SECTIONS):
                 lint.append(l)
@@ -1786,7 +1941,7 @@ def gate_config_hits(files, facts):
                     or (COVERAGE_FLOOR_NAME.search(l.text) and not is_test_file(fd.path))
                     or (js_config and JS_THRESHOLD.search(l.text))
                     or (gradle and GRADLE_MINIMUM.search(l.text))
-                    or (jacoco_properties and JACOCO_PROPERTY_LINE.search(l.text))):
+                    or i in jacoco_blocks):
                 coverage.append(l)
         if coverage and not moved:
             first = coverage[0]
