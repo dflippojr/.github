@@ -10,7 +10,7 @@ import unittest
 import urllib.parse
 from unittest import mock
 
-from test_gate_guard import FIXTURES, _trees, clean_env, gate_guard
+from test_gate_guard import FIXTURES, _trees, clean_env, gate_guard, run_main
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SCENARIOS = pathlib.Path(__file__).resolve().parent / "fixtures" / "gate_guard_target"
@@ -169,8 +169,8 @@ def job_verdict(stdout, outputs, summary):
     return {"conclusion": conclusion, "title": title, "summary": summary}
 
 
-def run_job(tmp, event, github, server=None):
-    """(exit code, job verdict or None, stdout, outputs, stderr) of the guard as the job runs it."""
+def run_job(tmp, event, github, server=None, args=()):
+    """(exit code, job verdict or None, stdout, outputs, stderr) of the guard as the job runs it, with extra args."""
     path = pathlib.Path(tmp, "event.json")
     path.write_text(json.dumps(event), encoding="utf-8")
     outputs, summary = pathlib.Path(tmp, "outputs.txt"), pathlib.Path(tmp, "summary.md")
@@ -181,15 +181,15 @@ def run_job(tmp, event, github, server=None):
                      **({"GITHUB_SERVER_URL": server} if server else {})})
     out, err = io.StringIO(), io.StringIO()
     with mock.patch.dict(os.environ, env, clear=True), mock.patch("sys.stdout", out), mock.patch("sys.stderr", err),             mock.patch.object(gate_guard, "GitHub", return_value=github):
-        code = gate_guard.main(["--pull-request-target", "--guard-sha", "a" * 40])
+        code = gate_guard.main(["--pull-request-target", "--guard-sha", "a" * 40, *args])
     stdout, written = out.getvalue(), outputs.read_text(encoding="utf-8")
     verdict = job_verdict(stdout, written, summary.read_text(encoding="utf-8")) if "conclusion=" in written else None
     return code, verdict, stdout, written, err.getvalue()
 
 
-def run_cli(tmp, server, event, fake):
+def run_cli(tmp, server, event, fake, args=()):
     """(exit code, stdout, outputs) of the guard on a pull_request_target event; fake.current() has its verdict."""
-    code, verdict, out, outputs, _ = run_job(tmp, event, fake, server)
+    code, verdict, out, outputs, _ = run_job(tmp, event, fake, server, args)
     fake.jobs.append(verdict)
     return code, out, outputs
 
@@ -1116,6 +1116,201 @@ class JobResult(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn(f"{VERDICT}hits=0; success; forged", out)
         self.assertEqual([c for c in commands(out) if c.startswith((VERDICT, "::add-mask::"))], [])
+
+
+def diff_of(*entries):
+    """A diff of files by kind: ("modified", path), ("deleted", path), ("binary", path), ("mode", path) or
+    ("renamed", old, new)."""
+    out = []
+    for kind, path, *rest in entries:
+        new = rest[0] if rest else path
+        out.append(f"diff --git a/{path} b/{new}\n")
+        if kind == "modified":
+            out.append(f"--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-1\n+2\n")
+        elif kind == "deleted":
+            out.append(f"deleted file mode 100644\n--- a/{path}\n+++ /dev/null\n@@ -1 +0,0 @@\n-1\n")
+        elif kind == "binary":
+            out.append(f"Binary files a/{path} and b/{path} differ\n")
+        elif kind == "mode":
+            out.append("old mode 100644\nnew mode 100755\n")
+        else:
+            out.append(f"similarity index 100%\nrename from {path}\nrename to {new}\n")
+    return "".join(out)
+
+
+def extra_hits(diff, *globs):
+    """[(path, detail)] of the hits analyze finds in diff with these extra gate paths."""
+    files = gate_guard.parse_diff(diff)
+    return [(h.path, h.detail) for h in gate_guard.analyze(files, extra=gate_guard.parse_extra_paths(globs))
+            if h.rule == "gate-config"]
+
+
+class ExtraGatePaths(unittest.TestCase):
+    """Issue #29: a repository names its own gate paths, such as tests/golden/**, with extra-gate-paths. A change
+    under one is a gate-config hit, so it needs the owner's gate-change-approved label, applied after the newest
+    push, like any other gate change."""
+    CODE = {"src/app.py": "def total():\n    return 1\n"}
+    GLOB = "tests/golden/**"
+    ARGS = ("--extra-gate-path", GLOB)
+    DETAIL = "| gate-config | `tests/golden/case.json` | matches extra gate path `tests/golden/**` |"
+    LABELED = {"event": "labeled", "label": gate_guard.APPROVAL_LABEL, "actor": OWNER,
+               "created_at": "2026-10-16T13:00:00Z"}
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        # Only the golden file changes between commits; nothing else in the tree is a hit.
+        self.server, (self.base, self.head, self.later) = make_remote(
+            self.tmp, dict(self.CODE, **{"tests/golden/case.json": '{"total": 1}\n'}),
+            dict(self.CODE, **{"tests/golden/case.json": '{"total": 2}\n'}),
+            dict(self.CODE, **{"tests/golden/case.json": '{"total": 3}\n'}))
+
+    def fake(self, head=None, labels=(), events=(), pushed_at="2026-10-16T12:00:00Z"):
+        return FakeGitHub.single(self.base, head or self.head,
+                                 {"labels": list(labels), "events": list(events), "pushed_at": pushed_at})
+
+    def judge(self, fake, args=ARGS):
+        """(exit code, the commit's check) after a run of the job on fake's head."""
+        code, _, _ = run_cli(self.tmp, self.server, {"pull_request": event_pr(NUMBER, fake.head, "main")}, fake,
+                             args)
+        return code, fake.current()
+
+    def test_change_only_under_an_extra_path_fails_without_the_label(self):
+        code, check = self.judge(self.fake())
+        self.assertEqual((code, check["conclusion"]), (1, "failure"))
+        self.assertEqual(check["title"], "1 hit, not approved")
+        self.assertIn(self.DETAIL, check["summary"])
+
+    def test_without_extra_paths_the_same_change_passes(self):
+        """The input is what makes the hit: no flag, or a blank one, adds no path and matches nothing."""
+        for args in ((), ("--extra-gate-path=",), ("--extra-gate-path= \n\t\n",)):
+            with self.subTest(args=args):
+                code, check = self.judge(self.fake(), args)
+                self.assertEqual((code, check["conclusion"]), (0, "success"))
+                self.assertEqual(check["title"], "No removed tests, skips, retries or gate-config edits")
+
+    def test_fresh_owner_label_passes(self):
+        code, check = self.judge(self.fake(labels=[gate_guard.APPROVAL_LABEL], events=[self.LABELED]))
+        self.assertEqual((code, check["conclusion"]), (0, "success"))
+        self.assertEqual(check["title"], "1 hit, approved by the owner")
+        self.assertIn(self.DETAIL, check["summary"])
+
+    def test_a_later_push_voids_the_label(self):
+        labels, events = [gate_guard.APPROVAL_LABEL], [self.LABELED]
+        code, check = self.judge(self.fake(labels=labels, events=events))
+        self.assertEqual((code, check["conclusion"]), (0, "success"))
+        code, check = self.judge(self.fake(self.later, labels, events, pushed_at="2026-10-16T14:00:00Z"))
+        self.assertEqual((code, check["conclusion"]), (1, "failure"))
+        self.assertEqual(check["title"], "1 hit, not approved")
+        self.assertIn(f"before {self.later[:7]} was pushed at 2026-10-16T14:00:00Z", check["summary"])
+
+    def test_removing_the_label_fails_again(self):
+        fake = self.fake(labels=[gate_guard.APPROVAL_LABEL], events=[self.LABELED])
+        code, check = self.judge(fake)
+        self.assertEqual((code, check["conclusion"]), (0, "success"))
+        fake.prs[NUMBER]["labels"] = []
+        fake.prs[NUMBER]["events"].append(dict(self.LABELED, event="unlabeled", created_at="2026-10-16T14:00:00Z"))
+        code, check = self.judge(fake)
+        self.assertEqual((code, check["conclusion"]), (1, "failure"))
+        self.assertEqual(check["title"], "1 hit, not approved")
+
+    def test_values_hold_one_glob_per_line(self):
+        """The workflow passes its newline-separated input as one value; blank lines and edge spaces drop."""
+        globs = gate_guard.parse_extra_paths(["\n  tests/golden/**  \r\n\n", "docs/*.md"])
+        self.assertEqual([g.glob for g in globs], ["tests/golden/**", "docs/*.md"])
+        self.assertEqual(gate_guard.parse_extra_paths([]), [])
+        self.assertEqual(gate_guard.parse_extra_paths(["", " \n \r\n"]), [])
+
+    def test_globs_match_no_more_than_asked(self):
+        cases = [
+            ("tests/golden/**", "tests/golden/case.json", True),
+            ("tests/golden/**", "tests/golden/a/b/c.json", True),
+            ("tests/golden/**", "tests/golden/.hidden", True),
+            ("tests/golden/**", "tests/goldenx/case.json", False),
+            ("tests/golden/**", "tests/golden", False),
+            ("tests/golden/**", "src/tests/golden/case.json", False),
+            ("tests/golden/*", "tests/golden/case.json", True),
+            ("tests/golden/*", "tests/golden/.hidden", True),
+            ("tests/golden/*", "tests/golden/a/case.json", False),
+            ("*.json", "case.json", True),
+            ("*.json", "tests/case.json", False),
+            ("**/*.json", "case.json", True),
+            ("**/*.json", "tests/golden/case.json", True),
+            ("**/*.json", "tests/golden/case.jsonl", False),
+            ("tests/**/golden/*.json", "tests/golden/case.json", True),
+            ("tests/**/golden/*.json", "tests/a/b/golden/case.json", True),
+            ("tests/**/golden/*.json", "tests/a/goldens/case.json", False),
+            ("snap?.txt", "snap1.txt", True),
+            ("snap?.txt", "snap12.txt", False),
+            ("snap?.txt", "snap/.txt", False),
+            ("a.b", "axb", False),
+            ("a+b(c)", "a+b(c)", True),
+            ("tests/golden/case.json", "tests/golden/case.json", True),
+            ("tests/golden/case.json", "tests/golden/case.json.bak", False),
+            ("**", "anything/at/all", True),
+        ]
+        for glob, path, expected in cases:
+            with self.subTest(glob=glob, path=path):
+                [g] = gate_guard.parse_extra_paths([glob])
+                self.assertEqual(g.matches(path), expected)
+
+    def test_malformed_globs_are_refused(self):
+        for glob in ("tests/golden/", "/tests/golden/**", "./tests/golden/**", "tests/../golden/**",
+                     "tests//golden", "tests/gold**/x", "tests/**x", "tests/[gG]olden/**", "tests/golden]/x",
+                     "{tests,spec}/golden/**", "tests\\golden\\**", "!tests/golden/**", ".", "tests/./golden"):
+            with self.subTest(glob=glob), self.assertRaises(ValueError) as caught:
+                gate_guard.parse_extra_paths([glob])
+            self.assertIn(repr(glob), str(caught.exception))
+
+    def test_malformed_glob_fails_the_job_closed(self):
+        """A glob the guard can't read fails the job before any diff or label is read, never matching nothing."""
+        code, verdict, stdout, outputs, err = run_job(self.tmp, {"pull_request": event_pr(NUMBER, self.head, "main")},
+                                                      self.fake(), self.server,
+                                                      ("--extra-gate-path", "tests/golden/**\ntests/[ab]/x"))
+        self.assertEqual(code, 2)
+        self.assertIsNone(verdict)
+        self.assertIn("tests/[ab]/x", err)
+        self.assertIn("::error title=gate-guard::", stdout)
+        self.assertNotIn("conclusion=success", outputs)
+
+    def test_every_path_a_change_touches_counts(self):
+        """Deleted, renamed out of or into, binary and mode-only changes under an extra path are hits too."""
+        diff = diff_of(("deleted", "tests/golden/a.json"), ("renamed", "tests/golden/b.json", "fixtures/b.json"),
+                       ("renamed", "fixtures/c.json", "tests/golden/c.json"), ("binary", "tests/golden/d.png"),
+                       ("mode", "tests/golden/e.sh"), ("modified", "src/app.py"))
+        detail = "matches extra gate path `tests/golden/**`"
+        self.assertEqual(sorted(extra_hits(diff, self.GLOB)),
+                         [("fixtures/b.json", f"renamed from tests/golden/b.json, which {detail}"),
+                          ("tests/golden/a.json", detail), ("tests/golden/c.json", detail),
+                          ("tests/golden/d.png", detail), ("tests/golden/e.sh", detail)])
+        self.assertEqual(extra_hits(diff), [])
+
+    def test_one_hit_per_file_whatever_matches(self):
+        diff = diff_of(("modified", "tests/golden/a.json"))
+        self.assertEqual(extra_hits(diff, "tests/golden/**", "**/*.json"),
+                         [("tests/golden/a.json", "matches extra gate path `tests/golden/**`")])
+
+    def test_extra_path_hit_beside_a_rule_hit(self):
+        """A workflow listed as an extra path keeps its own hit; the extra-path hit is added, not merged."""
+        diff = diff_of(("modified", ".github/workflows/ci.yml"))
+        self.assertEqual(extra_hits(diff, ".github/**"),
+                         [(".github/workflows/ci.yml", "matches extra gate path `.github/**`"),
+                          (".github/workflows/ci.yml", "workflow modified")])
+
+    def test_pull_request_mode_takes_extra_paths_too(self):
+        """gate-guard.yml runs the guard on a diff with --extra-gate-path, for parity with the target workflow."""
+        path = pathlib.Path(self.tmp, "pr.diff")
+        path.write_text(diff_of(("modified", "tests/golden/case.json")), encoding="utf-8")
+        code, out = run_main(["--diff-file", str(path)])
+        self.assertEqual(code, 0, out)
+        code, out = run_main(["--diff-file", str(path), "--extra-gate-path", self.GLOB])
+        self.assertEqual(code, 1)
+        self.assertIn(self.DETAIL, out)
+        with mock.patch("sys.stderr", io.StringIO()) as err:
+            code, _ = run_main(["--diff-file", str(path), "--extra-gate-path=tests/golden/"])
+        self.assertEqual(code, 2)
+        self.assertIn("tests/golden/", err.getvalue())
 
 
 class WorkflowSafety(unittest.TestCase):
