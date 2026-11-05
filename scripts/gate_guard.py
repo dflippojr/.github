@@ -2154,15 +2154,17 @@ def _glob_regex(glob):
     refused = GLOB_REFUSED.search(glob)
     if refused:
         raise ValueError(f"it has {refused.group()!r}; only *, ? and ** are wildcards")
-    parts = glob.split("/")
+    split = glob.split("/")
+    # ** after ** adds nothing, and a run of them would only backtrack. Dropping it before the regex is built keeps
+    # a trailing run such as tests/golden/**/** matching everything under tests/golden, as ** alone does.
+    parts = [part for i, part in enumerate(split) if not (part == "**" and i and split[i - 1] == "**")]
     out = []
     for i, part in enumerate(parts):
         last = i == len(parts) - 1
-        if part != "**":
-            out.append(_glob_segment(part) + ("" if last else "/"))
-        elif i == 0 or parts[i - 1] != "**":
-            # ** after ** adds nothing, and a run of them would only backtrack.
+        if part == "**":
             out.append(".*" if last else "(?:[^/]+/)*")
+        else:
+            out.append(_glob_segment(part) + ("" if last else "/"))
     return re.compile("".join(out), re.S)
 
 
