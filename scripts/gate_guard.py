@@ -46,6 +46,7 @@ import bisect
 import collections
 import configparser
 import datetime
+import decimal
 import difflib
 import io
 import json
@@ -1178,16 +1179,26 @@ PROPERTIES_CONTINUED = re.compile(r"(?<!\\)(?:\\\\)*\\$")
 PROPERTIES_KEY = re.compile(r"^\s*(?:[A-Za-z_][\w.\-]*(?:\s*[:=]|\s+\S|\s*$)|[#!])")
 JS_CONFIG_JSON = re.compile(r"^(package\.json|.*(config|rc)\.jsonc?)$")
 KEY_LINE = re.compile(r"^\s*[\"']?([\w.\-/@]+)[\"']?\s*[:=]")
-SIZE_UNITS = {"": 1, "b": 1, "kb": 1e3, "kib": 1024, "mb": 1e6, "mib": 2 ** 20, "gb": 1e9,
+SIZE_UNITS = {"": 1, "b": 1, "kb": 10 ** 3, "kib": 1024, "mb": 10 ** 6, "mib": 2 ** 20, "gb": 10 ** 9,
               "gib": 2 ** 30, "ms": 1, "s": 1000}
+# Budget values are compared as exact decimals, never floats, which would read 1e-400 and 2e-400 both as 0.0
+# and 1e400 and 2e400 both as infinity. A number longer than BUDGET_DIGITS, or one this context can't hold
+# exactly once scaled by its unit, can't be compared.
+BUDGET_DIGITS = 100
+BUDGET_CONTEXT = decimal.Context(prec=BUDGET_DIGITS + 20, Emax=10_000, Emin=-10_000, traps=[])
+BUDGET_LOSSY = (decimal.Inexact, decimal.Rounded, decimal.Overflow, decimal.Underflow, decimal.Subnormal,
+                decimal.Clamped, decimal.InvalidOperation)
 
 
 # A number read whole, exponent and all, then its unit and anything else that runs on from it; a number
 # followed by more than a unit the guard knows ("12 tiles", "1.2.3", "0x1F") can't be compared.
 BUDGET_NUMBER = r"(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
 BUDGET_UNIT = r"(\s*[\w.%]*)"
-# A value alone on its line, which belongs to an empty-valued key on the line before it (JSON or YAML).
-BUDGET_BARE = re.compile(r"^\s*[\"']?" + BUDGET_NUMBER + BUDGET_UNIT + r"[\"']?\s*,?\s*$")
+# A value alone on its line, which belongs to an empty-valued key on the line before it (JSON or YAML),
+# matched once its comment and surrounding whitespace are gone. Its unit can't start with a digit unless
+# whitespace parts it from the number, so no two parts can take the same characters and a failed match
+# backtracks in linear time.
+BUDGET_BARE = re.compile(r"[\"']?" + BUDGET_NUMBER + r"((?:\s*[^\W\d.%]|\s*[.%]|\s+\d)[\w.%]*)?[\"']?,?")
 # A number standing as a value, not part of a name or a longer token ("v2", "es2020").
 BUDGET_ANY_NUMBER = re.compile(r"(?<![\w.\-])-?(?:\d+(?:\.\d*)?|\.\d+)")
 BUDGET_COMMENT = re.compile(r"(?:^|\s)(?:#|//).*$")
@@ -1207,9 +1218,22 @@ def _budget_re(path):
 
 
 def _budget_value(number, unit):
-    """The number in bytes or milliseconds, or None when its unit is one the guard doesn't know."""
-    unit = unit.strip().lower()
-    return float(number) * SIZE_UNITS[unit] if unit in SIZE_UNITS else None
+    """The number in bytes or milliseconds as an exact decimal, or None when its unit is one the guard
+    doesn't know or the number can't be held exactly (see BUDGET_CONTEXT)."""
+    unit = (unit or "").strip().lower()
+    if unit not in SIZE_UNITS or len(number) > BUDGET_DIGITS:
+        return None
+    context = BUDGET_CONTEXT.copy()
+    value = context.multiply(context.create_decimal(number), SIZE_UNITS[unit])
+    return None if any(context.flags[f] for f in BUDGET_LOSSY) else value
+
+
+def _bare_budget(text):
+    """(number, unit, the number's span in text) for a budget value alone on its line, or None."""
+    body = BUDGET_COMMENT.sub("", text)
+    m = BUDGET_BARE.fullmatch(body.strip())
+    offset = len(body) - len(body.lstrip())
+    return (m.group(1), m.group(2), (offset + m.start(1), offset + m.end(1))) if m else None
 
 
 def _lint_hits(fd, lines):
@@ -1271,10 +1295,9 @@ def _budget_entries(fd, regex, key_only):
         for _, run in _side_runs(fd, side):
             key = None
             for i, l in run:
-                bare = BUDGET_BARE.match(l.text) if key else None
+                bare = _bare_budget(l.text) if key else None
                 if bare and (l.kind != " " or key[1].kind != " "):
-                    out[side].append((key[0], l.text.strip(), _budget_value(bare.group(1), bare.group(2)), i,
-                                      bare.span(1)))
+                    out[side].append((key[0], l.text.strip(), _budget_value(bare[0], bare[1]), i, bare[2]))
                 if l.kind != " ":
                     out[side] += [(m.group(1), l.text.strip(), _budget_value(m.group(2), m.group(3)), i, m.span(2))
                                   for m in regex.finditer(l.text)]
