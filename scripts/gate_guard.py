@@ -1843,6 +1843,23 @@ def _change_blocks(fd):
     return blocks + [block] if block else blocks
 
 
+def _xml_uncommented(text, comment):
+    """(text with its XML comments blanked, whether a comment runs on past it), given whether one runs into it."""
+    out = ""
+    while text:
+        if comment:
+            end = text.find("-->")
+            if end < 0:
+                return out, True
+            text, comment = text[end + 3:], False
+        else:
+            start = text.find("<!--")
+            if start < 0:
+                return out + text, False
+            out, text, comment = out + text[:start], text[start + 4:], True
+    return out, comment
+
+
 def _jacoco_property_lines(fd):
     """Indexes into fd.lines of the lines, on their side, that are part of a jacoco.minimum.* property.
 
@@ -1871,9 +1888,11 @@ def _jacoco_property_lines(fd):
                     if unknown or re.search(r"jacoco\.minimum\.\w", text):
                         out.update(i for i, _ in group)
             elif _name(fd.path) == "pom.xml":
-                inside, seen = False, from_top
+                inside, seen, comment = False, from_top, False
                 for k, (i, l) in enumerate(run):
-                    tags = [m for m in JACOCO_PROPERTY_TAG.finditer(l.text) if not m.group(2)]
+                    # A tag in an XML comment opens or closes nothing.
+                    text, comment = _xml_uncommented(l.text, comment)
+                    tags = [m for m in JACOCO_PROPERTY_TAG.finditer(text) if not m.group(2)]
                     if not seen and tags and tags[0].group(1):
                         # The run starts inside a property: its first lines are part of the value.
                         out.update(j for j, _ in run[:k])
