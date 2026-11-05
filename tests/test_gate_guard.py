@@ -1497,6 +1497,24 @@ class RuleDetails(unittest.TestCase):
         details = [h.detail for h in self.hits("flag-gate-budget")]
         self.assertEqual(sum("maximumWarning" in d for d in details), 1)
 
+    def test_a_budget_file_flags_each_raised_numeric_key_and_a_removed_one(self):
+        # In a file named for budgets, any numeric key is a budget, listed or not; an unchanged one is no hit.
+        details = sorted(h.detail for h in self.hits("flag-gate-budget-file"))
+        self.assertEqual(details, ['budget raised: "limit": 200000,', 'budget raised: "maxGzipBytes": 40000,',
+                                   "budget removed: maxImages"])
+
+    def test_budget_files_are_named_for_budgets_as_a_word(self):
+        def raised(path):
+            diff = (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,3 +1,3 @@\n"
+                    " {{\n-  \"maxKb\": 10\n+  \"maxKb\": 20\n }}\n")
+            return [h.detail for h in analyze_text(diff)]
+        for path in ("checks/size-budget.json", "perf_budgets.json", "budget.json", "web/js.budget.json"):
+            with self.subTest(path=path):
+                self.assertEqual(raised(path), ['budget raised: "maxKb": 20'])
+        for path in ("checks/budgeting.json", "checks/nobudget.json", "checks/sizes.json"):
+            with self.subTest(path=path):
+                self.assertEqual(raised(path), [])
+
 
 class Parser(unittest.TestCase):
     def test_removed_lines_that_look_like_headers(self):
@@ -1672,6 +1690,14 @@ class Main(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("**Failing with 2 hits:** no label.", out)
         self.assertIn("::error file=.github/workflows/ci.yml,title=gate-guard gate-config::workflow modified", out)
+
+    def test_a_lowered_jacoco_property_fails_without_the_label(self):
+        with mock.patch.object(gate_guard, "approval", return_value=(False, "no label")):
+            code, out = run_main(["--diff-file", str(FIXTURES / "flag-gate-coverage-jacoco-property.diff")],
+                                 {"GITHUB_ACTIONS": "true"})
+        self.assertEqual(code, 1)
+        self.assertIn("**Failing with 2 hits:** no label.", out)
+        self.assertIn("::error file=gradle.properties,title=gate-guard gate-config::coverage config edited", out)
 
     def test_clean_diff_skips_the_label_lookup(self):
         with mock.patch.object(gate_guard, "approval") as approval:

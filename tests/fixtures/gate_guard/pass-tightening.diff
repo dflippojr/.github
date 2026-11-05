@@ -1,4 +1,4 @@
-# gate-guard fixture: retries lowered, a budget lowered, a lint rule made stricter and a test renamed in place
+# gate-guard fixture: retries lowered, budgets lowered (one in a size budget file), a lint rule made stricter and a test renamed in place
 # expect: 
 # hits: 0
 
@@ -26,6 +26,16 @@ index a0a3a76..fb3635f 100644
 +    "limit": "8 kB"
    }
  ]
+diff --git a/checks/size-budget.json b/checks/size-budget.json
+index 9a1c2e4..5be81c0 100644
+--- a/checks/size-budget.json
++++ b/checks/size-budget.json
+@@ -1,4 +1,4 @@
+ {
+-  "limit": 100000,
++  "limit": 90000,
+   "maxGzipBytes": 30000
+ }
 diff --git a/playwright.config.ts b/playwright.config.ts
 index 586b9d9..0b93f97 100644
 --- a/playwright.config.ts
