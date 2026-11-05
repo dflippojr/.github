@@ -1531,6 +1531,20 @@ class RuleDetails(unittest.TestCase):
                 '-  "maxTime": 2e-400,\n-  "maxBytes": 2e400\n+  "maxTime": 1e-400,\n+  "maxBytes": 1e400\n }\n')
         self.assertEqual(analyze_text(diff), [])
 
+    def test_a_budget_value_on_its_own_line_may_space_its_comma_and_quotes(self):
+        # A listed-key file has no fallback for values it can't pair, so these must pair with their key.
+        path = ".size-limit.json"
+        diff = (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,8 +1,8 @@\n [\n  {{\n"
+                '    "limit":\n-    200000 ,\n+    300000 ,\n    "maxSize":\n-    "500kb" ,\n+    "900kb" ,\n'
+                '    "budget":\n-    "500 "\n+    "700 "\n')
+        self.assertEqual(sorted(h.detail for h in analyze_text(diff)),
+                         ['budget raised: "700 "', 'budget raised: "900kb" ,', "budget raised: 300000 ,"])
+        # The review's one-line reproduction of an exponent past a float's range.
+        path = "checks/perf-budget.json"
+        diff = (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n"
+                '-{"maxTime": 1e-400}\n+{"maxTime": 2e-400}\n')
+        self.assertEqual([h.detail for h in analyze_text(diff)], ['budget raised: {"maxTime": 2e-400}'])
+
     def test_a_padded_budget_value_with_an_inline_comment_is_read_in_bounded_time(self):
         # A YAML value on the line after its key, padded with a long run of spaces before its comment, once
         # backtracked cubically; the guard reads it in a child process that is killed if it runs long.
