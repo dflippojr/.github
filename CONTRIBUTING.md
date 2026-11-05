@@ -10,6 +10,7 @@ Feature work and fixes go through GitHub issues and pull requests, so plans and 
 | `ready` | Specified enough to implement or verify without further decisions |
 | `blocked` | Specified, but waiting on a dependency |
 | `user-present` | The owner or a physical device is needed for the next step |
+| `user-action` | Needs the owner to do something (purchase, credential, decision) that doesn't need them at the machine or device |
 | `in-progress` | Work started on a branch; no pull request yet |
 | `awaiting-review` | Pull request open; waiting for the owner's review or merge |
 | `verification` | Confirm something already built works for real |
@@ -36,7 +37,9 @@ The remaining labels are GitHub's defaults plus one for accessibility:
 | `wontfix` | This will not be worked on |
 | `accessibility` | Barrier affecting people with disabilities |
 
-An issue moves from `needs-refinement` to `ready` once its outcome, scope, decisions and acceptance criteria are written down. Only `ready` issues without `reserved`, `parked`, `blocked` or `user-present` get picked up.
+`user-present` and `user-action` are two labels, not one renamed to the other. Use `user-present` when someone has to be at the machine or a device; use `user-action` for an owner task that doesn't need them there.
+
+An issue moves from `needs-refinement` to `ready` once its outcome, scope, decisions and acceptance criteria are written down. Only `ready` issues without `reserved`, `parked`, `blocked`, `user-present` or `user-action` get picked up.
 
 The labels themselves are defined in `labels.json`. `python scripts/sync_labels.py` shows what differs in each active repository (not archived, not a fork, pushed within the last 365 days; `--since YYYY-MM-DD` overrides the cutoff), and `--apply` brings them in line. Naming a repository that doesn't exist is an error (exit 2) before anything is changed.
 
