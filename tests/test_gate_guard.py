@@ -1556,6 +1556,11 @@ class RuleDetails(unittest.TestCase):
         pom = ("@@ -1,7 +1,7 @@\n <project>\n   <properties>\n     <jacoco.minimum.line>\n-      0.80\n"
                "+      0.90\n     </jacoco.minimum.line>\n   </properties>\n </project>\n")
         self.assertEqual(hits("pom.xml", pom), [])
+        # A property's tag named in an XML comment opens nothing, so a later edit is no part of a value.
+        commented = ("@@ -1,6 +1,6 @@\n <project>\n   <!-- set <jacoco.minimum.line> in the parent -->\n"
+                     "   <dependencies>\n-    <version>1.0</version>\n+    <version>1.1</version>\n"
+                     "   </dependencies>\n </project>\n")
+        self.assertEqual(hits("child/pom.xml", commented), [])
 
 
 class Parser(unittest.TestCase):
