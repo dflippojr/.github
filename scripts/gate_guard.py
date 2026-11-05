@@ -1195,10 +1195,10 @@ BUDGET_LOSSY = (decimal.Inexact, decimal.Rounded, decimal.Overflow, decimal.Unde
 BUDGET_NUMBER = r"(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
 BUDGET_UNIT = r"(\s*[\w.%]*)"
 # A value alone on its line, which belongs to an empty-valued key on the line before it (JSON or YAML),
-# matched once its comment and surrounding whitespace are gone. Its unit can't start with a digit unless
-# whitespace parts it from the number, so no two parts can take the same characters and a failed match
-# backtracks in linear time.
-BUDGET_BARE = re.compile(r"[\"']?" + BUDGET_NUMBER + r"((?:\s*[^\W\d.%]|\s*[.%]|\s+\d)[\w.%]*)?[\"']?,?")
+# matched once _bare_budget has removed its comment, trailing comma, quotes and whitespace. Its unit can't
+# start with a digit unless whitespace parts it from the number, so no two parts can take the same
+# characters and a failed match backtracks in linear time.
+BUDGET_BARE = re.compile(BUDGET_NUMBER + r"((?:\s*[^\W\d.%]|\s*[.%]|\s+\d)[\w.%]*)?")
 # A number standing as a value, not part of a name or a longer token ("v2", "es2020").
 BUDGET_ANY_NUMBER = re.compile(r"(?<![\w.\-])-?(?:\d+(?:\.\d*)?|\.\d+)")
 BUDGET_COMMENT = re.compile(r"(?:^|\s)(?:#|//).*$")
@@ -1230,10 +1230,15 @@ def _budget_value(number, unit):
 
 def _bare_budget(text):
     """(number, unit, the number's span in text) for a budget value alone on its line, or None."""
-    body = BUDGET_COMMENT.sub("", text)
-    m = BUDGET_BARE.fullmatch(body.strip())
+    body = BUDGET_COMMENT.sub("", text).rstrip()
+    body = body[:-1].rstrip() if body.endswith(",") else body
+    body = body[:-1].rstrip() if body.endswith(("'", '"')) else body
     offset = len(body) - len(body.lstrip())
-    return (m.group(1), m.group(2), (offset + m.start(1), offset + m.end(1))) if m else None
+    if body.startswith(("'", '"'), offset):
+        offset += 1
+    offset += len(body[offset:]) - len(body[offset:].lstrip())
+    m = BUDGET_BARE.fullmatch(body, offset)
+    return (m.group(1), m.group(2), m.span(1)) if m else None
 
 
 def _lint_hits(fd, lines):
