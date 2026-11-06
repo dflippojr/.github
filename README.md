@@ -110,10 +110,11 @@ whatever the change:
   `test_*` or `extends` option it changes, when the guard can read both sides);
 - any change to a file in or under a test directory (`test`, `tests`,
   `__tests__`, `e2e`, `spec`, `specs`), in either tree, whatever its extension
-  (`removed-tests`), except a Python file in a test directory whose outermost
-  test directory holds no C/C++ source or header in either tree (a file with no
-  extension counts, except `.gitignore`, `.gitattributes`, `.gitkeep` and
-  `.keep`), as in a Python backend's `backend/tests`. Such a file is exempt
+  (`removed-tests`), except a Python file, which is judged as Python wherever
+  it is, even beside C/C++ tests (issue #54: per file, by extension), as in a
+  Python backend's `backend/tests`; PlatformIO's custom test runner
+  (`test_custom_runner.py`), which decides how the C/C++ results are read, is
+  not judged as Python. Such a file is exempt
   only when its change edits a `test_*.py` or `*_test.py` module in place and
   does nothing but replace `assert` statements of its existing tests' own
   bodies (top-level `test_` functions, and `test_` methods of top-level `Test`
@@ -186,7 +187,7 @@ and doctest's (`CHECK_MESSAGE(cond, ...)`, variadic and logged lazily), like
 any other framework's, is every argument after the first.
 
 A new C/C++ test is not exempt (the owner's decision of 2026-11-06; issue #54
-exempts new Python tests, below): a new Unity, GoogleTest, Catch2 or doctest test, and its
+exempts new Python tests the guard can judge, below): a new Unity, GoogleTest, Catch2 or doctest test, and its
 `RUN_TEST` registration, need approval whatever they hold. A new test can call
 code the file or its headers already reach, such as a function that ends the
 process, or write memory the framework reads, and no check of its names rules
@@ -225,33 +226,57 @@ or an included file whose own brackets do not pair, included at file, namespace
 or `extern "C"` scope, can rename a test or change its scope unseen: the guard
 reads only the test source.
 
-A Python test module in such a test directory (a `test_*.py` or `*_test.py`
-module whose outermost test directory holds no C/C++ source or header, as
-above) is judged per file, as Python (issue #54, the owner's decision of
+A Python test module in any test directory (a `test_*.py` or `*_test.py`
+module) is judged per file, as Python (issue #54, the owner's decision of
 2026-11-02). An edit that removes no line of it and only adds tests is exempt,
 and so is a new module that holds only tests. Python is the only language the
 guard parses, so other files there, such as a JavaScript test or a data file,
-are still hits, and so are a `conftest.py`, a helper and a Python file beside
-C/C++ tests. The edit is exempt only when the guard can read the whole file on
+are still hits, and so are a `conftest.py` and a helper. What the guard cannot
+judge exactly fails closed (review round 1, the owner's decision of
+2026-11-06). The edit is exempt only when the guard can read the whole file on
 both sides as above (UTF-8, printable ASCII on changed lines, no carriage
 return inside a line) and parse it, every statement that was there stays as it
 was and in its order, and each statement it adds is one of these:
 
-- a `test_` function, plain or `async`, whose decorators are only
-  `pytest.mark.NAME` marks with literal arguments (where one top-level
-  `import pytest` is all that binds `pytest`), whose defaults are literals,
-  and whose annotations are literals or dotted names, so Python runs nothing
-  when it defines it;
-- a `Test` class with no base, keyword or decorator but such marks, holding
-  only such `test_` methods and docstrings;
+- a `test_` function (not `async`, which pytest skips without a plugin) whose
+  only decorators are `@pytest.mark.parametrize` marks with a literal name
+  list, a non-empty literal list of values and at most literal `ids` (where
+  one top-level `import pytest` is all that binds `pytest`), whose defaults
+  are literals and whose annotations are literals or dotted names, so Python
+  runs nothing when it defines it. The guard reads the parsed decorator, so a
+  `skip`, `skipif`, `xfail`, `usefixtures` or custom mark (one a `conftest.py`
+  hook or a `-m` option may skip) is a hit however its lines are written. Its
+  parameters are plain ones; each one without a default is a name a
+  `parametrize` mark gives, `tmp_path`, `capsys`, `capfd` or `caplog`, or a
+  fixture an existing test of the module already requests, but never
+  `request`, `pytestconfig`, `monkeypatch`, `mocker`, `cache`, `pytester` or
+  another that reaches pytest's session or config or patches code. Its body
+  holds only `assert` statements, expressions, `pass` and assignments to its
+  own names: no `if`, `for`, `while`, `try`, `with`, `raise`, `return`,
+  `del`, `global`, import or nested definition, and no `and`, `or`,
+  conditional expression, comprehension, lambda, `:=`, `await` or `yield`. It
+  assigns to no attribute or item, reads no attribute that starts with `_`
+  (such as `__code__` or `os._exit`) or that may skip a test or end the run
+  (`skip…`, `xfail…`, `exit`, `quit`, `abort`, `system`, `kill…`, `fork…`,
+  `spawn…`, `execl…`/`execv…`, `popen…`, `shouldstop`, `shouldfail`), and reads
+  only its own names, builtins that only compute a value (`len`, `sorted`,
+  `isinstance`, exception classes and the like), `pytest.approx`, and names
+  the module binds at its top level by an import of code other than `os`,
+  `sys`, `subprocess`, `signal`, `builtins`, `importlib`, `ctypes`,
+  `threading`, `asyncio`, `inspect`, `atexit`, `shutil`, `unittest`, `mock`,
+  `pytest` and the like, by a `def` or `class` that is not a test, or to a
+  literal. So it cannot read an existing test (to swap its code, say), exit,
+  skip itself or reach the interpreter;
+- a `Test` class with no base, keyword, decorator or type parameter, holding
+  only such `test_` methods (whose first parameter is `self`) and docstrings;
 - such a `test_` method added to an existing `Test` class that pytest collects
-  (no decorator but pytest marks, no constructor), whose header stays as it
-  was and whose bases are only `object` or `unittest.TestCase`, so no base can
-  hold a test the method overrides;
-- an import of a module (`import x`); in a new module a `from` import too. In a
-  module that already holds tests, a `from` import is a hit, since the name it
-  imports may be a fixture that pytest applies to those tests (an autouse
-  one);
+  (no decorator at all, since a class's marks apply to the method, and no
+  constructor), whose header stays as it was and whose bases are only
+  `object` or `unittest.TestCase`, so no base can hold a test the method
+  overrides;
+- `import pytest`. Any other import is a hit: importing a module runs its code
+  when pytest imports the test module, and a name a `from` import binds may be
+  a fixture that pytest applies to the module's tests (an autouse one);
 - a docstring; and in a new module, a literal assigned to a name. In a module
   that already holds tests, such an assignment is a hit, since a
   `conftest.py` hook may read it from the module (a flag that skips its
@@ -262,15 +287,19 @@ it anywhere, it is not a builtin, and it does not start with `_`, `pytest_`,
 `pytestmark`, `setup`, `teardown`, `collect_ignore` or `load_tests`, which
 pytest or unittest read from a test module by name. So an added test cannot
 shadow an existing test, fixture, helper or import, and an addition cannot set
-`__test__`, `pytestmark` or a module setup. A module that uses a wildcard
-import, `globals`, `vars`, `locals`, `exec`, `eval` or `setattr` anywhere is
-never exempt this way, since it may define tests whose names the guard does
-not see. A change that does anything else is
-judged by the assert-only rule above, so an assertion fixed beside a test added
-is a hit. New skips in an added test are hits as in any repository. The guard
-does not read what an added test does when it runs: like any code the pull
-request changes, it can end the process or change state that the existing
-tests read.
+`__test__`, `pytestmark` or a module setup. Never exempt this way are a module
+that uses a wildcard import, `globals`, `vars`, `locals`, `exec`, `eval` or
+`setattr` anywhere, since it may define tests whose names the guard does not
+see; a fixture file, one that defines or applies a fixture (`fixture`,
+`yield_fixture`, `usefixtures`) or holds any `pytest_` name, such as a hook;
+and one that sets `pytestmark`, whose marks apply to an added test. A change
+that does anything else is judged by the assert-only rule above, so an
+assertion fixed beside a test added is a hit. New skips in an added test are
+also hits as in any repository. The guard does not follow the code an added
+test calls: a function the module already imports, a fixture an existing test
+requests, or a method of the objects they return can still end the process or
+change state that the existing tests read, like any code the pull request
+changes.
 
 Unity `RUN_TEST(name)` registrations and `void test_name(void)` definitions are
 still counted, so a hit names the tests a change removed. Editing a source or

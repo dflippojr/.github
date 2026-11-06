@@ -24,6 +24,11 @@ TOUCHED = ("modified a file in a test directory of a C/C++ repository; the guard
 # C_SOURCE.format(why).
 C_SOURCE = ("modified a C/C++ test source of a C/C++ repository: {}; only replacing literals or comparison operators "
             "in assertions of existing tests is exempt, so this needs approval")
+# The hit for a Python file in a test directory of a C/C++ repository that is not a test module (issue #40),
+# wherever it is (issue #54): PY_HELPER.format(status).
+PY_HELPER = ("{} a Python test file of a C/C++ repository: it is not a test_*.py or *_test.py module (a conftest.py or a "
+             "helper can change any test); only adding tests the guard can judge, or replacing compared literals or "
+             "comparison operators in assert statements of existing tests, is exempt, so this needs approval")
 DIRECTIVE = "it changes a directive line, which the guard does not read"
 MACRO = "the guard does not expand macros"
 SPLICE = "it splices a line with a backslash at its end"
@@ -888,10 +893,14 @@ class RuleDetails(unittest.TestCase):
  }
 """, "test/test_a/test_main.cpp")
         for path in ("test/test_a/cases.txt", "test/shared/CASES", "test/test_a/data.json", "test/test_a/cases.md",
-                     "test/test_a/cases.rst", "test/test_a/cases.py", "test/test_a/cases.tpp", "test/test_a/cases.c++"):
+                     "test/test_a/cases.rst", "test/test_a/cases.tpp", "test/test_a/cases.c++"):
             with self.subTest(path=path):
                 [hit] = analyze_text(source + self.platformio_diff("-RUN_TEST(test_b);\n", path))
                 self.assertEqual((hit.path, hit.detail), (path, TOUCHED))
+        # A Python file there is judged as Python, per file (issue #54): a helper is still a hit.
+        [hit] = analyze_text(source + self.platformio_diff("-RUN_TEST(test_b);\n", "test/test_a/cases.py"))
+        self.assertEqual(hit.path, "test/test_a/cases.py")
+        self.assertIn("a Python test file of a C/C++ repository: it is not a test_*.py", hit.detail)
         # In a repository with no C/C++ file or platformio.ini, the rule does not apply.
         self.assertEqual(analyze_text(self.platformio_diff("-a\n+b\n", "tests/fixtures/data.json")), [])
         # A symbolic link's target is not read, whatever its name.
@@ -1060,8 +1069,9 @@ class RuleDetails(unittest.TestCase):
                 self.assertEqual({(h.rule, h.path) for h in hits}, {("skip-marker", "backend/tests/test_api.py"),
                                                                     ("removed-tests", "backend/tests/test_api.py")})
         # (d) The C/C++ rules stand: a Unity test edit beyond an assertion's literal arguments (issue #43: a
-        # call's argument), a Python file in the firmware test directory, and a Python test directory that
-        # gains a C/C++ file. A Unity assertion's literal argument fixed is no hit.
+        # call's argument), and a C/C++ file added to a Python test directory. A Unity assertion's literal
+        # argument fixed is no hit. A Python file is judged as Python wherever it is (issue #54, per file): a
+        # helper in the firmware test directory is a hit, and an assertion fixed beside a new C file is not.
         self.assertEqual(judge_commits(base, dict(base, **{
             "firmware/test/test_logic/test_main.cpp": unity.replace("0, clamp", "1, clamp")})), [])
         call = C_SOURCE.format("it changes an assertion in test_clamp_low outside its literal arguments and the "
@@ -1070,17 +1080,17 @@ class RuleDetails(unittest.TestCase):
         cases = [({"firmware/test/test_logic/test_main.cpp": unity.replace("0, 10", "1, 10")},
                   {("firmware/test/test_logic/test_main.cpp", call)}),
                  ({"firmware/test/test_logic/gen_cases.py": "CASES = 3\n"},
-                  {("firmware/test/test_logic/gen_cases.py", TOUCHED.replace("modified", "added"))}),
+                  {("firmware/test/test_logic/gen_cases.py", PY_HELPER.format("added"))}),
                  ({"backend/tests/test_api.py": edited, "backend/tests/native.c": "int x;\n"},
-                  {("backend/tests/test_api.py", TOUCHED),
-                   ("backend/tests/native.c", TOUCHED.replace("modified", "added"))})]
+                  {("backend/tests/native.c", TOUCHED.replace("modified", "added"))})]
         for change, expected in cases:
             with self.subTest(change=sorted(change)):
                 hits = judge_commits(base, dict(base, **change))
                 self.assertEqual({(h.path, h.detail) for h in hits}, expected)
         base_py = dict(base, **{"firmware/test/test_logic/gen_cases.py": "CASES = 3\n"})
         hits = judge_commits(base_py, dict(base_py, **{"firmware/test/test_logic/gen_cases.py": "CASES = 2\n"}))
-        self.assertEqual({(h.path, h.detail) for h in hits}, {("firmware/test/test_logic/gen_cases.py", TOUCHED)})
+        self.assertEqual({(h.path, h.detail) for h in hits},
+                         {("firmware/test/test_logic/gen_cases.py", PY_HELPER.format("modified"))})
         # Only Python files are judged as Python: other files in a test directory are still hits.
         [hit] = judge_commits(dict(base, **{"backend/tests/data.json": "{}\n"}),
                               dict(base, **{"backend/tests/data.json": "[]\n"}))
@@ -1281,8 +1291,8 @@ class RuleDetails(unittest.TestCase):
                          ("    app = create_app()\n", "    app = create_app()\n\n"),
                          ("    assert os.environ\n", "    # The environment is set.\n    assert os.environ\n"),
                          ("== LIMIT\n", "== LIMIT  # the upper stop\n"), ("== LIMIT\n", "== (\n        LIMIT)\n"),
-                         # Issue #54: an edit that removes no line and only adds an import, a blank line or a test.
-                         ("import os\n", "import os\nimport sys\n"), ("import os\n", "import os\n\n"),
+                         # Issue #54: an edit that removes no line and only adds a blank line or a test.
+                         ("import os\n", "import os\n\n"),
                          ("    assert create_app().ready is True\n",
                           "    assert create_app().ready is True\n\n\ndef test_reset():\n    reset()\n")):
             with self.subTest(old=old, new=new):
@@ -1292,7 +1302,8 @@ class RuleDetails(unittest.TestCase):
         moved, statement = "adds, removes or moves a statement", "not an assert statement of a test's own body"
         shape, unsafe = "outside a comparison's literal operands", "which decide what else it runs"
         tail = "    assert create_app().ready is True\n"
-        cases = [("import os\n", "import sys\n", outside), ("LIMIT = 120", "LIMIT = 125", outside),
+        cases = [("import os\n", "import os\nimport sys\n", outside), ("import os\n", "import sys\n", outside),
+                 ("LIMIT = 120", "LIMIT = 125", outside),
                  ("# Height checks.", "# Limit checks.", comment), ("\n\nimport pytest", "\nimport pytest", comment),
                  ("def test_height_limits():", "@pytest.mark.slow\ndef test_height_limits():", outside),
                  ("def test_height_limits():", "def test_height_limits(app=None):", outside),
@@ -1411,12 +1422,14 @@ class RuleDetails(unittest.TestCase):
             with self.subTest(start=start_text):
                 [hit] = judged("120", "125", start_text)
                 self.assertIn(outside, hit.detail)
-        # Other Python files in the test directory, and a test module renamed or deleted. A test module added
-        # with only tests in it passes (issue #54).
+        # Other Python files in the test directory, a test module renamed or deleted, and a test module added
+        # with an import other than pytest. A test module added with only tests in it passes (issue #54).
         start = dict(DESK_TREE, **{"backend/tests/helpers.py": "LIMIT = 120\n"})
-        self.assertEqual(judge_commits(start, dict(start, **{"backend/tests/test_new.py": DESK_API})), [])
+        self.assertEqual(judge_commits(start, dict(start, **{"backend/tests/test_new.py": "def test_new():\n"
+                                                                                       "    assert True\n"})), [])
         for change, drop, why in (({"backend/tests/helpers.py": "LIMIT = 125\n"}, (), "not a test_*.py or *_test.py module"),
-                                  ({"backend/tests/test_api_v2.py": DESK_API}, {test_api}, "only an edit in place")):
+                                  ({"backend/tests/test_api_v2.py": DESK_API}, {test_api}, "only an edit in place"),
+                                  ({"backend/tests/test_new.py": DESK_API}, (), "an import other than import pytest")):
             with self.subTest(change=sorted(change)):
                 head = {p: t for p, t in dict(start, **change).items() if p not in drop}
                 [hit] = judge_commits(start, head)
@@ -1564,7 +1577,7 @@ class RuleDetails(unittest.TestCase):
                 self.assertIn(test_api, flagged(base, change))
         hits = judge_commits(base, dict(base, **{test_api: "import pytest\n" + api + added.replace(
             "def test_reset", "@pytest.mark.skip\ndef test_reset")}))
-        self.assertEqual({(h.rule, h.path) for h in hits}, {("skip-marker", test_api)})
+        self.assertEqual({(h.rule, h.path) for h in hits}, {("skip-marker", test_api), ("removed-tests", test_api)})
         # Added lines that change which existing tests run, or what their names mean, are hits.
         hiding = [api + "\n\ndef test_health():\n    pass\n",
                   api.replace("create_app\n", "create_app\nfrom os import _exit as create_app\n", 1),

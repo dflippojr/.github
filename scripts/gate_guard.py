@@ -599,15 +599,10 @@ def _at_test_dir(path):
     return any(d in TEST_DIRS for d in path.lower().split("/"))
 
 
-def _test_root(path):
-    """The outermost test directory path is in, lower-cased, or None."""
-    parts = path.lower().split("/")[:-1]
-    return next(("/".join(parts[:i + 1]) for i, d in enumerate(parts) if d in TEST_DIRS), None)
-
-
-def _python_test(path, facts):
-    """Whether path is a Python file outside test directories, or in one that holds no C/C++ source or header."""
-    return _ext(path) in PY_EXTS and _test_root(path) not in facts.c_test_roots
+def _python_test(path):
+    """Whether path is a Python file, judged as Python wherever it is (issue #54: per file, by extension), but
+    PlatformIO's custom test runner, which decides how the C/C++ tests' results are read."""
+    return _ext(path) in PY_EXTS and _name(path) != "test_custom_runner.py"
 
 
 # A source encoding declaration (PEP 263). The guard reads a file as UTF-8, so a
@@ -874,6 +869,39 @@ def _py_line_change(tree, tests, text, changed):
 # and other dunders), which an addition may not bind.
 PY_RESERVED = re.compile(r"_|pytest_|pytestmark|setup|teardown|collect_ignore|load_tests", re.IGNORECASE)
 PY_BUILTINS = frozenset(dir(builtins))
+# Review round 1, the owner's decision: what the guard cannot judge exactly
+# fails closed. An added test's body holds only these statements, none of the
+# PY_BODY_UNSAFE nodes (flow control, :=, a lambda, a suspension), and reads
+# only its own names, the PY_SAFE_BUILTINS, pytest.approx and names the module
+# binds by an import of code that is not a PY_RUNTIME_MODULES module, a helper
+# or a literal (see _PyAddition.traceable).
+PY_BODY_STATEMENTS = (ast.Expr, ast.Assert, ast.Pass, ast.Assign, ast.AnnAssign, ast.AugAssign)
+PY_BODY_UNSAFE = PY_UNSAFE - {"Starred"}
+PY_SAFE_BUILTINS = frozenset((
+    "abs", "all", "any", "ascii", "bin", "bool", "bytearray", "bytes", "callable", "chr", "complex", "dict", "divmod",
+    "enumerate", "filter", "float", "format", "frozenset", "hash", "hex", "int", "isinstance", "issubclass", "iter",
+    "len", "list", "map", "max", "min", "next", "oct", "ord", "pow", "print", "range", "repr", "reversed", "round",
+    "set", "slice", "sorted", "str", "sum", "tuple", "zip")) | frozenset(
+    n for n in PY_BUILTINS if isinstance(getattr(builtins, n), type) and issubclass(getattr(builtins, n), Exception))
+# Modules through which code can end the process, skip a test, patch other code
+# or reach the interpreter or pytest itself; a body reads no name bound from one.
+PY_RUNTIME_MODULES = frozenset((
+    "os", "posix", "nt", "sys", "subprocess", "signal", "builtins", "importlib", "ctypes", "threading", "_thread",
+    "multiprocessing", "concurrent", "asyncio", "gc", "inspect", "atexit", "faulthandler", "types", "runpy", "code",
+    "pdb", "shutil", "pty", "resource", "unittest", "mock", "pytest", "_pytest", "pluggy"))
+# Attributes a body may not read: private and special ones (__code__,
+# __globals__, os._exit), and those that skip a test or end the run.
+PY_STOP_ATTRS = re.compile(
+    r"_|skip|xfail|(?:exit|quit|abort|system)$|kill|fork|spawn|exec[lv]|popen|should(?:stop|fail)$", re.IGNORECASE)
+# Fixtures an added test may request although no existing test of the module
+# does, and fixtures it may never request: they reach pytest's session and
+# config, or patch other code.
+PY_INERT_FIXTURES = frozenset(("tmp_path", "capsys", "capfd", "caplog"))
+PY_INTERNAL_FIXTURES = frozenset(("request", "pytestconfig", "monkeypatch", "mocker", "cache", "pytester", "testdir",
+                                  "doctest_namespace", "record_property", "record_testsuite_property",
+                                  "record_xml_attribute", "tmp_path_factory", "tmpdir_factory"))
+# Names that make a module a fixture file: it defines or applies fixtures.
+PY_FIXTURE_NAMES = frozenset(("fixture", "yield_fixture", "usefixtures"))
 
 
 def _py_identifiers(tree):
@@ -886,43 +914,40 @@ def _py_identifiers(tree):
     return names
 
 
+def _py_fixture_file(tree):
+    """Whether tree defines or applies a fixture, or defines a pytest hook or plugin list (a pytest_ name)."""
+    names = _py_identifiers(tree) | {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    return bool(PY_FIXTURE_NAMES & names) or any(n.startswith("pytest_") for n in names)
+
+
 def _py_docstring(node):
     """Whether node is a statement that is only a string literal, which runs nothing."""
     return isinstance(node, ast.Expr) and _py_text(node.value)
 
 
-def _py_mark(node, pytest_module):
-    """Whether node, a decorator, is pytest.mark.NAME, or a call of it with only literal arguments, where
-    pytest_module says pytest is the pytest module."""
-    call = isinstance(node, ast.Call)
-    if not pytest_module or not re.fullmatch(r"pytest\.mark\.\w+", _py_chain(node.func if call else node) or ""):
-        return False
-    return not call or all(k.arg is not None and _py_leaves(k.value) is not None for k in node.keywords) and all(
-        _py_leaves(a) is not None for a in node.args)
+def _py_parametrize(node, pytest_module):
+    """The parameter names node, a decorator, gives a test, when it is pytest.mark.parametrize with a literal
+    string or sequence of names, a non-empty literal list or tuple of values and no keyword but literal ids, or
+    None, where pytest_module says pytest is the pytest module. The guard reads the parsed decorator, so a mark
+    is judged however its lines are written: any other mark (skip, skipif, xfail, usefixtures, or a custom one a
+    conftest.py hook or -m option may skip) gives None."""
+    if not (pytest_module and isinstance(node, ast.Call) and _py_chain(node.func) == "pytest.mark.parametrize"):
+        return None
+    if len(node.args) != 2 or any(k.arg != "ids" or _py_leaves(k.value) is None for k in node.keywords):
+        return None
+    names, values = node.args
+    if not isinstance(values, (ast.List, ast.Tuple)) or not values.elts or _py_leaves(values) is None:
+        return None
+    parts = [names] if _py_text(names) else getattr(names, "elts", [None])
+    if not parts or not all(_py_text(p) for p in parts):
+        return None
+    words = [w.strip() for p in parts for w in (p.value if hasattr(p, "value") else p.s).split(",")]
+    return set(words) if all(w.isidentifier() for w in words) else None
 
 
 def _py_annotation(node):
     """Whether node, an annotation, is absent, a literal or a dotted name, whose value comes from a lookup only."""
     return node is None or _py_chain(node) is not None or _py_leaves(node) is not None
-
-
-def _py_new_test(node, pytest_module):
-    """Why node, a function an edit adds, is not a test_ function that Python can define without running code,
-    or None. Its decorators are pytest marks with literal arguments, and its defaults are literals and its
-    annotations literals or dotted names: Python evaluates them all when it imports the module."""
-    if not isinstance(node, PY_DEFS) or not node.name.startswith("test_"):
-        return f"it adds {node.name}, a function that is not a test_ function"
-    if not all(_py_mark(d, pytest_module) for d in node.decorator_list):
-        return (f"it adds {node.name} with a decorator other than a pytest mark with literal arguments, where one "
-                "top-level import pytest is all that binds pytest")
-    a = node.args
-    params = getattr(a, "posonlyargs", []) + a.args + a.kwonlyargs + [p for p in (a.vararg, a.kwarg) if p]
-    defaults = a.defaults + [d for d in a.kw_defaults if d is not None]
-    if (any(_py_leaves(d) is None for d in defaults) or not all(_py_annotation(p.annotation) for p in params)
-            or not _py_annotation(node.returns) or getattr(node, "type_params", None)):
-        return (f"it adds {node.name} with a default that is not a literal, an annotation that is not a literal or "
-                "a dotted name, or a type parameter, which Python evaluates when it imports the module")
-    return None
 
 
 def _py_collected_class(node):
@@ -960,6 +985,33 @@ def _py_inserted(old, new):
     return inserted if i == len(old) else None
 
 
+def _py_top_bindings(statement):
+    """(name, traceable) for each name a top-level statement binds. A name is traceable when it is bound by an
+    import of code that is not a PY_RUNTIME_MODULES module, by a def or class that is not a test, or to a
+    literal, and is not private; a name bound any other way, or declared global inside it, is not."""
+    if isinstance(statement, (ast.Import, ast.ImportFrom)):
+        level, module = getattr(statement, "level", 0), getattr(statement, "module", None) or ""
+        for a in statement.names:
+            root = "" if level else (module or a.name).split(".")[0]
+            bound = a.asname or (a.name if module or level else a.name.split(".")[0])
+            yield bound, root not in PY_RUNTIME_MODULES and a.name != "*" and not bound.startswith("_")
+        return
+    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        bound = [(statement.name, not statement.name.lower().startswith(("test", "_")))]
+    elif isinstance(statement, (ast.Assign, ast.AnnAssign)) and statement.value is not None:
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        literal = _py_leaves(statement.value) is not None and all(isinstance(t, ast.Name) for t in targets)
+        bound = [(n, literal and not n.startswith("_")) for t in targets for n in _py_identifiers(t)]
+    else:
+        bound = [(n, False) for n in _py_identifiers(statement)]
+    for name, traceable in bound:
+        yield name, traceable
+    for n in ast.walk(statement):
+        if isinstance(n, (ast.Global, ast.Nonlocal)):
+            for name in n.names:
+                yield name, False
+
+
 # Names through which a module can define or rebind names the guard does not see.
 PY_DYNAMIC = frozenset(("globals", "vars", "locals", "exec", "eval", "setattr", "*"))
 
@@ -970,6 +1022,12 @@ class _PyAddition:
     def __init__(self, old, new, new_module):
         self.used, self.bound = _py_identifiers(old) | PY_BUILTINS, set()
         self.new, self.new_module, self.pytest_module = new, new_module, _py_pytest(new)
+        self.requested = {a.arg for t in _python_tests(old) for a in t.args.args} - PY_INTERNAL_FIXTURES
+        traceable, untraceable = set(), set()
+        for statement in new.body:
+            for name, ok in _py_top_bindings(statement):
+                (traceable if ok else untraceable).add(name)
+        self.module_names, self.traceable = traceable | untraceable, traceable - untraceable
 
     def fresh(self, name, scope):
         """Why binding name in scope (a set it then joins) is not a new name, or None."""
@@ -980,6 +1038,84 @@ class _PyAddition:
         scope.add(name)
         return None
 
+    def readable(self, name):
+        """Whether an added test's body may read name, a name that is not its own: see _py_top_bindings."""
+        return name in self.traceable if name in self.module_names else name in PY_SAFE_BUILTINS
+
+    def params(self, node, method):
+        """The names of the parameters of node, an added test, or why one is a fixture the guard cannot judge."""
+        a, given = node.args, set()
+        for d in node.decorator_list:
+            names = _py_parametrize(d, self.pytest_module)
+            if names is None:
+                return (f"it adds {node.name} with a decorator other than pytest.mark.parametrize with literal "
+                        "arguments: a skip, skipif, xfail, usefixtures or custom mark may keep a test from running")
+            given |= names
+        if getattr(a, "posonlyargs", []) or a.vararg or a.kwarg or a.kwonlyargs:
+            return f"it adds {node.name} with a parameter that is not a plain positional one"
+        if (any(_py_leaves(d) is None for d in a.defaults) or not all(_py_annotation(p.annotation) for p in a.args)
+                or not _py_annotation(node.returns) or getattr(node, "type_params", None)):
+            return (f"it adds {node.name} with a default that is not a literal, an annotation that is not a literal "
+                    "or a dotted name, or a type parameter, which Python evaluates when it imports the module")
+        fixtures = a.args[1:] if method else a.args
+        if method and (not a.args or a.args[0].arg != "self"):
+            return f"it adds {node.name}, a method whose first parameter is not self"
+        for p in fixtures[:len(fixtures) - len(a.defaults)]:
+            if p.arg not in given | PY_INERT_FIXTURES | self.requested:
+                return (f"it adds {node.name}, which requests the fixture {p.arg}: one no existing test of the module "
+                        "requests, or one that reaches pytest's session or config or patches code (request, "
+                        "pytestconfig, monkeypatch and the like)")
+        return {p.arg for p in a.args}
+
+    def effect(self, n, own, approx, name):
+        """Why n, a node of the body of name, an added test whose own names are own, does what the guard cannot
+        judge, or None. approx holds the ids of the pytest names of pytest.approx."""
+        if type(n).__name__ in PY_BODY_UNSAFE:
+            return (f"{name} holds and, or, a conditional, a comprehension, a lambda, :=, await or yield, which decide "
+                    "what else it runs")
+        if isinstance(n, (ast.Attribute, ast.Subscript)) and not isinstance(n.ctx, ast.Load):
+            return f"{name} assigns to or deletes an attribute or an item, which may change what other tests run"
+        if isinstance(n, ast.Attribute) and PY_STOP_ATTRS.match(n.attr):
+            return (f"{name} reads the attribute {n.attr}: a private or special one, or one that may skip the test or "
+                    "end the run")
+        if isinstance(n, ast.Name) and n.id not in own and id(n) not in approx and not self.readable(n.id):
+            return (f"{name} reads {n.id}, which is not its own name, a builtin that only computes a value, "
+                    "pytest.approx, or a name the module binds by an import of other code, a helper or a literal "
+                    "(not a test, nor anything from os, sys, pytest or the like)")
+        return None
+
+    def test(self, node, method=False):
+        """Why node, a function an edit adds, is not a test_ function whose effects the guard can judge, or None.
+
+        Python defines it without running code: its decorators are literal
+        parametrize marks, its defaults literals and its annotations literals
+        or dotted names. It requests no fixture but the parameters parametrize
+        gives, inert built-in fixtures (PY_INERT_FIXTURES) and fixtures an
+        existing test of the module requests. Its body holds only assert
+        statements, expressions and assignments to its own names, and reads
+        only names the guard can trace (readable), so it cannot end the run,
+        skip itself, or change an existing test or what its names mean.
+        """
+        if not isinstance(node, ast.FunctionDef) or not node.name.startswith("test_"):
+            return (f"it adds {node.name}, a function that is not a test_ function, or an async one, which pytest "
+                    "skips without a plugin")
+        own = self.params(node, method)
+        if isinstance(own, str):
+            return own
+        own |= {n.id for s in node.body for n in ast.walk(s)
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+        approx = {id(n.value) for s in node.body for n in ast.walk(s) if self.pytest_module
+                  and isinstance(n, ast.Attribute) and n.attr == "approx" and isinstance(n.value, ast.Name)
+                  and n.value.id == "pytest"}
+        for statement in node.body:
+            if not isinstance(statement, PY_BODY_STATEMENTS):
+                return (f"{node.name} holds a statement other than an assert, an expression or an assignment to a "
+                        "name: flow control, a raise, a return, a with, an import, a global or a nested definition")
+            why = next(filter(None, (self.effect(n, own, approx, node.name) for n in ast.walk(statement))), None)
+            if why:
+                return why
+        return None
+
     def methods(self, nodes):
         """Why nodes, statements added to a test class, are not test_ methods and docstrings, or None."""
         scope = set()
@@ -988,16 +1124,16 @@ class _PyAddition:
                 continue
             if not isinstance(node, PY_DEFS):
                 return "it adds a statement to a test class that is not a test_ method or a docstring"
-            why = _py_new_test(node, self.pytest_module) or self.fresh(node.name, scope)
+            why = self.test(node, method=True) or self.fresh(node.name, scope)
             if why:
                 return why
         return None
 
     def extension(self, prior, node):
         """Why node, the class prior with statements added, does more than add test_ methods to it, or None."""
-        if not _py_collected_class(prior):
-            return (f"it changes {prior.name}, a class pytest does not collect tests from (not a Test class, a "
-                    "decorator other than pytest marks, or a constructor)")
+        if not _py_collected_class(prior) or prior.decorator_list:
+            return (f"it changes {prior.name}, a class pytest does not collect tests from (not a Test class, or a "
+                    "constructor), or whose decorator, such as a skip mark, applies to a method it adds")
         if any(_py_masked(v, set()) != _py_masked(getattr(node, f, None), set())
                for f, v in ast.iter_fields(prior) if f != "body"):
             return f"it changes the header of {prior.name}: its name, a base, a keyword or a decorator"
@@ -1013,21 +1149,19 @@ class _PyAddition:
 
     def new_class(self, node):
         """Why node, an added class, is not a Test class of test_ methods and docstrings, or None."""
-        if (not node.name.startswith("Test") or node.bases or node.keywords or getattr(node, "type_params", None)
-                or not all(_py_mark(d, self.pytest_module) for d in node.decorator_list)):
-            return (f"it adds {node.name}, a class that is not a Test class with no base, keyword, decorator but "
-                    "pytest marks or type parameter")
+        if (not node.name.startswith("Test") or node.bases or node.keywords or node.decorator_list
+                or getattr(node, "type_params", None)):
+            return (f"it adds {node.name}, a class that is not a Test class with no base, keyword, decorator or type "
+                    "parameter")
         return self.methods(node.body) or self.fresh(node.name, self.bound)
 
     def imports(self, node):
-        """Why node, an added import, may bind a name the module's tests read, or None."""
-        if isinstance(node, ast.ImportFrom) and not self.new_module:
-            return ("it adds a from-import to a module that holds tests: a name it imports may be a fixture pytest "
-                    "applies to them (import the module instead)")
-        if any(a.name == "*" for a in node.names):
-            return "it adds a wildcard import, which may bind any name"
-        return next(filter(None, (self.fresh((a.asname or a.name).split(".")[0], self.bound) for a in node.names)),
-                    None)
+        """Why node, an added import, is not import pytest, or None. Importing any other module runs its code
+        when pytest imports the test module, and a from-import may bind a fixture pytest applies to its tests."""
+        if isinstance(node, ast.Import) and [(a.name, a.asname) for a in node.names] == [("pytest", None)]:
+            return self.fresh("pytest", self.bound)
+        return ("it adds an import other than import pytest: importing a module runs its code when pytest imports "
+                "the test module, and a name it imports may be a fixture pytest applies to its tests")
 
     def statement(self, node):
         """Why node, a statement the edit adds, or an (old class, new class) pair, is not an addition of tests,
@@ -1037,7 +1171,7 @@ class _PyAddition:
         if _py_docstring(node):
             return None
         if isinstance(node, PY_DEFS):
-            return _py_new_test(node, self.pytest_module) or self.fresh(node.name, self.bound)
+            return self.test(node) or self.fresh(node.name, self.bound)
         if isinstance(node, ast.ClassDef):
             return self.new_class(node)
         if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -1045,7 +1179,7 @@ class _PyAddition:
         if (self.new_module and isinstance(node, ast.Assign) and _py_leaves(node.value) is not None
                 and all(isinstance(t, ast.Name) for t in node.targets)):
             return next(filter(None, (self.fresh(t.id, self.bound) for t in node.targets)), None)
-        return ("it adds a statement that is not a test, a test class, an import or a docstring (or, in a new "
+        return ("it adds a statement that is not a test, a test class, import pytest or a docstring (or, in a new "
                 "module, a literal assigned to a name)")
 
 
@@ -1056,24 +1190,29 @@ def _py_added_change(old, new, new_module):
     Issue #54, the owner's per-file rule: in a repository that also holds
     C/C++, an edit that only adds tests to a Python test module passes. Each
     statement of old stays as it was, in its order, and each statement the
-    edit adds is a test_ function (see _py_new_test), a Test class of such
-    methods and docstrings with no base, a test_ method added to an existing
-    Test class, an import or a docstring; in a new module, a literal assigned
+    edit adds is a test_ function whose effects the guard can judge (see
+    _PyAddition.test), a Test class of such methods and docstrings with no
+    base or decorator, a test_ method added to an existing undecorated Test
+    class, import pytest or a docstring; in a new module, a literal assigned
     to a name too. A name it binds is new to the module and not a builtin, so
     no existing test reads it, and is not one pytest or unittest reads by its
-    name (PY_RESERVED). In a module that already holds tests, an import names
-    a module (import x), never a name from it, which may be a fixture that
-    pytest applies to them (an autouse one), and no literal is assigned, which
-    a conftest.py hook may read from the module. A module that may define
-    names the guard does not see (a wildcard import, globals() and the like,
-    PY_DYNAMIC) is never exempt. What an added test does when it runs is not
-    read.
+    name (PY_RESERVED). Review round 1, the owner's decision: what the guard
+    cannot judge exactly fails closed. So a module that may define names the
+    guard does not see (a wildcard import, globals() and the like,
+    PY_DYNAMIC), a fixture file (one that defines or applies a fixture or
+    defines a pytest hook), and one that sets pytestmark, whose marks apply
+    to an added test, are never exempt this way.
     """
     dynamic = PY_DYNAMIC & _py_identifiers(old)
     if dynamic:
         how = "a wildcard import" if "*" in dynamic else sorted(dynamic)[0]
         return (f"the module uses {how}, through which it may define tests the guard does not see, so a name it "
                 "adds may shadow one")
+    if _py_fixture_file(old) or _py_fixture_file(new):
+        return ("it is a fixture file: it defines or applies a fixture, or defines a pytest hook, which may change "
+                "what any test it holds does")
+    if "pytestmark" in _py_identifiers(old):
+        return "the module sets pytestmark, whose marks, such as a skip, apply to every test it adds"
     inserted = _py_inserted(old.body, new.body)
     if inserted is None:
         return "it changes or removes a statement that was there"
@@ -1082,7 +1221,7 @@ def _py_added_change(old, new, new_module):
 
 
 def _python_unexempt(fd):
-    """Why fd, a Python file in a Python test directory of a C/C++ repository, is not exempt, or None.
+    """Why fd, a Python file in a test directory of a C/C++ repository, is not exempt, or None.
 
     Issue #40, the owner's assert-only rule: only an edit in place of a
     test_*.py or *_test.py module that replaces assert statements of its
@@ -1670,13 +1809,13 @@ def c_cpp_hits(files, facts, flagged):
         if not _touched(fd) or fd.path in flagged or fd.path in facts.blind:
             continue
         if any(_at_test_dir(p) for p in fd.paths):
-            if all(_python_test(p, facts) for p in fd.paths):
+            if all(_python_test(p) for p in fd.paths):
                 why = _python_unexempt(fd)
                 if why:
                     hits.append(Hit("removed-tests", fd.path, None, f"{fd.status} a Python test file of a C/C++ "
-                                    f"repository: {why}; only adding tests, or replacing compared literals or "
-                                    "comparison operators in assert statements of existing tests, is exempt, so this "
-                                    "needs approval"))
+                                    f"repository: {why}; only adding tests the guard can judge, or replacing compared "
+                                    "literals or comparison operators in assert statements of existing tests, is "
+                                    "exempt, so this needs approval"))
                 continue
             if fd.status == "modified" and all(_ext(p) in C_EXTS for p in fd.paths):
                 why = _c_cpp_unexempt(fd)
@@ -2831,14 +2970,11 @@ class GitTrees:
 # c_cpp: whether either tree has a platformio.ini or a C/C++ source or header;
 # open_configs: [(platformio.ini, why)] for those that name extra_configs or
 # test_dir, or that cannot be read; blind: symbolic links and submodules at or
-# in a test directory, in a C/C++ repository; c_test_roots: the outermost test
-# directories (see _test_root) that hold a C/C++ source or header in either
-# tree, counting any file with no extension but git's own; coverage_configs:
+# in a test directory, in a C/C++ repository; coverage_configs:
 # the (side, path) of each config a tool finds by name (COVERAGE_CONFIG_NAMES)
 # that is on one side only and holds coverage settings or can't be read.
-TreeFacts = collections.namedtuple("TreeFacts", "c_cpp open_configs blind c_test_roots coverage_configs")
+TreeFacts = collections.namedtuple("TreeFacts", "c_cpp open_configs blind coverage_configs")
 PIO_OPEN_OPTION = re.compile(r"extra_configs|test_dir", re.IGNORECASE)
-GIT_FILES = {".gitignore", ".gitattributes", ".gitkeep", ".keep"}
 
 
 def tree_facts(trees):
@@ -2858,7 +2994,6 @@ def tree_facts(trees):
             open_configs[path] = f"names {' and '.join(sorted({m.lower() for m in PIO_OPEN_OPTION.findall(text)}))}"
     links = dict.fromkeys(link for side in ("-", "+") for link in trees.links(side))
     blind = [link for link in links if _at_test_dir(link)] if c_cpp else []
-    c_test_roots = {_test_root(p) for _, p in paths if _ext(p) in C_FILE_EXTS and _name(p) not in GIT_FILES} - {None}
     # A renamed file the diff shows no hunk of reads as empty from DiffTrees; git never pairs empty files.
     coverage_configs = set()
     for side, path in paths:
@@ -2866,7 +3001,7 @@ def tree_facts(trees):
             text = trees.read(side, path)
             if not text or COVERAGE_TEXT.search(text):
                 coverage_configs.add((side, path))
-    return TreeFacts(c_cpp, sorted(open_configs.items()), blind, c_test_roots, coverage_configs)
+    return TreeFacts(c_cpp, sorted(open_configs.items()), blind, coverage_configs)
 
 
 def repo_hits(repo_dir, base, head, extra=()):
