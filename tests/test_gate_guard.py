@@ -1027,15 +1027,17 @@ class RuleDetails(unittest.TestCase):
         """Issue #40: desk-controller's backend/tests are Python, beside firmware Unity tests."""
         unity, api, base = DESK_UNITY, DESK_API, DESK_TREE
         edited = api.replace("120", "125")
-        # (a) An assertion fixed: no hit. A conftest edited or a test added is a hit (issue #40, narrowed).
+        # (a) An assertion fixed, or a test added (issue #54): no hit. A conftest edited is a hit (issue #40,
+        # narrowed), and so is an assertion fixed beside a test added.
+        added = "\n\ndef test_reset():\n    assert create_app()\n"
         for change in ({"backend/tests/test_api.py": edited},
-                       {"backend/tests/test_api.py": edited, "firmware/src/logic.cpp": "int clamp(int v) { return v; }\n"}):
+                       {"backend/tests/test_api.py": edited, "firmware/src/logic.cpp": "int clamp(int v) { return v; }\n"},
+                       {"backend/tests/test_api.py": api + added}):
             with self.subTest(change=sorted(change)):
                 self.assertEqual(judge_commits(base, dict(base, **change)), [])
         for change, why in (({"backend/tests/conftest.py": "import pytest\n\n\n@pytest.fixture\ndef app():\n    pass\n"},
                              "conftest.py"),
-                            ({"backend/tests/test_api.py": api + "\n\ndef test_reset():\n    assert create_app()\n"},
-                             "outside a test body")):
+                            ({"backend/tests/test_api.py": edited + added}, "outside a test body")):
             with self.subTest(change=sorted(change)):
                 [hit] = judge_commits(base, dict(base, **change))
                 self.assertEqual((hit.rule, hit.path), ("removed-tests", sorted(change)[0]))
@@ -1128,12 +1130,13 @@ class RuleDetails(unittest.TestCase):
         with self.subTest(change="backend/tests/gen_cases.py"):
             self.assertEqual(flagged(native, {"backend/tests/gen_cases.py": "N = 2\n"}), {"backend/tests/gen_cases.py"})
         # A fixture added, or a test moved or a module renamed between test modules, is a hit
-        # too since issue #40 was narrowed; an edit beside git's own dotfiles is not.
+        # too since issue #40 was narrowed; an edit beside git's own dotfiles is not. A test moved
+        # to a new test module flags the module it left; the new one only adds tests (issue #54).
         keep = dict(base, **{"backend/tests/.gitkeep": "", "backend/tests/.gitignore": "*.log\n"})
         fixture = "import pytest\n\n\n@pytest.fixture\ndef app():\n    pass\n"
         limits = {test_api: fewer, "backend/tests/test_limits.py": helper["backend/tests/helpers.py"]}
         for start, change, drop, expected in ((base, {conftest: fixture}, (), {conftest}),
-                                              (base, limits, (), set(limits)),
+                                              (base, limits, (), {test_api}),
                                               (base, {"backend/tests/test_api_v2.py": api}, {test_api},
                                                {"backend/tests/test_api_v2.py"}),
                                               (keep, {test_api: api.replace("120", "125")}, (), set())):
@@ -1225,9 +1228,12 @@ class RuleDetails(unittest.TestCase):
         for header in ("class TestLimits(Hidden):", "class TestLimits(metaclass=Hidden):", "@hide\nclass TestLimits:"):
             with self.subTest(header=header):
                 self.assertTrue(flipped(cls, cls.replace("class TestLimits:", header)), header)
+        # A test method added to a test class passes (issue #54); one that shadows a method is a hit.
         with self.subTest(change="test method added"):
             self.assertEqual(flagged(dict(base, **{test_api: cls}),
-                                     {test_api: cls + "\n    def test_width(self):\n        assert True\n"}), {test_api})
+                                     {test_api: cls + "\n    def test_width(self):\n        assert True\n"}), set())
+            self.assertEqual(flagged(dict(base, **{test_api: cls}),
+                                     {test_api: cls + "\n    def test_height(self):\n        pass\n"}), {test_api})
         # A module renamed to conftest.py, whose ignore list then applies.
         hooks = "collect_ignore = ['test_api.py']\n"
         with self.subTest(change="renamed to conftest.py"):
@@ -1274,7 +1280,11 @@ class RuleDetails(unittest.TestCase):
                          ("speed != 0", "speed == 3"), ("ready is True", "ready is not False"),
                          ("    app = create_app()\n", "    app = create_app()\n\n"),
                          ("    assert os.environ\n", "    # The environment is set.\n    assert os.environ\n"),
-                         ("== LIMIT\n", "== LIMIT  # the upper stop\n"), ("== LIMIT\n", "== (\n        LIMIT)\n")):
+                         ("== LIMIT\n", "== LIMIT  # the upper stop\n"), ("== LIMIT\n", "== (\n        LIMIT)\n"),
+                         # Issue #54: an edit that removes no line and only adds an import, a blank line or a test.
+                         ("import os\n", "import os\nimport sys\n"), ("import os\n", "import os\n\n"),
+                         ("    assert create_app().ready is True\n",
+                          "    assert create_app().ready is True\n\n\ndef test_reset():\n    reset()\n")):
             with self.subTest(old=old, new=new):
                 self.assertEqual(judged(old, new), [])
         # A hit, with the reason in its detail.
@@ -1282,12 +1292,12 @@ class RuleDetails(unittest.TestCase):
         moved, statement = "adds, removes or moves a statement", "not an assert statement of a test's own body"
         shape, unsafe = "outside a comparison's literal operands", "which decide what else it runs"
         tail = "    assert create_app().ready is True\n"
-        cases = [("import os\n", "import os\nimport sys\n", outside), ("LIMIT = 120", "LIMIT = 125", outside),
-                 ("# Height checks.", "# Limit checks.", comment), ("import os\n", "import os\n\n", comment),
+        cases = [("import os\n", "import sys\n", outside), ("LIMIT = 120", "LIMIT = 125", outside),
+                 ("# Height checks.", "# Limit checks.", comment), ("\n\nimport pytest", "\nimport pytest", comment),
                  ("def test_height_limits():", "@pytest.mark.slow\ndef test_height_limits():", outside),
                  ("def test_height_limits():", "def test_height_limits(app=None):", outside),
                  ("    speed = 3\n", "    speed = 4\n", outside),
-                 (tail, tail + "\n\ndef test_reset():\n    reset()\n", outside),
+                 (tail, tail.replace("True", "True  # ready") + "\n\ndef test_reset():\n    reset()\n", outside),
                  # Statements other than an assert, and an assert added, removed or moved.
                  ("stops at its limits", "stops at both limits", statement),
                  ("    app = create_app()\n", "    app = create_app(1)\n", statement),
@@ -1401,11 +1411,12 @@ class RuleDetails(unittest.TestCase):
             with self.subTest(start=start_text):
                 [hit] = judged("120", "125", start_text)
                 self.assertIn(outside, hit.detail)
-        # Other Python files in the test directory, and a test module renamed, added or deleted.
+        # Other Python files in the test directory, and a test module renamed or deleted. A test module added
+        # with only tests in it passes (issue #54).
         start = dict(DESK_TREE, **{"backend/tests/helpers.py": "LIMIT = 120\n"})
+        self.assertEqual(judge_commits(start, dict(start, **{"backend/tests/test_new.py": DESK_API})), [])
         for change, drop, why in (({"backend/tests/helpers.py": "LIMIT = 125\n"}, (), "not a test_*.py or *_test.py module"),
-                                  ({"backend/tests/test_api_v2.py": DESK_API}, {test_api}, "only an edit in place"),
-                                  ({"backend/tests/test_new.py": DESK_API}, (), "only an edit in place")):
+                                  ({"backend/tests/test_api_v2.py": DESK_API}, {test_api}, "only an edit in place")):
             with self.subTest(change=sorted(change)):
                 head = {p: t for p, t in dict(start, **change).items() if p not in drop}
                 [hit] = judge_commits(start, head)
@@ -1534,9 +1545,9 @@ class RuleDetails(unittest.TestCase):
                       "    assert create_app()\n\n\nclass TestReset:\n    def test_twice(self):\n        assert True\n")
         passing = [(base, {test_api: api + added}),
                    (base, {test_api: api.replace("\n\n\ndef test_height_limits", added + "\n\ndef test_height_limits")}),
-                   (base, {test_api: "import pytest\nfrom pathlib import Path\n" + api
-                           + "\n\n@pytest.mark.slow\n@pytest.mark.parametrize('n', [1, 2])\n"
-                             "def test_paths(n, tmp_path: Path) -> None:\n    assert tmp_path\n"}),
+                   (base, {test_api: "import pathlib\nimport pytest\n" + api
+                           + "\n\nHEIGHTS = (60, 120)\n\n\n@pytest.mark.slow\n@pytest.mark.parametrize('n', [1, 2])\n"
+                             "def test_paths(n, tmp_path: pathlib.Path) -> None:\n    assert tmp_path\n"}),
                    (base, {test_api: api + "\n\nasync def test_status():\n    assert create_app()\n"}),
                    (base, {test_api: api + "\n\nclass TestReset:\n    \"\"\"Reset.\"\"\"\n\n"
                                            "    def test_reset(self):\n        assert create_app()\n"}),
@@ -1562,7 +1573,9 @@ class RuleDetails(unittest.TestCase):
                   api.replace("create_app\n", "create_app\nfrom os import _exit as len\n", 1),
                   api.replace("create_app\n", "create_app\nfrom os import *\n", 1),
                   "__test__ = False\n" + api,
-                  api + "\n\nLIMIT = 0\n",
+                  api + "\n\ncreate_app = None\n",
+                  api + "\n\nLIMIT = len('ab')\n",
+                  api.replace("create_app\n", "create_app\nfrom pathlib import Path\n", 1),
                   api + "\n\npytestmark = []\n",
                   api + "\n\ndef setup_module():\n    pass\n",
                   api + "\n\ndef helper():\n    pass\n",
@@ -1585,11 +1598,16 @@ class RuleDetails(unittest.TestCase):
                          "\n    def __init__(self):\n        pass\n"):
             with self.subTest(addition=addition):
                 self.assertEqual(flagged(dict(base, **{test_api: cls}), {test_api: cls + addition}), {test_api})
-        for header in ("class TestLimits(object):", "class Limits:"):
-            start = dict(base, **{test_api: cls.replace("class TestLimits:", header)})
+        # A method added to a class pytest does not collect is a hit; to a test class with the base it had, not.
+        # So is one added to a test class with a base that may hold the test it overrides.
+        for header, expected in (("class Limits:", {test_api}), ("@hide\nclass TestLimits:", {test_api}),
+                                 ("class TestLimits(Base):", {test_api}), ("class TestLimits(case.Base):", {test_api}),
+                                 ("class TestLimits(unittest.TestCase, metaclass=Meta):", {test_api}),
+                                 ("class TestLimits(unittest.TestCase):", set()), ("class TestLimits(object):", set())):
+            start = dict(base, **{test_api: "import unittest\n" + cls.replace("class TestLimits:", header)})
             with self.subTest(header=header):
                 self.assertEqual(flagged(start, {test_api: start[test_api] + "\n    def test_width(self):\n"
-                                                                            "        assert True\n"}), {test_api})
+                                                                            "        assert True\n"}), expected)
         # A file that is not a test module stays a hit, even when it only adds lines.
         for path in ("backend/tests/conftest.py", "backend/tests/helpers.py", "backend/tests/__init__.py"):
             with self.subTest(path=path):

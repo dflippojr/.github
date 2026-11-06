@@ -140,7 +140,9 @@ whatever the change:
   declares a source encoding other than UTF-8 or holds a carriage return inside
   a line. The guard does not follow the code a comparison reaches (an
   object's `__eq__`, a `conftest.py` hook), so an exempt change can still give
-  code already in the file or its imports other values to compare. Removed
+  code already in the file or its imports other values to compare. Such a
+  file is also exempt when its change removes no line and only adds tests
+  (issue #54, below). Removed
   tests and new skips are hits as in any repository. A C/C++ source (`.c`,
   `.cc`, `.cpp`, `.cxx`) in a test directory is judged by the rule below;
 - any change to a CMake file (`CMakeLists.txt` or `*.cmake`) anywhere, which
@@ -183,8 +185,8 @@ may run only when the assertion fails: Unity's message is its last argument,
 and doctest's (`CHECK_MESSAGE(cond, ...)`, variadic and logged lazily), like
 any other framework's, is every argument after the first.
 
-A new test is not exempt, as in Python test files (the owner's decision of
-2026-11-06): a new Unity, GoogleTest, Catch2 or doctest test, and its
+A new C/C++ test is not exempt (the owner's decision of 2026-11-06; issue #54
+exempts new Python tests, below): a new Unity, GoogleTest, Catch2 or doctest test, and its
 `RUN_TEST` registration, need approval whatever they hold. A new test can call
 code the file or its headers already reach, such as a function that ends the
 process, or write memory the framework reads, and no check of its names rules
@@ -222,6 +224,47 @@ test_name helper`, or one whose replacement closes a test and opens a helper),
 or an included file whose own brackets do not pair, included at file, namespace
 or `extern "C"` scope, can rename a test or change its scope unseen: the guard
 reads only the test source.
+
+A Python test module in such a test directory (a `test_*.py` or `*_test.py`
+module whose outermost test directory holds no C/C++ source or header, as
+above) is judged per file, as Python (issue #54, the owner's decision of
+2026-11-02). An edit that removes no line of it and only adds tests is exempt,
+and so is a new module that holds only tests. Python is the only language the
+guard parses, so other files there, such as a JavaScript test or a data file,
+are still hits, and so are a `conftest.py`, a helper and a Python file beside
+C/C++ tests. The edit is exempt only when the guard can read the whole file on
+both sides as above (UTF-8, printable ASCII on changed lines, no carriage
+return inside a line) and parse it, every statement that was there stays as it
+was and in its order, and each statement it adds is one of these:
+
+- a `test_` function, plain or `async`, whose decorators are only
+  `pytest.mark.NAME` marks with literal arguments (where one top-level
+  `import pytest` is all that binds `pytest`), whose defaults are literals,
+  and whose annotations are literals or dotted names, so Python runs nothing
+  when it defines it;
+- a `Test` class with no base, keyword or decorator but such marks, holding
+  only such `test_` methods and docstrings;
+- such a `test_` method added to an existing `Test` class that pytest collects
+  (no decorator but pytest marks, no constructor), whose header stays as it
+  was and whose bases are only `object` or `unittest.TestCase`, so no base can
+  hold a test the method overrides;
+- an import of a module (`import x`); in a new module a `from` import too. In a
+  module that already holds tests, a `from` import is a hit, since the name it
+  imports may be a fixture that pytest applies to those tests (an autouse
+  one);
+- a docstring, or a literal assigned to a name.
+
+Each name an added statement binds is new: the module neither binds nor reads
+it anywhere, it is not a builtin, and it does not start with `_`, `pytest_`,
+`pytestmark`, `setup`, `teardown`, `collect_ignore` or `load_tests`, which
+pytest or unittest read from a test module by name. So an added test cannot
+shadow an existing test, fixture, helper or import, and an addition cannot set
+`__test__`, `pytestmark` or a module setup. A change that does anything else is
+judged by the assert-only rule above, so an assertion fixed beside a test added
+is a hit. New skips in an added test are hits as in any repository. The guard
+does not read what an added test does when it runs: like any code the pull
+request changes, it can end the process or change state that the existing
+tests read.
 
 Unity `RUN_TEST(name)` registrations and `void test_name(void)` definitions are
 still counted, so a hit names the tests a change removed. Editing a source or

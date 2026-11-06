@@ -1,0 +1,42 @@
+# gate-guard fixture: issue #54, in a C/C++ repository, a Python test module whose edit only adds a test and an import, and a new test module
+# expect: 
+# hits: 0
+
+diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
+--- a/firmware/src/logic.cpp
++++ b/firmware/src/logic.cpp
+@@ -1 +1 @@
+-int limit = 120;
++int limit = 125;
+diff --git a/backend/tests/test_guard.py b/backend/tests/test_guard.py
+--- a/backend/tests/test_guard.py
++++ b/backend/tests/test_guard.py
+@@ -1,10 +1,17 @@
+ import os
++import json
+ 
+ import pytest
+ 
+ from backend.app import create_app
+ 
+ 
+ def test_status():
+     response = create_app().test_client().get("/status")
+     assert response.status_code == 200, "status is up"
++
++
++@pytest.mark.parametrize("height", [60, 120])
++def test_height(height):
++    response = create_app().test_client().get(f"/height/{height}")
++    assert json.loads(response.data)["height"] == height
+diff --git a/backend/tests/test_reset.py b/backend/tests/test_reset.py
+new file mode 100644
+--- /dev/null
++++ b/backend/tests/test_reset.py
+@@ -0,0 +1,6 @@
++"""Reset checks."""
++from backend.app import create_app
++
++
++def test_reset():
++    assert create_app().test_client().post("/reset").status_code == 204

@@ -47,6 +47,7 @@ import argparse
 import ast
 import base64
 import bisect
+import builtins
 import collections
 import configparser
 import datetime
@@ -575,9 +576,10 @@ def removed_test_hits(files):
 #     except a Python file in a test directory that holds no C/C++ source or
 #     header in either tree (a Python backend's tests/), when its change only
 #     replaces compared literals and comparison operators in assert statements
-#     of its existing tests (issue #40, see _python_unexempt). The guard does
-#     not model what pytest collects or skips, so any other change to such a
-#     file is a hit; and except a C/C++ source edited in place whose change
+#     of its existing tests (issue #40, see _python_unexempt), or when it
+#     removes no line and only adds tests (issue #54, see _py_added_change).
+#     The guard does not model what pytest collects or skips, so any other
+#     change to such a file is a hit; and except a C/C++ source edited in place whose change
 #     only replaces literals and comparison operators in assertions of its
 #     existing tests; a new test is a hit (issue #43, see _c_cpp_unexempt);
 #   - a change to a CMake file anywhere, which can register or drop tests;
@@ -706,16 +708,16 @@ def _py_binds_here(node):
     return {v for f, v in ast.iter_fields(node) if f in ("name", "rest") and isinstance(v, str)}
 
 
-def _py_pytest(tree):
-    """Whether pytest in tree is the pytest module: one top-level import pytest is all that binds or declares
-    the name, nothing assigns or deletes an attribute of it, and no wildcard import may rebind it."""
+def _py_pytest(tree, module="pytest"):
+    """Whether pytest (or module) in tree is the pytest module: one top-level import pytest is all that binds or
+    declares the name, nothing assigns or deletes an attribute of it, and no wildcard import may rebind it."""
     imports = [a for n in tree.body if isinstance(n, ast.Import)
-               for a in n.names if a.name == "pytest" and not a.asname]
+               for a in n.names if a.name == module and not a.asname]
     for n in ast.walk(tree):
-        if n not in imports and {"pytest", "*"} & _py_binds_here(n):
+        if n not in imports and {module, "*"} & _py_binds_here(n):
             return False
         if (isinstance(n, ast.Attribute) and not isinstance(n.ctx, ast.Load)
-                and (_py_chain(n) or "").startswith("pytest.")):
+                and (_py_chain(n) or "").startswith(module + ".")):
             return False
     return len(imports) == 1
 
@@ -866,6 +868,186 @@ def _py_line_change(tree, tests, text, changed):
     return None
 
 
+# Issue #54: what an edit that removes no line of a Python test module may add.
+# A name pytest or unittest reads from a test module by its name (pytestmark,
+# pytest_plugins, setup_module, setUpModule, teardown_*, load_tests, __test__
+# and other dunders), which an addition may not bind.
+PY_RESERVED = re.compile(r"_|pytest_|pytestmark|setup|teardown|collect_ignore|load_tests", re.IGNORECASE)
+PY_BUILTINS = frozenset(dir(builtins))
+
+
+def _py_identifiers(tree):
+    """Every name tree binds, declares or reads, in any scope."""
+    names = set()
+    for n in ast.walk(tree):
+        names |= _py_binds_here(n)
+        if isinstance(n, ast.Name):
+            names.add(n.id)
+    return names
+
+
+def _py_docstring(node):
+    """Whether node is a statement that is only a string literal, which runs nothing."""
+    return isinstance(node, ast.Expr) and _py_text(node.value)
+
+
+def _py_mark(node, pytest_module):
+    """Whether node, a decorator, is pytest.mark.NAME, or a call of it with only literal arguments, where
+    pytest_module says pytest is the pytest module."""
+    call = isinstance(node, ast.Call)
+    if not pytest_module or not re.fullmatch(r"pytest\.mark\.\w+", _py_chain(node.func if call else node) or ""):
+        return False
+    return not call or all(k.arg is not None and _py_leaves(k.value) is not None for k in node.keywords) and all(
+        _py_leaves(a) is not None for a in node.args)
+
+
+def _py_annotation(node):
+    """Whether node, an annotation, is absent, a literal or a dotted name, whose value comes from a lookup only."""
+    return node is None or _py_chain(node) is not None or _py_leaves(node) is not None
+
+
+def _py_new_test(node, pytest_module):
+    """Why node, a function an edit adds, is not a test_ function that Python can define without running code,
+    or None. Its decorators are pytest marks with literal arguments, and its defaults are literals and its
+    annotations literals or dotted names: Python evaluates them all when it imports the module."""
+    if not isinstance(node, PY_DEFS) or not node.name.startswith("test_"):
+        return f"it adds {node.name}, a function that is not a test_ function"
+    if not all(_py_mark(d, pytest_module) for d in node.decorator_list):
+        return (f"it adds {node.name} with a decorator other than a pytest mark with literal arguments, where one "
+                "top-level import pytest is all that binds pytest")
+    a = node.args
+    params = getattr(a, "posonlyargs", []) + a.args + a.kwonlyargs + [p for p in (a.vararg, a.kwarg) if p]
+    defaults = a.defaults + [d for d in a.kw_defaults if d is not None]
+    if (any(_py_leaves(d) is None for d in defaults) or not all(_py_annotation(p.annotation) for p in params)
+            or not _py_annotation(node.returns) or getattr(node, "type_params", None)):
+        return (f"it adds {node.name} with a default that is not a literal, an annotation that is not a literal or "
+                "a dotted name, or a type parameter, which Python evaluates when it imports the module")
+    return None
+
+
+def _py_collected_class(node):
+    """Whether node is a class pytest collects test_ methods from: a top-level Test class with no decorator but
+    pytest marks and no constructor (see _python_tests)."""
+    return (isinstance(node, ast.ClassDef) and node.name.startswith("Test") and _py_marks_only(node)
+            and not any(getattr(n, "name", getattr(n, "id", None)) in ("__init__", "__new__")
+                        for statement in node.body for n in ast.walk(statement)))
+
+
+def _py_plain_base(node, tree):
+    """Whether node, a base of a class in tree, is object or unittest.TestCase, which hold no test_ method."""
+    if isinstance(node, ast.Name) and node.id == "object":
+        return not any({"object", "*"} & _py_binds_here(n) for n in ast.walk(tree))
+    return _py_chain(node) == "unittest.TestCase" and _py_pytest(tree, "unittest")
+
+
+def _py_inserted(old, new):
+    """The statements of the list new that are not in old, when new is old with statements inserted, or None.
+
+    Statements are compared without line numbers. A class of old whose
+    statement differs is paired with the class of new of the same name at its
+    place, as (old class, new class), for _py_added_change to compare.
+    """
+    inserted, i = [], 0
+    for node in new:
+        prior = old[i] if i < len(old) else None
+        if prior is not None and ast.dump(node) == ast.dump(prior):
+            i += 1
+        elif isinstance(prior, ast.ClassDef) and isinstance(node, ast.ClassDef) and prior.name == node.name:
+            inserted.append((prior, node))
+            i += 1
+        else:
+            inserted.append(node)
+    return inserted if i == len(old) else None
+
+
+def _py_added_change(old, new, new_module):
+    """Why new, the tree of a Python test module that an edit changes by adding lines only, does more than add
+    tests to old, the tree before it, or None. new_module says the edit adds the module.
+
+    Issue #54, the owner's per-file rule: in a repository that also holds
+    C/C++, an edit that only adds tests to a Python test module passes. Each
+    statement of old stays as it was, in its order, and each statement the
+    edit adds is a test_ function (see _py_new_test), a Test class of such
+    methods and docstrings with no base, a test_ method added to an existing
+    Test class, an import, a docstring, or a literal assigned to a name. A
+    name it binds is new to the module and not a builtin, so no existing test
+    reads it, and is not one pytest or unittest reads by its name
+    (PY_RESERVED). In a module that already holds tests, an import names a
+    module (import x), never a name from it, which may be a fixture that
+    pytest applies to them (an autouse one). What an added test does when it
+    runs is not read.
+    """
+    inserted = _py_inserted(old.body, new.body)
+    if inserted is None:
+        return "it changes or removes a statement that was there"
+    used, bound = _py_identifiers(old) | PY_BUILTINS, set()
+    pytest_module = _py_pytest(new)
+
+    def fresh(name, scope):
+        if name in used or name in scope:
+            return f"it binds {name}, which the module already binds or reads, or which is a builtin"
+        if PY_RESERVED.match(name):
+            return f"it binds {name}, a name pytest or unittest may read from a test module"
+        scope.add(name)
+        return None
+
+    def methods(nodes, scope):
+        for node in nodes:
+            if not _py_docstring(node):
+                why = _py_new_test(node, pytest_module) if isinstance(node, PY_DEFS) else (
+                    "it adds a statement to a test class that is not a test_ method or a docstring")
+                why = why or fresh(node.name, scope)
+                if why:
+                    return why
+        return None
+
+    for node in inserted:
+        if isinstance(node, tuple):
+            prior, node = node
+            if not _py_collected_class(prior):
+                return (f"it changes {prior.name}, a class pytest does not collect tests from (not a Test class, "
+                        "a decorator other than pytest marks, or a constructor)")
+            if any(_py_masked(v, set()) != _py_masked(getattr(node, f, None), set())
+                   for f, v in ast.iter_fields(prior) if f != "body"):
+                return f"it changes the header of {prior.name}: its name, a base, a keyword or a decorator"
+            if prior.keywords or not all(_py_plain_base(b, new) for b in prior.bases):
+                return (f"it adds to {prior.name}, whose base or keyword may hold tests a new method overrides "
+                        "(only object and unittest.TestCase are read)")
+            added = _py_inserted(prior.body, node.body)
+            why = "it changes or removes a statement that was there" if added is None else (
+                methods(added, set()) if all(isinstance(n, ast.AST) for n in added) else
+                f"it changes a class inside {prior.name}")
+        elif _py_docstring(node):
+            continue
+        elif isinstance(node, PY_DEFS):
+            why = _py_new_test(node, pytest_module) or fresh(node.name, bound)
+        elif isinstance(node, ast.ClassDef):
+            why = ((f"it adds {node.name}, a class that is not a Test class with no base, keyword, decorator but "
+                    "pytest marks or type parameter")
+                   if (not node.name.startswith("Test") or node.bases or node.keywords
+                       or getattr(node, "type_params", None)
+                       or not all(_py_mark(d, pytest_module) for d in node.decorator_list))
+                   else methods(node.body, set()) or fresh(node.name, bound))
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            if isinstance(node, ast.ImportFrom) and not new_module:
+                why = ("it adds a from-import to a module that holds tests: a name it imports may be a fixture "
+                       "pytest applies to them (import the module instead)")
+            elif any(a.name == "*" for a in node.names):
+                why = "it adds a wildcard import, which may bind any name"
+            else:
+                why = next(filter(None, (fresh((a.asname or a.name).split(".")[0], bound) for a in node.names)),
+                           None)
+        elif (isinstance(node, ast.Assign) and _py_leaves(node.value) is not None
+              and all(isinstance(t, ast.Name) for t in node.targets)):
+            why = next(filter(None, (fresh(t.id, bound) for t in node.targets)), None)
+        else:
+            why = ("it adds a statement that is not a test, a test class, an import, a docstring or a literal "
+                   "assigned to a name")
+        if why:
+            return why
+    return None
+
+
 def _python_unexempt(fd):
     """Why fd, a Python file in a Python test directory of a C/C++ repository, is not exempt, or None.
 
@@ -875,14 +1057,15 @@ def _python_unexempt(fd):
     with only its compared literals, comparison operators and pytest.approx
     tolerances changed (_python_test_change). Every other line of the file
     stays as it was, but for comments and blank lines inside a test body.
-    Every changed line holds only printable ASCII, and the file must be
-    UTF-8 as Python reads it, so the text the guard compares is the code
-    Python runs.
+    Issue #54: so is an edit of such a module, or its addition, that
+    removes no line and only adds tests (_py_added_change). Every changed
+    line holds only printable ASCII, and the file must be UTF-8 as Python
+    reads it, so the text the guard compares is the code Python runs.
     """
     if not is_test_module(fd.path):
         return "it is not a test_*.py or *_test.py module (a conftest.py or a helper can change any test)"
-    if fd.status != "modified" or fd.mode_changed:
-        return "only an edit in place can be exempt, not a rename, an addition, a deletion or a mode change"
+    if fd.status not in ("modified", "added") or fd.mode_changed and fd.status != "added":
+        return "only an edit in place or a new module can be exempt, not a rename, a deletion or a mode change"
     sides = _whole_sides(fd)
     if sides is None:
         return "the diff does not show the whole file"
@@ -904,6 +1087,20 @@ def _python_unexempt(fd):
                 _py_logical_lines(text)
     except (SyntaxError, ValueError, tokenize.TokenError):
         return "the guard cannot parse it"
+    added = None
+    if not fd.changed("-"):
+        added = _py_added_change(*trees, fd.status == "added")
+        if added is None:
+            return None
+        if fd.status == "added":
+            return added
+    why = _python_assert_change(fd, trees, texts)
+    return why and (f"{why}; and {added.replace('it ', 'it does not only add tests: it ', 1)}" if added else why)
+
+
+def _python_assert_change(fd, trees, texts):
+    """Why the edit fd, its sides parsed as trees from texts, is more than issue #40's assert-only rule exempts
+    (see _python_unexempt), or None."""
     tests, skeletons = [_python_tests(tree) for tree in trees], []
     for tree, side in zip(trees, tests):
         bodies = [t.body for t in side]
@@ -1444,8 +1641,9 @@ def c_cpp_hits(files, facts, flagged):
                 why = _python_unexempt(fd)
                 if why:
                     hits.append(Hit("removed-tests", fd.path, None, f"{fd.status} a Python test file of a C/C++ "
-                                    f"repository: {why}; only replacing compared literals or comparison operators in "
-                                    "assert statements of existing tests is exempt, so this needs approval"))
+                                    f"repository: {why}; only adding tests, or replacing compared literals or "
+                                    "comparison operators in assert statements of existing tests, is exempt, so this "
+                                    "needs approval"))
                 continue
             if fd.status == "modified" and all(_ext(p) in C_EXTS for p in fd.paths):
                 why = _c_cpp_unexempt(fd)
