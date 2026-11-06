@@ -33,7 +33,7 @@ merging the pull request would change and reports each hit in the job summary:
 | `removed-tests` | A deleted test file, or fewer test functions in a file (`def test_`, `test(`/`it(`, `@Test`, `#[test]`, `func Test`, and in a C/C++ source or header under a test directory, Unity `RUN_TEST(name)` and `void test_name(void)`, counted over the whole file); in a C/C++ or PlatformIO repository, any change that could change which tests run or what they include (see below). |
 | `skip-marker` | A new `pytest.mark.skip`/`skipif`/`xfail`, `unittest.skip`, `.skip(`/`.only(`/`test.fixme`/`xit(`/`xdescribe(`, `@Disabled`, `#[ignore]`, any change to a PlatformIO `platformio.ini` (see below), or pytest `--deselect`/`-k "not …"` in config. `pytest.skip()` and Go `t.Skip()` count when unconditional or when the condition checks `CI`. |
 | `retry` | New or raised Playwright `retries`, `--reruns`, `pytest-rerunfailures`, `flaky`, `jest.retryTimes`, Surefire `rerunFailingTestsCount`. |
-| `gate-config` | Any edit to `.github/workflows/**`, `sonar-project.properties`, `CODEOWNERS` or coverage config (`.coveragerc`, `[tool.coverage]`, `fail_under`, JaCoCo rules, a `jacoco.minimum.*` property in a `pom.xml` or `.properties` file, c8/nyc/Jest thresholds), except a coverage-config edit outside workflows that only changes floors the guard reads (see `floor-lowered`); a lint rule disabled; a size or performance budget raised or removed. In a budget file, one whose name has `budget` or `budgets` as a word split on `-`, `_` or `.` (`size-budget.json`, `perf_budgets.yaml`), every numeric key counts as a budget, and so does a value alone on the line after its key; a changed number there that the guard can't pair with a key (a list item, or a value whose key the diff doesn't show) is a hit whatever its direction. A budget number is read whole, exponent included (`9e2` to `1e3` is raised); one whose unit the guard doesn't know (`b`, `kb`, `kib`, `mb`, `mib`, `gb`, `gib`, `ms`, `s`) is a hit whenever it changes. |
+| `gate-config` | Any edit to `.github/workflows/**`, `sonar-project.properties`, `CODEOWNERS` or coverage config (`.coveragerc`, `[tool.coverage]`, `fail_under`, JaCoCo rules, a `jacoco.minimum.*` property in a `pom.xml` or `.properties` file, c8/nyc/Jest thresholds), except a coverage-config edit outside workflows that only changes floors the guard reads (see `floor-lowered`); a lint rule disabled; a size or performance budget raised or removed. In a budget file, one whose name has `budget` or `budgets` as a word split on `-`, `_` or `.` (`size-budget.json`, `perf_budgets.yaml`), every numeric key counts as a budget, and so does a value alone on the line after its key; a changed number there that the guard can't pair with a key (a list item, or a value whose key the diff doesn't show) is a hit whatever its direction. A budget number is read whole, exponent included (`9e2` to `1e3` is raised); one whose unit the guard doesn't know (`b`, `kb`, `kib`, `mb`, `mib`, `gb`, `gib`, `ms`, `s`) is a hit whenever it changes. Any change to a file the repository names as an extra gate path (see "Extra gate paths"). |
 | `floor-lowered` | A coverage floor lowered or removed. A raised floor, or a new line that holds only a floor, needs no approval. |
 
 Floors only ratchet up, so raising one is not a hit. The guard reads both sides
@@ -197,14 +197,38 @@ jobs:
 | `runs-on` | `'"ubuntu-latest"'` | Runner as JSON: a label string or a list of labels. |
 | `require-owner-label-actor` | `false` | Accept the label only when the repository owner applied it, checked through the issue-events API. Turn it on once workers act under their own identity (dflippojr/agent-ops#44). |
 | `guard-ref` | `main` | Ref of this repository to load `scripts/gate_guard.py` from. If you pin `uses:` to a SHA or tag, set `guard-ref` to the same value. |
+| `extra-gate-paths` | `''` | Repository-specific gate paths, one glob per line, passed as `--extra-gate-path` (see "Extra gate paths"). Under `pull_request` the caller is the pull request's own copy, but editing it is itself a `gate-config` hit. |
 
 The check appears as `gate-guard / gate-guard`; make it a required status check
 to enforce it. On events other than `pull_request` the job only prints a notice.
+
+### Extra gate paths
+
+Some repositories treat more paths as part of the gate: an `UPDATE_GOLDEN=1`
+refresh of `tests/golden/**` rewrites what the tests expect. Pass such globs
+with `--extra-gate-path`, once per glob or several in one value, one per line;
+blank lines name nothing, so an empty value adds no path. Any change to a file
+whose old or new path matches one (an edit, an addition, a deletion, a rename
+in or out, a mode change or a binary change) is a `gate-config` hit, one per
+file, reported as ``matches extra gate path `tests/golden/**` ``. Like any
+other hit, it needs the owner's `gate-change-approved` label, which on the
+default-branch guard counts only when applied after the newest push.
+
+A glob names paths from the repository root. `*` and `?` match within one path
+segment, dotfiles included, and `**` standing alone between slashes matches
+any number of segments, none included: `tests/golden/**` matches
+`tests/golden/a/b.json` but not `tests/goldenx/a.json`, and `tests/golden/*`
+doesn't match `tests/golden/a/b.json`. Every other character is literal. The
+guard refuses `[`, `]`, `{`, `}`, `\`, `!`, an empty, `.` or `..` segment
+(so a leading or trailing `/` too) and `**` inside a segment, and exits 2
+before reading anything, so a glob it can't read fails the check instead of
+quietly matching nothing.
 
 Run it locally against a branch or a saved diff:
 
 ```sh
 python3 scripts/gate_guard.py --repo-dir ../some-repo --base origin/main --head HEAD
+python3 scripts/gate_guard.py --repo-dir ../some-repo --base origin/main --head HEAD --extra-gate-path 'tests/golden/**'
 gh pr diff 80 -R dflippojr/disc-golf-league > pr.diff && python3 scripts/gate_guard.py --diff-file pr.diff
 ```
 
@@ -341,6 +365,7 @@ default branch's newest commit.
 | `guard-ref` | required | Full commit SHA of this repository to load the script from; the SHA in the caller's `uses:` line. |
 | `runs-on` | `'"ubuntu-latest"'` | Runner as JSON. Private repositories pass the tower's labels. |
 | `owner` | repository owner | Login whose labels count. |
+| `extra-gate-paths` | `''` | Repository-specific gate paths, one glob per line, such as `tests/golden/**`, passed as `--extra-gate-path` (see "Extra gate paths"). The caller on the default branch sets them, so a pull request can't drop its own. |
 
 Every edit to `.github/workflows/**` is a `gate-config` hit, so a pull request
 that edits its caller or `gate-guard-target.yml` itself needs the owner's
