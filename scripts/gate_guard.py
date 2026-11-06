@@ -577,7 +577,11 @@ def removed_test_hits(files):
 #     replaces compared literals and comparison operators in assert statements
 #     of its existing tests (issue #40, see _python_unexempt). The guard does
 #     not model what pytest collects or skips, so any other change to such a
-#     file is a hit;
+#     file is a hit; and except a C/C++ source edited in place whose change
+#     only replaces literals and comparison operators in assertions of its
+#     existing tests or adds new tests of the file's own names, run after the
+#     existing ones (issue #43, see _c_cpp_unexempt);
+#   - a change to a CMake file anywhere, which can register or drop tests;
 #   - an added, deleted or renamed C/C++ source or header anywhere, or a
 #     changed submodule;
 #   - every pull request, when a platformio.ini names extra_configs or test_dir
