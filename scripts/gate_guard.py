@@ -958,6 +958,9 @@ C_PRINTABLE = re.compile(r"[ -~\t]*")
 C_MOVING = re.compile(r"\b__(?:LINE|COUNTER)__\b")
 C_CONDITIONAL = re.compile(r"#\s*(if|ifdef|ifndef|elif|elifdef|elifndef|else|endif)\b")
 C_DEFINE = re.compile(r"#\s*(?:define|undef)\s+([A-Za-z_]\w*)")
+# A #define: its name, and its replacement after the parameters of a function-like macro, which follow the name
+# with no space between.
+C_DEFINITION = re.compile(r"#\s*define\s+([A-Za-z_]\w*)(?:\([^)]*\))?(.*)", re.S)
 # The directives that bring in no text, allowed inside a function or other bracket (see _c_branches): the null
 # directive and a GNU line marker (# 7 "x.c") too.
 C_INERT = re.compile(r"#\s*(?:(?:define|undef|pragma|line|error|warning)\b|\d|$)")
@@ -1085,8 +1088,8 @@ def _c_match(tokens, i):
 
 def _c_branches(tokens):
     """ValueError unless where each bracket, statement and function starts and ends, as the guard reads the file
-    with every preprocessor branch in and no included text, is where the compiler finds it, whichever branches
-    it takes and whatever a directive brings in:
+    with every preprocessor branch in, no included text and no macro expanded, is where the compiler finds it,
+    whichever branches it takes, whatever a directive brings in and whatever a macro of the file expands to:
 
     - each branch of a conditional closes every bracket it opens, and no bracket opened before it, so a branch
       cannot close one function and open another at the same depth;
@@ -1096,42 +1099,73 @@ def _c_branches(tokens):
     - inside a bracket other than a namespace or extern "C" scope (a function body, say), a directive is only
       a conditional, #define, #undef (the guard reads the names they define), #pragma, #line, #error,
       #warning or the null directive: not #include or #embed, whose text may close the function and open
-      another.
+      another;
+    - each #define's replacement closes every bracket it opens, and no other, so a macro cannot close a test
+      and open a helper where it is used (_c_directive).
     """
     brackets, arms, seen, unopened = [], [], [], 0
     for t in tokens:
-        if t.kind != "directive":
-            if t.text in C_BRACKETS:
-                # Whether the bracket is a namespace or extern "C" scope, read from the tokens before it.
-                brackets.append(t.text == "{" and bool(C_SCOPE_HEAD.match(" ".join(reversed(seen[-12:])))))
-            elif t.text in (")", "]", "}"):
-                if arms and len(brackets) == arms[-1]:
-                    raise ValueError("a preprocessor branch closes a bracket opened before it")
-                if brackets:
-                    brackets.pop()
-                else:
-                    unopened += 1
-            seen.append(t.text)
+        if t.kind == "directive":
+            _c_directive(t, brackets, arms, seen[-1] if seen else None)
             continue
-        last = seen[-1] if seen else None
-        m = C_CONDITIONAL.match(t.text)
-        if m:
-            if last not in (None, ";", "{", "}"):
-                raise ValueError(f"a preprocessor conditional on line {t.line} comes inside a statement or "
-                                 "declaration, where a branch may end or begin it")
-            if m.group(1).startswith("if"):
-                arms.append(len(brackets))
-                continue
-            if not arms or arms[-1] != len(brackets):
-                raise ValueError("a preprocessor branch opens or closes a bracket it does not close or open, or "
-                                 "its conditionals do not pair")
-            if m.group(1) == "endif":
-                arms.pop()
-        elif not all(brackets) and not C_INERT.match(t.text):
-            raise ValueError(f"line {t.line} holds {t.text.split()[0]} inside a bracket, where the text it brings "
-                             "in may end a function and begin another")
+        if t.text in C_BRACKETS:
+            # Whether the bracket is a namespace or extern "C" scope, read from the tokens before it.
+            brackets.append(t.text == "{" and bool(C_SCOPE_HEAD.match(" ".join(reversed(seen[-12:])))))
+        elif t.text in (")", "]", "}"):
+            if arms and len(brackets) == arms[-1]:
+                raise ValueError("a preprocessor branch closes a bracket opened before it")
+            if brackets:
+                brackets.pop()
+            else:
+                unopened += 1
+        seen.append(t.text)
     if arms or len(brackets) != unopened:
         raise ValueError("its brackets or preprocessor conditionals do not pair")
+
+
+def _c_directive(t, brackets, arms, last):
+    """ValueError when the directive t, after the token last, with brackets open (True for a namespace or extern
+    "C" scope) and arms, the bracket count at each open conditional, may move where code starts or ends
+    (_c_branches). Updates arms."""
+    m = C_CONDITIONAL.match(t.text)
+    if not m:
+        definition = C_DEFINITION.match(t.text)
+        if definition and not _c_balanced(definition.group(2)):
+            raise ValueError(f"line {t.line} holds a #define whose replacement does not close every bracket it "
+                             f"opens, or closes one it does not open: {definition.group(1)} may end a test and "
+                             "begin a helper where it is used")
+        if not all(brackets) and not C_INERT.match(t.text):
+            raise ValueError(f"line {t.line} holds {t.text.split()[0]} inside a bracket, where the text it brings "
+                             "in may end a function and begin another")
+        return
+    if last not in (None, ";", "{", "}"):
+        raise ValueError(f"a preprocessor conditional on line {t.line} comes inside a statement or declaration, "
+                         "where a branch may end or begin it")
+    if m.group(1).startswith("if"):
+        arms.append(len(brackets))
+    elif not arms or arms[-1] != len(brackets):
+        raise ValueError("a preprocessor branch opens or closes a bracket it does not close or open, or its "
+                         "conditionals do not pair")
+    elif m.group(1) == "endif":
+        arms.pop()
+
+
+def _c_balanced(text):
+    """Whether each bracket in text, a macro's replacement, is closed in order by one it opens, outside literals."""
+    want, pos = [], 0
+    while pos < len(text):
+        m = C_TOKEN.match(text, pos)
+        if not m:
+            pos += 1
+            continue
+        pos = m.end()
+        if m.lastgroup != "punct":
+            continue
+        if m.group() in C_BRACKETS:
+            want.append(C_BRACKETS[m.group()])
+        elif m.group() in (")", "]", "}") and (not want or want.pop() != m.group()):
+            return False
+    return not want
 
 
 def _c_items(tokens, lo, hi):

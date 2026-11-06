@@ -210,10 +210,17 @@ close a helper and open a test at the same depth), a conditional directive
 inside a statement or declaration (anywhere but the start of the file or after
 `;`, `{` or `}`), an `#include`, `#embed` or other directive that brings in
 text inside a function or any other bracket but a namespace or `extern "C"`
-scope (it could close the test and open a helper), a test whose name is a
-macro the file defines, and any use of `__LINE__` or `__COUNTER__`, whose
-values move with the lines around them. The guard does not expand macros from headers or follow the code
-a test reaches, so an exempt change can still give that code other values.
+scope (it could close the test and open a helper), a `#define` whose
+replacement does not close every bracket it opens or closes one it did not
+open (`#define SPLIT } void helper(void) {`), a test whose name is a macro the
+file defines, and any use of `__LINE__` or `__COUNTER__`, whose
+values move with the lines around them. The guard does not read included files, expand macros from
+headers or follow the code a test reaches, so an exempt change can still give
+that code other values. For the same reason, a header's macro (`#define
+test_name helper`, or one whose replacement closes a test and opens a helper),
+or an included file whose own brackets do not pair, included at file, namespace
+or `extern "C"` scope, can rename a test or change its scope unseen: the guard
+reads only the test source.
 
 Unity `RUN_TEST(name)` registrations and `void test_name(void)` definitions are
 still counted, so a hit names the tests a change removed. Editing a source or

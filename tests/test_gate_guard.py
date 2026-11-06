@@ -1564,6 +1564,10 @@ class RuleDetails(unittest.TestCase):
                 u.replace("void test_clamp_low(void) {\n", "void test_clamp_low(void) {\n#pragma GCC diagnostic ignored \"-Wall\"\n#define LIMIT 10\n# 9 \"t.c\"\n"),
                 u.replace("void test_clamp_low(void) {\n", "void test_clamp_low(void) {\n#pragma GCC diagnostic ignored \"-Wall\"\n#define LIMIT 10\n# 9 \"t.c\"\n").replace(
                     "EQUAL(0,", "EQUAL(1,")),
+            "balanced macros, a brace in a string and an object-like (x)": (
+                u.replace("void setUp", "#define WRAP(x) do { (x); } while (0)\n#define BRACE \"}\"\n#define F (x) [x]\nvoid setUp"),
+                u.replace("void setUp", "#define WRAP(x) do { (x); } while (0)\n#define BRACE \"}\"\n#define F (x) [x]\nvoid setUp").replace(
+                    "EQUAL(0,", "EQUAL(1,")),
             "an assertion in a whole-statement branch": (
                 u.replace("    TEST_ASSERT_EQUAL(0,", "#ifdef HW\n    TEST_ASSERT_EQUAL(0,").replace("10));\n", "10));\n#endif\n", 1),
                 u.replace("    TEST_ASSERT_EQUAL(0,", "#ifdef HW\n    TEST_ASSERT_EQUAL(1,").replace("10));\n", "10));\n#endif\n", 1)),
@@ -1658,6 +1662,13 @@ class RuleDetails(unittest.TestCase):
                 u.replace("clamp(-5, 0, 10)", "clamp(\n#include \"args.inc\"\n)"),
                 u.replace("clamp(-5, 0, 10)", "clamp(\n#include \"args.inc\"\n)").replace("EQUAL(0,", "EQUAL(1,"),
                 "holds #include inside a bracket"),
+            "a macro that opens a bracket": (u.replace("void setUp", "#define OPEN {\nvoid setUp"),
+                                             u.replace("void setUp", "#define OPEN {\nvoid setUp").replace("EQUAL(0,", "EQUAL(1,"),
+                                             "OPEN may end a test and begin a helper"),
+            "a function-like macro whose brackets cross": (
+                u.replace("void setUp", "#define CROSS(x) ( x ]\nvoid setUp"),
+                u.replace("void setUp", "#define CROSS(x) ( x ]\nvoid setUp").replace("EQUAL(0,", "EQUAL(1,"),
+                "CROSS may end a test and begin a helper"),
             "a test renamed by a #define in the file": (
                 u.replace("void setUp", "#define test_clamp_low helper\nvoid setUp"),
                 u.replace("void setUp", "#define test_clamp_low helper\nvoid setUp").replace("EQUAL(0,", "EQUAL(1,"),
