@@ -204,9 +204,15 @@ backslash at a line's end), a trigraph, a digraph, a carriage return inside a
 line, a form feed or other control character, a character that is not ASCII
 outside comments and literals, a changed line holding anything but printable
 ASCII and tabs, a literal it cannot read, a stray `#`, unbalanced brackets, a
-preprocessor branch that opens or closes a bracket it does not close or open,
-and any use of `__LINE__` or `__COUNTER__`, whose values move with the lines
-around them. The guard does not expand macros from headers or follow the code
+preprocessor branch that opens a bracket it does not close or closes one
+opened before it (even when it opens another, so a dead `#if 0` branch cannot
+close a helper and open a test at the same depth), a conditional directive
+inside a statement or declaration (anywhere but the start of the file or after
+`;`, `{` or `}`), an `#include`, `#embed` or other directive that brings in
+text inside a function or any other bracket but a namespace or `extern "C"`
+scope (it could close the test and open a helper), a test whose name is a
+macro the file defines, and any use of `__LINE__` or `__COUNTER__`, whose
+values move with the lines around them. The guard does not expand macros from headers or follow the code
 a test reaches, so an exempt change can still give that code other values.
 
 Unity `RUN_TEST(name)` registrations and `void test_name(void)` definitions are

@@ -958,6 +958,11 @@ C_PRINTABLE = re.compile(r"[ -~\t]*")
 C_MOVING = re.compile(r"\b__(?:LINE|COUNTER)__\b")
 C_CONDITIONAL = re.compile(r"#\s*(if|ifdef|ifndef|elif|elifdef|elifndef|else|endif)\b")
 C_DEFINE = re.compile(r"#\s*(?:define|undef)\s+([A-Za-z_]\w*)")
+# The directives that bring in no text, allowed inside a function or other bracket (see _c_branches): the null
+# directive and a GNU line marker (# 7 "x.c") too.
+C_INERT = re.compile(r"#\s*(?:(?:define|undef|pragma|line|error|warning)\b|\d|$)")
+# What comes before the { of a namespace or extern "C" scope, read backwards: no function body opens there.
+C_SCOPE_HEAD = re.compile(r'^(?:"C(?:\+\+)?" extern|(?:\w+(?: :: \w+)* )?namespace(?: inline)?)(?: |$)')
 C_BRACKETS = {"(": ")", "[": "]", "{": "}"}
 # An int or float literal with a built-in suffix only: an integer's u, l or ll (in either order), a floating
 # literal's f or l. Any other suffix, such as 0f, 1.0ff or 0_wipe, makes a user-defined literal, which calls a
@@ -1079,24 +1084,53 @@ def _c_match(tokens, i):
 
 
 def _c_branches(tokens):
-    """ValueError when a preprocessor branch opens or closes a bracket it does not close or open, or its
-    conditionals do not pair, so which branch the compiler takes cannot change where a test ends."""
-    depth, stack = 0, []
+    """ValueError unless where each bracket, statement and function starts and ends, as the guard reads the file
+    with every preprocessor branch in and no included text, is where the compiler finds it, whichever branches
+    it takes and whatever a directive brings in:
+
+    - each branch of a conditional closes every bracket it opens, and no bracket opened before it, so a branch
+      cannot close one function and open another at the same depth;
+    - each conditional directive comes where a statement or declaration may start, at the text's start or
+      after ;, { or }, so a branch cannot end a statement that the code after it continues (if (x) then a
+      dead ;);
+    - inside a bracket other than a namespace or extern "C" scope (a function body, say), a directive is only
+      a conditional, #define, #undef (the guard reads the names they define), #pragma, #line, #error,
+      #warning or the null directive: not #include or #embed, whose text may close the function and open
+      another.
+    """
+    brackets, arms, seen, unopened = [], [], [], 0
     for t in tokens:
-        m = C_CONDITIONAL.match(t.text) if t.kind == "directive" else None
-        if m and m.group(1).startswith("if"):
-            stack.append(depth)
-        elif m:
-            if not stack or stack[-1] != depth:
+        if t.kind != "directive":
+            if t.text in C_BRACKETS:
+                # Whether the bracket is a namespace or extern "C" scope, read from the tokens before it.
+                brackets.append(t.text == "{" and bool(C_SCOPE_HEAD.match(" ".join(reversed(seen[-12:])))))
+            elif t.text in (")", "]", "}"):
+                if arms and len(brackets) == arms[-1]:
+                    raise ValueError("a preprocessor branch closes a bracket opened before it")
+                if brackets:
+                    brackets.pop()
+                else:
+                    unopened += 1
+            seen.append(t.text)
+            continue
+        last = seen[-1] if seen else None
+        m = C_CONDITIONAL.match(t.text)
+        if m:
+            if last not in (None, ";", "{", "}"):
+                raise ValueError(f"a preprocessor conditional on line {t.line} comes inside a statement or "
+                                 "declaration, where a branch may end or begin it")
+            if m.group(1).startswith("if"):
+                arms.append(len(brackets))
+                continue
+            if not arms or arms[-1] != len(brackets):
                 raise ValueError("a preprocessor branch opens or closes a bracket it does not close or open, or "
                                  "its conditionals do not pair")
             if m.group(1) == "endif":
-                stack.pop()
-        elif t.text in C_BRACKETS:
-            depth += 1
-        elif t.text in (")", "]", "}"):
-            depth -= 1
-    if stack or depth:
+                arms.pop()
+        elif not all(brackets) and not C_INERT.match(t.text):
+            raise ValueError(f"line {t.line} holds {t.text.split()[0]} inside a bracket, where the text it brings "
+                             "in may end a function and begin another")
+    if arms or len(brackets) != unopened:
         raise ValueError("its brackets or preprocessor conditionals do not pair")
 
 
@@ -1284,6 +1318,9 @@ def _c_test_change(old, new, macros):
     """Why changing the existing test old to new is more than replacing assertions of its own body, each by one
     that differs only in literals and comparison operators (_c_assert_change), or None."""
     name = _c_test_name(new.test)
+    renamed = next((w for w in new.head if w in macros), None)
+    if renamed:
+        return f"it changes {name}, whose header names {renamed}, a macro the file defines, so it may not be a test"
     statements = [_c_statements(old.body), _c_statements(new.body)]
     keys = [[_c_texts(s) for s in side] for side in statements]
     for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, *keys, autojunk=False).get_opcodes():

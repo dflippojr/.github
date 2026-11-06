@@ -1557,6 +1557,16 @@ class RuleDetails(unittest.TestCase):
                 u.replace("void setUp", "#if defined(ARDUINO)\n#include <Arduino.h>\n#endif\n\nvoid setUp").replace(
                     "EQUAL(0,", "EQUAL(1,")),
             "a C source": (u, u.replace("EQUAL(0,", "EQUAL(2,")),
+            "an #include in a namespace scope": (
+                "namespace desk {\n#include \"cases.h\"\n}\n" + u, "namespace desk {\n#include \"cases.h\"\n}\n" + u.replace(
+                    "EQUAL(0,", "EQUAL(1,")),
+            "a #pragma, #define and line marker in a test body": (
+                u.replace("void test_clamp_low(void) {\n", "void test_clamp_low(void) {\n#pragma GCC diagnostic ignored \"-Wall\"\n#define LIMIT 10\n# 9 \"t.c\"\n"),
+                u.replace("void test_clamp_low(void) {\n", "void test_clamp_low(void) {\n#pragma GCC diagnostic ignored \"-Wall\"\n#define LIMIT 10\n# 9 \"t.c\"\n").replace(
+                    "EQUAL(0,", "EQUAL(1,")),
+            "an assertion in a whole-statement branch": (
+                u.replace("    TEST_ASSERT_EQUAL(0,", "#ifdef HW\n    TEST_ASSERT_EQUAL(0,").replace("10));\n", "10));\n#endif\n", 1),
+                u.replace("    TEST_ASSERT_EQUAL(0,", "#ifdef HW\n    TEST_ASSERT_EQUAL(1,").replace("10));\n", "10));\n#endif\n", 1)),
             "a doctest message of string arguments only": (
                 c.replace("REQUIRE(clamp(-5, 0, 10) == 0);", 'REQUIRE_MESSAGE(clamp(-5, 0, 10) == 0, "low", "end");'),
                 c.replace("REQUIRE(clamp(-5, 0, 10) == 0);", 'REQUIRE_MESSAGE(clamp(-5, 0, 10) == 1, "min", "end");')),
@@ -1621,6 +1631,37 @@ class RuleDetails(unittest.TestCase):
                 c.replace("REQUIRE(clamp(-5, 0, 10) == 0);", 'CHECK_THROWS_AS_MESSAGE(clamp(-5, 0, 10), Error, "a");'),
                 c.replace("REQUIRE(clamp(-5, 0, 10) == 0);", 'CHECK_THROWS_AS_MESSAGE(clamp(-5, 0, 10), Error, "b");'),
                 "message is not a string literal"),
+            "a branch that closes a namespace and opens a test": (
+                "namespace desk {\n#if 0\n}\nvoid test_fake(void) {\n#endif\n    TEST_ASSERT_EQUAL(0, f());\n}\n" + u,
+                "namespace desk {\n#if 0\n}\nvoid test_fake(void) {\n#endif\n    TEST_ASSERT_EQUAL(1, f());\n}\n" + u,
+                "closes a bracket opened before it"),
+            "a branch that opens a bracket it closes in the next branch": (
+                u.replace("void test_clamp_low(void) {\n", "void test_clamp_low(void) {\n#ifdef HW\n    {\n#else\n    {\n#endif\n    }\n"),
+                u.replace("void test_clamp_low(void) {\n", "void test_clamp_low(void) {\n#ifdef HW\n    {\n#else\n    {\n#endif\n    }\n").replace("EQUAL(0,", "EQUAL(1,"),
+                "opens or closes a bracket it does not close or open"),
+            "a branch after else": (
+                u.replace("void test_clamp_low(void) {\n", "void test_clamp_low(void) {\n    if (ready()) setUp(); else\n#if 0\n    ;\n#endif\n"),
+                u.replace("void test_clamp_low(void) {\n", "void test_clamp_low(void) {\n    if (ready()) setUp(); else\n#if 0\n    ;\n#endif\n").replace("EQUAL(0,", "EQUAL(1,"),
+                "comes inside a statement or declaration"),
+            "a branch inside an initializer": (
+                u.replace("void setUp", "int limits[] = {\n#ifdef HW\n    1,\n#endif\n    2};\nvoid setUp"),
+                u.replace("void setUp", "int limits[] = {\n#ifdef HW\n    1,\n#endif\n    2};\nvoid setUp").replace("EQUAL(0,", "EQUAL(1,"),
+                "comes inside a statement or declaration"),
+            "#embed in a test body": (u.replace("void test_clamp_low(void) {\n", "void test_clamp_low(void) {\n#embed \"data.bin\" if_empty(if (0))\n"),
+                                       u.replace("void test_clamp_low(void) {\n", "void test_clamp_low(void) {\n#embed \"data.bin\" if_empty(if (0))\n").replace(
+                                           "EQUAL(0,", "EQUAL(1,"), "holds #embed inside a bracket"),
+            "#include_next in a helper, beside an edited test": (
+                u.replace("void setUp(void) {}", "void setUp(void) {\n#include_next \"setup.inc\"\n}"),
+                u.replace("void setUp(void) {}", "void setUp(void) {\n#include_next \"setup.inc\"\n}").replace("EQUAL(0,", "EQUAL(1,"),
+                "holds #include_next inside a bracket"),
+            "an #include in an assertion's parentheses": (
+                u.replace("clamp(-5, 0, 10)", "clamp(\n#include \"args.inc\"\n)"),
+                u.replace("clamp(-5, 0, 10)", "clamp(\n#include \"args.inc\"\n)").replace("EQUAL(0,", "EQUAL(1,"),
+                "holds #include inside a bracket"),
+            "a test renamed by a #define in the file": (
+                u.replace("void setUp", "#define test_clamp_low helper\nvoid setUp"),
+                u.replace("void setUp", "#define test_clamp_low helper\nvoid setUp").replace("EQUAL(0,", "EQUAL(1,"),
+                "whose header names test_clamp_low, a macro the file defines"),
             "EXPECT_CALL, a mock expectation": (g.replace("EXPECT_EQ(0, clamp(-5, 0, 10));", "EXPECT_CALL(mock, Read(0));"),
                                                 g.replace("EXPECT_EQ(0, clamp(-5, 0, 10));", "EXPECT_CALL(mock, Read(1));"),
                                                 "not an assertion macro call"),
@@ -1630,7 +1671,7 @@ class RuleDetails(unittest.TestCase):
                 u.replace("EQUAL(0, clamp(-5, 0, 10));", "EQUAL(0,\n#ifdef WIDE\n    clamp(-5, 0, 10)\n#else\n"
                           "    clamp(-5, 0, 9)\n#endif\n    );"),
                 u.replace("EQUAL(0, clamp(-5, 0, 10));", "EQUAL(1,\n#ifdef WIDE\n    clamp(-5, 0, 10)\n#else\n"
-                          "    clamp(-5, 0, 9)\n#endif\n    );"), "not an assertion macro call"),
+                          "    clamp(-5, 0, 9)\n#endif\n    );"), "comes inside a statement or declaration"),
             "a statement added on an assertion's line": (u, u.replace("label(0));", "label(0)); abort();"),
                                                          "adds, removes or moves a statement in test_clamp_low"),
             "a test's header": (u, u.replace("void test_clamp_low(void)", "static void test_clamp_low(void)"),
@@ -1676,7 +1717,7 @@ class RuleDetails(unittest.TestCase):
             "a test whose header holds a directive": (
                 u.replace("void test_clamp_low(void) {", "void test_clamp_low(void)\n#ifdef HW\n#endif\n{"),
                 u.replace("void test_clamp_low(void) {", "void test_clamp_low(void)\n#ifdef HW\n#endif\n{").replace(
-                    "EQUAL(0,", "EQUAL(1,"), "it changes code outside a test body"),
+                    "EQUAL(0,", "EQUAL(1,"), "comes inside a statement or declaration"),
             "a new test: a declaration of a type the file does not name": (u, self.new_unity("    Gauge g = 1;\n"),
                                                                             added),
             "a new test: a template closed before it opens": (u, self.new_unity("    int x = 0;\n    x > getpid = 1;\n"),
