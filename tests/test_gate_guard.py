@@ -1537,18 +1537,16 @@ class RuleDetails(unittest.TestCase):
             head = {p: t for p, t in dict(start, **change).items() if p not in drop}
             return {h.path for h in judge_commits(start, head)}
 
-        # (1) Added-only edits to a Python test module pass: a test appended or inserted between two, with a new
-        # import and literal pytest marks, an async test, a new test class, a method added to a test class, and a
-        # new test module.
-        new_module = ('"""Reset checks."""\nimport pytest\n\nfrom backend.app import create_app\n\nHEIGHTS = (60, 120)\n\n\n'
+        # (1) Added-only edits to a Python test module pass: a test appended or inserted between two, with import
+        # pytest and a literal parametrize mark, a new test class, a method added to a test class, and a new test
+        # module (review round 1: an async test, a custom mark and another import are hits).
+        new_module = ('"""Reset checks."""\nimport pytest\n\nHEIGHTS = (60, 120)\n\n\n'
                       "@pytest.mark.parametrize('height', [60, -1, (1, 2)])\ndef test_reset(height):\n"
-                      "    assert create_app()\n\n\nclass TestReset:\n    def test_twice(self):\n        assert True\n")
+                      "    assert height in HEIGHTS\n\n\nclass TestReset:\n    def test_twice(self):\n        assert True\n")
         passing = [(base, {test_api: api + added}),
                    (base, {test_api: api.replace("\n\n\ndef test_height_limits", added + "\n\ndef test_height_limits")}),
-                   (base, {test_api: "import pathlib\nimport pytest\n" + api
-                           + "\n\n@pytest.mark.slow\n@pytest.mark.parametrize('n', [1, 2])\n"
-                             "def test_paths(n, tmp_path: pathlib.Path) -> None:\n    assert tmp_path\n"}),
-                   (base, {test_api: api + "\n\nasync def test_status():\n    assert create_app()\n"}),
+                   (base, {test_api: "import pytest\n" + api + "\n\n@pytest.mark.parametrize('n', [1, 2])\n"
+                                                              "def test_paths(n, tmp_path) -> None:\n    assert tmp_path\n"}),
                    (base, {test_api: api + "\n\nclass TestReset:\n    \"\"\"Reset.\"\"\"\n\n"
                                            "    def test_reset(self):\n        assert create_app()\n"}),
                    (dict(base, **{test_api: cls}), {test_api: cls + "\n    def test_width(self):\n        assert True\n"}),
@@ -1633,7 +1631,8 @@ class RuleDetails(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(flagged(base, {path: base.get(path, "") + added}), {path})
         # (3) C/C++ test edits keep today's rule: a new Unity test is a hit. So does a file the guard cannot
-        # parse (a JavaScript test, a data file), and a Python test in a test directory that holds C/C++.
+        # parse (a JavaScript test, a data file). A Python test in a test directory that holds C/C++ is judged as
+        # Python (review round 1).
         unity = "firmware/test/test_logic/test_main.cpp"
         new_unity = DESK_UNITY.replace("int main() {\n", "void test_clamp_high(void) {\n  TEST_ASSERT_EQUAL(10, clamp(50, 0, "
                                        "10));\n}\nint main() {\n").replace("  RUN_TEST(test_clamp_low);\n",
@@ -1648,7 +1647,7 @@ class RuleDetails(unittest.TestCase):
                 (base, {js: js_added}, {js}),
                 (base, {"backend/tests/data.json": "{}\n"}, {"backend/tests/data.json"}),
                 (dict(base, **{firmware_py: "def test_gen():\n    assert True\n"}),
-                 {firmware_py: "def test_gen():\n    assert True\n" + added}, {firmware_py})):
+                 {firmware_py: "def test_gen():\n    assert True\n\n\ndef test_more():\n    assert True\n"}, set())):
             with self.subTest(change=sorted(change)):
                 self.assertEqual(flagged(start, change), expected)
         [hit] = judge_commits(js_base, dict(js_base, **{js: js_added}))
@@ -1657,6 +1656,117 @@ class RuleDetails(unittest.TestCase):
         python_only = {p: t for p, t in base.items() if p.startswith("backend/")}
         self.assertEqual(flagged(python_only, {test_api: api + added}), set())
         self.assertEqual(flagged(python_only, {test_api: fewer}), {test_api})
+
+    def test_mixed_repository_added_tests_fail_closed_on_what_the_guard_cannot_judge(self):
+        """Issue #54, review round 1 and the owner's decision: an addition the guard cannot judge exactly fails
+        closed. A body with an exit or skip call, flow control, a store into shared state or a name it cannot
+        trace is not an added test; nor is a skip, xfail or custom mark however it is written, an import (it runs
+        code when pytest imports the module), or any addition to a module that defines fixtures or hooks. A Python
+        test module is judged as Python even when its test directory also holds C/C++ tests."""
+        api, base, test_api = DESK_API, DESK_TREE, "backend/tests/test_api.py"
+        head = "import os\nimport sys\nimport pytest\n" + api
+
+        def flagged(start, change):
+            return {h.path for h in judge_commits(start, dict(start, **change))}
+
+        def body(lines, params="", start=api):
+            return start + f"\n\ndef test_reset({params}):\n" + "".join(f"    {l}\n" for l in lines)
+
+        # Finding 1: an added body that disables an existing test or ends the run, or reads what it can't trace.
+        disable = api.replace("def test_health():", "def test_000_disable():\n    test_health.__code__ = (lambda: None)"
+                                                    ".__code__\n\n\ndef test_health():", 1)
+        hits = [disable,
+                body(["os._exit(0)"], start=head), body(["sys.exit(0)"], start=head),
+                body(["pytest.exit('done', returncode=0)"], start=head), body(["pytest.skip('later')"], start=head),
+                body(["pytest.xfail('later')"], start=head), body(["raise SystemExit(0)"]), body(["exit(0)"]),
+                body(["return", "assert create_app()"]), body(["if create_app():", "    assert True"]),
+                body(["for _ in range(2):", "    assert create_app()"]),
+                body(["try:", "    assert False", "except AssertionError:", "    pass"]),
+                body(["with open('x') as f:", "    assert f"]), body(["import os", "os._exit(0)"]),
+                body(["global create_app", "create_app = None"]), body(["create_app.ready = True"]),
+                body(["vars(create_app)['ready'] = True"]), body(["getattr(create_app, 'ready')"]),
+                body(["assert test_health()"]), body(["assert create_app().__class__"]),
+                body(["assert all(create_app() for _ in [1])"]), body(["probe = lambda: 0"]),
+                body(["assert create_app()"], "monkeypatch"), body(["request.session.items.clear()"], "request"),
+                body(["assert pytestconfig"], "pytestconfig"), body(["assert client"], "client"),
+                body(["assert create_app()"], "*args"),
+                api + "\n\nasync def test_reset():\n    assert create_app()\n"]
+        for text in hits:
+            with self.subTest(text=text):
+                self.assertEqual(flagged(base, {test_api: text}), {test_api})
+        cls = "import pytest\n\n\nclass TestLimits:\n    def test_height(self):\n        assert True\n"
+        for method in ("        self.skipTest('later')\n", "        self.\\\n            skipTest('later')\n",
+                       "        self.test_height = None\n", "        self.test_height.__func__.__code__ = None\n"):
+            with self.subTest(method=method):
+                self.assertEqual(flagged(dict(base, **{test_api: cls}),
+                                         {test_api: cls + "\n    def test_width(self):\n" + method}), {test_api})
+        # Finding 2: a skip mark however it is written, any mark but a literal parametrize, on a function or a
+        # class, and a test added where an existing mark applies to it.
+        marked = "import pytest\n" + api + "\n\n{}\ndef test_new(n=1):\n    assert False\n"
+        for mark in ("@pytest.mark\\\n    .skip(reason='not now')", "@pytest.mark\\\n    .xfail",
+                     "@pytest.mark\\\n    .skipif(True, reason='x')", "@(pytest.mark\n  .skip)", "@pytest.mark.slow",
+                     "@pytest.mark.usefixtures('reset')", "@pytest.mark.parametrize('n', [])",
+                     "@pytest.mark.parametrize('n', [1], indirect=True)"):
+            with self.subTest(mark=mark):
+                self.assertEqual(flagged(base, {test_api: marked.format(mark)}), {test_api})
+                self.assertEqual(flagged(base, {test_api: marked.format(mark).replace(
+                    "def test_new(n=1):\n    assert False", "class TestNew:\n    def test_a(self):\n        assert False")}),
+                    {test_api})
+        for start_text, addition in (("@pytest.mark.skip\n" + cls.replace("import pytest\n\n\n", ""),
+                                      "\n    def test_width(self):\n        assert True\n"),
+                                     ("pytestmark = pytest.mark.skip\n\n\n" + cls.replace("import pytest\n\n\n", ""),
+                                      "\n\ndef test_width():\n    assert True\n")):
+            start_text = "import pytest\n\n\n" + start_text
+            with self.subTest(start=start_text):
+                self.assertEqual(flagged(dict(base, **{test_api: start_text}), {test_api: start_text + addition}),
+                                 {test_api})
+        # An import runs code when pytest imports the module; only import pytest is added. A module that defines a
+        # fixture or a hook is a fixture file, and is never exempt this way.
+        added = "\n\ndef test_reset():\n    assert create_app()\n"
+        for start, change in ((base, {test_api: "import pathlib\n" + api + added}),
+                              (base, {"backend/tests/test_reset.py": "from backend.app import create_app\n" + added}),
+                              (base, {"backend/tests/test_reset.py": "import json\n\n\ndef test_reset():\n"
+                                                                     "    assert json\n"})):
+            with self.subTest(change=change):
+                self.assertEqual(flagged(start, change), set(change))
+        for start_text in ("import pytest\n" + api + "\n\n@pytest.fixture\ndef app():\n    return create_app()\n",
+                           "from pytest import fixture\n" + api + "\n\n@fixture(autouse=True)\ndef app():\n    pass\n",
+                           api + "\n\ndef pytest_collection_modifyitems(items):\n    pass\n"):
+            with self.subTest(fixture_file=start_text):
+                hit = judge_commits(dict(base, **{test_api: start_text}), dict(base, **{test_api: start_text + added}))
+                self.assertEqual([(h.path, "fixture" in h.detail) for h in hit], [(test_api, True)])
+        # Controls that still pass: a body of assertions, calls and local names over what the module imported, a
+        # parameter an existing test already requests, an inert built-in fixture, a literal parametrize, and a new
+        # module of tests over literals.
+        requested = api + "\n\ndef test_client(client):\n    assert client\n"
+        new_module = ('"""Reset checks."""\nimport pytest\n\nHEIGHTS = (60, 120)\n\n\n'
+                      "@pytest.mark.parametrize('height, ok', [(60, True), (-1, False)])\ndef test_reset(height, ok):\n"
+                      "    assert (height in HEIGHTS) == ok\n\n\nclass TestReset:\n    def test_twice(self):\n"
+                      "        assert len(HEIGHTS) == 2\n")
+        for start, change in (
+                (dict(base, **{test_api: "import pytest\n" + api}),
+                 {test_api: body(["app = create_app()", "height: int = app.max_height", "height += 0",
+                                  "assert height == pytest.approx(120), f'{height}'", "assert [*app.limits]"],
+                                 "tmp_path, capsys", "import pytest\n" + api)}),
+                (dict(base, **{test_api: requested}), {test_api: body(["assert client.get('/') == {'ok': True}"],
+                                                                     "client", requested)}),
+                (base, {"backend/tests/test_reset.py": new_module})):
+            with self.subTest(change=change):
+                self.assertEqual(flagged(start, change), set())
+        # Finding 3: a Python test module beside C/C++ tests under one test directory is judged per file, as
+        # Python. PlatformIO's custom test runner, which reads the C/C++ results, is not a Python test.
+        shared = {"src/logic.cpp": "int clamp(int v) { return v; }\n", "backend/app.py": "def create_app():\n    pass\n",
+                  "tests/firmware/test_logic.cpp": "#include <unity.h>\nvoid test_low(void) {}\n",
+                  "tests/backend/test_api.py": api}
+        fewer = api.split("\n\n\ndef test_height_limits")[0] + "\n"
+        runner = "test/test_custom_runner.py"
+        for start, change, expected in (
+                (shared, {"tests/backend/test_api.py": api + added}, set()),
+                (shared, {"tests/backend/test_api.py": fewer}, {"tests/backend/test_api.py"}),
+                (dict(base, **{runner: "def test_one():\n    assert True\n"}),
+                 {runner: "def test_one():\n    assert True\n\n\ndef test_two():\n    assert True\n"}, {runner})):
+            with self.subTest(change=change):
+                self.assertEqual(flagged(start, change), expected)
 
     # Issue #43: a C/C++ test source, its old and new text, judged through a full-context diff.
     UNITY_SRC = ('#include <unity.h>\n#include "logic.h"\n\nvoid setUp(void) {}\nvoid tearDown(void) {}\n\n'
