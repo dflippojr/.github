@@ -2415,7 +2415,8 @@ class GitEndToEnd(unittest.TestCase):
                      "flag-cpp-line-splice", "flag-cpp-if0-around-test", "flag-cpp-ctest-registration",
                      "flag-cpp-rename-disabled-dir", "flag-cpp-assert-udl-reserved-suffix",
                      "flag-cpp-new-test-qualified-call", "flag-cpp-doctest-message-call-first",
-                     "pass-cpp-doctest-message-literals"] + sorted(p.stem for p in FIXTURES.glob("*-floor-*.diff")):
+                     "pass-cpp-doctest-message-literals", "flag-cpp-branch-swaps-scope",
+                     "flag-cpp-branch-swaps-scope-nested", "flag-cpp-include-in-test-body"] + sorted(p.stem for p in FIXTURES.glob("*-floor-*.diff")):
             with self.subTest(fixture=name), tempfile.TemporaryDirectory() as tmp:
                 subprocess.run(["git", "init", "-q", tmp], check=True, capture_output=True)
                 text = (FIXTURES / f"{name}.diff").read_text(encoding="utf-8")
