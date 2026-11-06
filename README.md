@@ -232,41 +232,42 @@ module) is judged per file, as Python (issue #54, the owner's decision of
 and so is a new module that holds only tests. Python is the only language the
 guard parses, so other files there, such as a JavaScript test or a data file,
 are still hits, and so are a `conftest.py` and a helper. What the guard cannot
-judge exactly fails closed (review round 1, the owner's decision of
-2026-11-06). The edit is exempt only when the guard can read the whole file on
-both sides as above (UTF-8, printable ASCII on changed lines, no carriage
-return inside a line) and parse it, every statement that was there stays as it
-was and in its order, and each statement it adds is one of these:
+judge exactly fails closed, so an added test is exempt only when the guard can
+prove it harmless (review rounds 1 and 2, the owner's decision of 2026-11-06).
+In practice that is a test of literals and builtins only: a test that calls the
+code under test, requests a fixture or reads a helper needs approval. The edit
+is exempt only when the guard can read the whole file on both sides as above
+(UTF-8, printable ASCII on changed lines, no carriage return inside a line)
+and parse it, every statement that was there stays as it was and in its
+order, and each statement it adds is one of these:
 
 - a `test_` function (not `async`, which pytest skips without a plugin) whose
   only decorators are `@pytest.mark.parametrize` marks with a literal name
   list, a non-empty literal list of values and at most literal `ids` (where
   one top-level `import pytest` is all that binds `pytest`), whose defaults
-  are literals and whose annotations are literals or dotted names, so Python
-  runs nothing when it defines it. The guard reads the parsed decorator, so a
-  `skip`, `skipif`, `xfail`, `usefixtures` or custom mark (one a `conftest.py`
-  hook or a `-m` option may skip) is a hit however its lines are written. Its
-  parameters are plain ones; each one without a default is a name a
-  `parametrize` mark gives, `tmp_path`, `capsys`, `capfd` or `caplog`, or a
-  fixture an existing test of the module already requests, but never
-  `request`, `pytestconfig`, `monkeypatch`, `mocker`, `cache`, `pytester` or
-  another that reaches pytest's session or config or patches code. Its body
-  holds only `assert` statements, expressions, `pass` and assignments to its
-  own names: no `if`, `for`, `while`, `try`, `with`, `raise`, `return`,
-  `del`, `global`, import or nested definition, and no `and`, `or`,
-  conditional expression, comprehension, lambda, `:=`, `await` or `yield`. It
-  assigns to no attribute or item, reads no attribute that starts with `_`
-  (such as `__code__` or `os._exit`) or that may skip a test or end the run
-  (`skip…`, `xfail…`, `exit`, `quit`, `abort`, `system`, `kill…`, `fork…`,
-  `spawn…`, `execl…`/`execv…`, `popen…`, `shouldstop`, `shouldfail`), and reads
-  only its own names, builtins that only compute a value (`len`, `sorted`,
-  `isinstance`, exception classes and the like), `pytest.approx`, and names
-  the module binds at its top level by an import of code other than `os`,
-  `sys`, `subprocess`, `signal`, `builtins`, `importlib`, `ctypes`,
-  `threading`, `asyncio`, `inspect`, `atexit`, `shutil`, `unittest`, `mock`,
-  `pytest` and the like, by a `def` or `class` that is not a test, or to a
-  literal. So it cannot read an existing test (to swap its code, say), exit,
-  skip itself or reach the interpreter;
+  are immutable literals and whose annotations are literals or builtins'
+  names, so Python runs nothing when it defines it. The guard reads the
+  parsed decorator, so a `skip`, `skipif`, `xfail`, `usefixtures` or custom
+  mark (one a `conftest.py` hook or a `-m` option may skip) is a hit however
+  its lines are written. It requests no fixture: each parameter without a
+  default is a name a `parametrize` mark gives. Its body holds only `assert`
+  statements, expressions, `pass` and plain assignments to its own names: no
+  augmented assignment (`values *= 0` empties a shared list through an
+  alias), no `if`, `for`, `while`, `try`, `with`, `raise`, `return`, `del`,
+  `global`, import or nested definition, and no `and`, `or`, conditional
+  expression, comprehension, lambda, `:=`, `await` or `yield`. It calls only
+  builtins that compute a value and call nothing they are given (`len`,
+  `sorted` without `key=`, `isinstance`, `abs`, exception classes and the
+  like; not `map`, `filter` or `iter`) and `pytest.approx`. It reads an
+  attribute only of its own names, literals and values computed from them,
+  never of a module binding, a builtin or `self` (`warnings.sys.modules`
+  reaches the interpreter), and no attribute that starts with `_` or that may
+  skip a test or end the run. It assigns to no attribute or item, and reads
+  no name but its own, those builtins, `pytest.approx` and an immutable
+  literal (no list, set or dict) the module assigns at its top level: not an
+  import, a helper, a test, a fixture or a mutable value. So it cannot call
+  or traverse code the guard does not follow, exit, skip itself, or change an
+  existing test or a value one reads;
 - a `Test` class with no base, keyword, decorator or type parameter, holding
   only such `test_` methods (whose first parameter is `self`) and docstrings;
 - such a `test_` method added to an existing `Test` class that pytest collects
@@ -277,8 +278,8 @@ was and in its order, and each statement it adds is one of these:
 - `import pytest`. Any other import is a hit: importing a module runs its code
   when pytest imports the test module, and a name a `from` import binds may be
   a fixture that pytest applies to the module's tests (an autouse one);
-- a docstring; and in a new module, a literal assigned to a name. In a module
-  that already holds tests, such an assignment is a hit, since a
+- a docstring; and in a new module, an immutable literal assigned to a name.
+  In a module that already holds tests, such an assignment is a hit, since a
   `conftest.py` hook may read it from the module (a flag that skips its
   tests).
 
@@ -295,11 +296,7 @@ see; a fixture file, one that defines or applies a fixture (`fixture`,
 and one that sets `pytestmark`, whose marks apply to an added test. A change
 that does anything else is judged by the assert-only rule above, so an
 assertion fixed beside a test added is a hit. New skips in an added test are
-also hits as in any repository. The guard does not follow the code an added
-test calls: a function the module already imports, a fixture an existing test
-requests, or a method of the objects they return can still end the process or
-change state that the existing tests read, like any code the pull request
-changes.
+also hits as in any repository.
 
 Unity `RUN_TEST(name)` registrations and `void test_name(void)` definitions are
 still counted, so a hit names the tests a change removed. Editing a source or
