@@ -1,0 +1,31 @@
+# gate-guard fixture: an assertion edited after SPLIT; in a test body, where an unchanged #define SPLIT closes the test and opens helper
+# expect: removed-tests
+# hits: 1
+# detail: a #define whose replacement
+
+diff --git a/test/test_main/test_main.cpp b/test/test_main/test_main.cpp
+index 1111111..2222222 100644
+--- a/test/test_main/test_main.cpp
++++ b/test/test_main/test_main.cpp
+@@ -1,20 +1,20 @@
+ #include <unity.h>
+ #include "support.h"
+ 
+ #define SPLIT } void helper(void) { (void)0
+ 
+ void test_synthetic(void) {
+     SPLIT;
+-    TEST_ASSERT_TRUE(value() == 1);
++    TEST_ASSERT_TRUE(value() == 2);
+ }
+ 
+ void test_existing(void) {
+     TEST_ASSERT_TRUE(ready());
+ }
+ 
+ int main(void) {
+     UNITY_BEGIN();
+     RUN_TEST(test_existing);
+     helper();
+     return UNITY_END();
+ }
