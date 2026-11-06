@@ -1515,6 +1515,111 @@ class RuleDetails(unittest.TestCase):
             with self.subTest(start=start_text):
                 self.assertIn(why, hit(start_text, *edits))
 
+    def test_mixed_repository_judges_python_test_files_per_file(self):
+        """Issue #54: in a repository that also holds C/C++, a Python test module whose change only adds tests
+        passes; a removed test still trips the guard, and C/C++ and files the guard cannot parse fail closed."""
+        api, base, test_api = DESK_API, DESK_TREE, "backend/tests/test_api.py"
+        cls = "import pytest\n\n\nclass TestLimits:\n    def test_height(self):\n        assert True\n"
+        added = "\n\ndef test_reset():\n    assert create_app()\n"
+
+        def flagged(start, change, drop=()):
+            head = {p: t for p, t in dict(start, **change).items() if p not in drop}
+            return {h.path for h in judge_commits(start, head)}
+
+        # (1) Added-only edits to a Python test module pass: a test appended or inserted between two, with a new
+        # import and literal pytest marks, an async test, a new test class, a method added to a test class, and a
+        # new test module.
+        new_module = ('"""Reset checks."""\nimport pytest\n\nfrom backend.app import create_app\n\n\n'
+                      "@pytest.mark.parametrize('height', [60, -1, (1, 2)])\ndef test_reset(height):\n"
+                      "    assert create_app()\n\n\nclass TestReset:\n    def test_twice(self):\n        assert True\n")
+        passing = [(base, {test_api: api + added}),
+                   (base, {test_api: api.replace("\n\n\ndef test_height_limits", added + "\n\ndef test_height_limits")}),
+                   (base, {test_api: "import pytest\nfrom pathlib import Path\n" + api
+                           + "\n\n@pytest.mark.slow\n@pytest.mark.parametrize('n', [1, 2])\n"
+                             "def test_paths(n, tmp_path: Path) -> None:\n    assert tmp_path\n"}),
+                   (base, {test_api: api + "\n\nasync def test_status():\n    assert create_app()\n"}),
+                   (base, {test_api: api + "\n\nclass TestReset:\n    \"\"\"Reset.\"\"\"\n\n"
+                                           "    def test_reset(self):\n        assert create_app()\n"}),
+                   (dict(base, **{test_api: cls}), {test_api: cls + "\n    def test_width(self):\n        assert True\n"}),
+                   (base, {"backend/tests/test_reset.py": new_module}),
+                   (base, {"backend/tests/unit/test_reset.py": new_module})]
+        for start, change in passing:
+            with self.subTest(change=change):
+                self.assertEqual(flagged(start, change), set())
+        # (2) A removed test in the same repository still trips the guard, beside an added test or not, and an
+        # added test still carries its own skip marker.
+        fewer = api.split("\n\n\ndef test_height_limits")[0] + "\n"
+        for change in ({test_api: fewer}, {test_api: fewer + added}, {test_api: fewer, "backend/tests/test_reset.py":
+                                                                       "from backend.app import create_app\n" + added}):
+            with self.subTest(change=change):
+                self.assertIn(test_api, flagged(base, change))
+        hits = judge_commits(base, dict(base, **{test_api: "import pytest\n" + api + added.replace(
+            "def test_reset", "@pytest.mark.skip\ndef test_reset")}))
+        self.assertEqual({(h.rule, h.path) for h in hits}, {("skip-marker", test_api)})
+        # Added lines that change which existing tests run, or what their names mean, are hits.
+        hiding = [api + "\n\ndef test_health():\n    pass\n",
+                  api.replace("create_app\n", "create_app\nfrom os import _exit as create_app\n", 1),
+                  api.replace("create_app\n", "create_app\nfrom os import _exit as len\n", 1),
+                  api.replace("create_app\n", "create_app\nfrom os import *\n", 1),
+                  "__test__ = False\n" + api,
+                  api + "\n\nLIMIT = 0\n",
+                  api + "\n\npytestmark = []\n",
+                  api + "\n\ndef setup_module():\n    pass\n",
+                  api + "\n\ndef helper():\n    pass\n",
+                  "import functools\n" + api + "\n\n@functools.lru_cache\ndef test_reset():\n    assert True\n",
+                  "import os\nimport pytest\n" + api + "\n\n@pytest.mark.parametrize('x', [os.getcwd()])\n"
+                                                         "def test_reset(x):\n    assert x\n",
+                  api + "\n\ndef test_reset(app=print()):\n    assert app\n",
+                  api + "\n\ndef test_reset(app: print()):\n    assert app\n",
+                  api + "\n\nclass TestReset(object):\n    def test_reset(self):\n        assert True\n",
+                  api + "\n\nclass TestReset:\n    flag = 1\n\n    def test_reset(self):\n        assert True\n",
+                  api + "\n\ndef test_reset(:\n    pass\n",
+                  "from __future__ import annotations\n" + api,
+                  api.replace("    assert create_app()\n", "    if True:\n        return\n    assert create_app()\n", 1),
+                  api.replace("120", "125") + added]
+        for text in hiding:
+            with self.subTest(text=text):
+                self.assertEqual(flagged(base, {test_api: text}), {test_api})
+        for addition in ("\n    def helper(self):\n        pass\n", "\n    def setup_method(self):\n        pass\n",
+                         "\n    __test__ = False\n", "\n    def test_height(self):\n        pass\n",
+                         "\n    def __init__(self):\n        pass\n"):
+            with self.subTest(addition=addition):
+                self.assertEqual(flagged(dict(base, **{test_api: cls}), {test_api: cls + addition}), {test_api})
+        for header in ("class TestLimits(object):", "class Limits:"):
+            start = dict(base, **{test_api: cls.replace("class TestLimits:", header)})
+            with self.subTest(header=header):
+                self.assertEqual(flagged(start, {test_api: start[test_api] + "\n    def test_width(self):\n"
+                                                                            "        assert True\n"}), {test_api})
+        # A file that is not a test module stays a hit, even when it only adds lines.
+        for path in ("backend/tests/conftest.py", "backend/tests/helpers.py", "backend/tests/__init__.py"):
+            with self.subTest(path=path):
+                self.assertEqual(flagged(base, {path: base.get(path, "") + added}), {path})
+        # (3) C/C++ test edits keep today's rule: a new Unity test is a hit. So does a file the guard cannot
+        # parse (a JavaScript test, a data file), and a Python test in a test directory that holds C/C++.
+        unity = "firmware/test/test_logic/test_main.cpp"
+        new_unity = DESK_UNITY.replace("int main() {\n", "void test_clamp_high(void) {\n  TEST_ASSERT_EQUAL(10, clamp(50, 0, "
+                                       "10));\n}\nint main() {\n").replace("  RUN_TEST(test_clamp_low);\n",
+                                                                           "  RUN_TEST(test_clamp_low);\n  RUN_TEST(test_clamp_high);\n")
+        js = "backend/tests/api.test.js"
+        js_base = dict(base, **{js: "test('health', () => {\n  expect(1).toBe(1);\n});\n"})
+        js_added = js_base[js] + "\ntest('reset', () => {\n  expect(2).toBe(2);\n});\n"
+        firmware_py = "firmware/test/test_logic/test_gen.py"
+        for start, change, expected in (
+                (base, {unity: new_unity}, {unity}),
+                (js_base, {js: js_added}, {js}),
+                (base, {js: js_added}, {js}),
+                (base, {"backend/tests/data.json": "{}\n"}, {"backend/tests/data.json"}),
+                (dict(base, **{firmware_py: "def test_gen():\n    assert True\n"}),
+                 {firmware_py: "def test_gen():\n    assert True\n" + added}, {firmware_py})):
+            with self.subTest(change=sorted(change)):
+                self.assertEqual(flagged(start, change), expected)
+        [hit] = judge_commits(js_base, dict(js_base, **{js: js_added}))
+        self.assertEqual((hit.rule, hit.detail), ("removed-tests", TOUCHED))
+        # (4) Repositories that are not mixed are judged as before: no C/C++, so no fail-closed hits at all.
+        python_only = {p: t for p, t in base.items() if p.startswith("backend/")}
+        self.assertEqual(flagged(python_only, {test_api: api + added}), set())
+        self.assertEqual(flagged(python_only, {test_api: fewer}), {test_api})
+
     # Issue #43: a C/C++ test source, its old and new text, judged through a full-context diff.
     UNITY_SRC = ('#include <unity.h>\n#include "logic.h"\n\nvoid setUp(void) {}\nvoid tearDown(void) {}\n\n'
                  'void test_clamp_low(void) {\n    TEST_ASSERT_EQUAL(0, clamp(-5, 0, 10));\n'
