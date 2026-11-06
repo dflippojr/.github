@@ -1711,6 +1711,17 @@ class RuleDetails(unittest.TestCase):
                                                                     "    int failures = UNITY_END();\n    return failures;"),
                                register=False).replace("    int failures", "    RUN_TEST(test_clamp_mid);\n    int failures"),
                 tail),
+            "a project macro named like an assertion": (
+                g.replace("  EXPECT_EQ(0, clamp", "  EXPECT_SKIP_IF(board() == 0);\n  EXPECT_EQ(0, clamp"),
+                g.replace("  EXPECT_EQ(0, clamp", "  EXPECT_SKIP_IF(board() == 1);\n  EXPECT_EQ(0, clamp"),
+                "not an assertion macro call"),
+            "a new test registered in setup while loop runs tests": (
+                u.replace("int main(int argc, char **argv)", "void loop() {\n    RUN_TEST(test_clamp_low);\n}\n\n"
+                          "void setup()"),
+                u.replace("int main(int argc, char **argv)", "void test_clamp_mid(void) {\n    TEST_ASSERT_TRUE(1);\n}"
+                          "\n\nvoid loop() {\n    RUN_TEST(test_clamp_low);\n}\n\nvoid setup()").replace(
+                    "    return UNITY_END", "    RUN_TEST(test_clamp_mid);\n    return UNITY_END"),
+                "runs tests outside main, setup and app_main"),
             "a new GoogleTest test between existing ones": (g, g.replace("TEST_F(ClampTest, High)", "TEST(Clamp, Mid) {\n"
                                                                          "  EXPECT_EQ(5, clamp(5, 0, 10));\n}\n\n"
                                                                          "TEST_F(ClampTest, High)"),

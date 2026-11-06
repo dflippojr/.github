@@ -164,9 +164,15 @@ guard can read it as the compiler does and its change does nothing but these
   with a minus sign, `true` or `false`, a string literal with the same prefix,
   or a character literal), or, where an argument is one comparison (`==`,
   `!=`, `<`, `<=`, `>`, `>=`), its operator and a literal operand. Assertions
-  are Unity's `TEST_ASSERT*`, GoogleTest's `EXPECT_*` and `ASSERT_*` (not
-  `EXPECT_CALL`), and Catch2's and doctest's `REQUIRE*` and `CHECK*`, each a
-  statement of its own, `MACRO(...);`. A test is Unity's `void test_name(void)`,
+  are the frameworks' own macros, each a statement of its own, `MACRO(...);`:
+  Unity's `TEST_ASSERT` and the `TEST_ASSERT_*` names built from its words
+  (`TEST_ASSERT_EQUAL_UINT32`, `TEST_ASSERT_FLOAT_WITHIN`), GoogleTest's
+  `EXPECT_*` and `ASSERT_*` (`EQ`, `NE`, `LT`, `LE`, `GT`, `GE`, `TRUE`,
+  `FALSE`, the string, float and exception checks, `NEAR`, `THAT`, `PRED*`,
+  `DEATH`, `EXIT`; not `EXPECT_CALL`), and Catch2's and doctest's `REQUIRE`,
+  `CHECK` and their `_FALSE`, `_THAT`, `_THROWS*`, `_NOTHROW`, comparison and
+  `_UNARY` forms, any of them ending in `_MESSAGE`. A project macro named like
+  one (`EXPECT_SKIP_IF`) is not an assertion. A test is Unity's `void test_name(void)`,
   GoogleTest's `TEST` or `TEST_F`, or a Catch2 or doctest `TEST_CASE` of plain
   strings. A changed assertion may hold no `&&`, `||`, `?:`, assignment, `++`,
   `--`, `throw` or `return`, no name of a macro the file defines, and, for a
@@ -191,7 +197,9 @@ guard can read it as the compiler does and its change does nothing but these
   `TEST_F` or `TEST_CASE` comes after every existing test, and a new Unity
   test is registered, if at all, only with `RUN_TEST(name);` in `main`,
   Arduino's `setup` or ESP-IDF's `app_main`, after every statement but
-  `UNITY_END();`, `return UNITY_END();`, `return 0;` and directives.
+  `UNITY_END();`, `return UNITY_END();`, `return 0;` and directives, and only
+  in a file where no other code names `RUN_TEST` (Arduino's `loop` runs after
+  `setup`).
 
 Comments, blank lines and how a statement is split across lines do not count:
 the guard compares tokens. Anything else is a hit: an assertion added, removed
@@ -211,8 +219,10 @@ with the lines around them. The guard does not expand macros from headers or
 follow the code a test reaches, so an exempt change can still give that code
 other values, and a new test can still run code the file already names (a
 function that ends the process, or an out-of-bounds write through a pointer
-the file already uses). A runner set to shuffle tests can run a new test
-before the existing ones.
+the file already uses). A new test runs after its own file's tests, not
+necessarily after another file's in the same binary, and a runner set to
+shuffle tests can run it first. A new Unity test that is not `static` can
+replace a weak function of the same name elsewhere.
 
 Unity `RUN_TEST(name)` registrations and `void test_name(void)` definitions are
 still counted, so a hit names the tests a change removed. Editing a source or

@@ -961,9 +961,20 @@ C_BRACKETS = {"(": ")", "[": "]", "{": "}"}
 # An int or float literal, with no user-defined suffix.
 C_NUMBER = re.compile(r"(?:0[xX][\da-fA-F'.]+(?:[pP][-+]?\d+)?|0[bB][01']+"
                       r"|(?:\d[\d']*(?:\.[\d']*)?|\.\d[\d']*)(?:[eE][-+]?\d+)?)[uUlLfFzZ]*")
-# Assertion macros: Unity's TEST_ASSERT*, GoogleTest's EXPECT_*/ASSERT_* (not the
-# mock expectation EXPECT_CALL), and Catch2's and doctest's REQUIRE*/CHECK*.
-C_ASSERT = re.compile(r"(?:TEST_ASSERT(?:_\w+)?|EXPECT_(?!CALL$)\w+|ASSERT_\w+|REQUIRE(?:_\w+)?|CHECK(?:_\w+)?)$")
+# The frameworks' own assertion macros, by name, so a project macro such as
+# EXPECT_SKIP_IF or CHECK_OR_IGNORE is not one: Unity's TEST_ASSERT and the
+# TEST_ASSERT_* names built from its words, GoogleTest's EXPECT_* and ASSERT_*
+# (not the mock expectation EXPECT_CALL), and Catch2's and doctest's REQUIRE*
+# and CHECK*. Any may end in _MESSAGE.
+C_UNITY_WORDS = ("TRUE|FALSE|UNLESS|NULL|NOT|EMPTY|EQUAL|BITS|BIT|HIGH|LOW|GREATER|LESS|THAN|OR|EACH|WITHIN|ARRAY|"
+                 "INT|INT8|INT16|INT32|INT64|UINT|UINT8|UINT16|UINT32|UINT64|HEX|HEX8|HEX16|HEX32|HEX64|CHAR|size_t|"
+                 "PTR|STRING|LEN|MEMORY|FLOAT|DOUBLE|IS|INF|NEG|NAN|DETERMINATE")
+C_ASSERT = re.compile(
+    rf"(?:TEST_ASSERT(?:_(?:{C_UNITY_WORDS}))*"
+    r"|(?:EXPECT|ASSERT)_(?:TRUE|FALSE|EQ|NE|LT|LE|GT|GE|STREQ|STRNE|STRCASEEQ|STRCASENE|FLOAT_EQ|DOUBLE_EQ|NEAR"
+    r"|THROW|ANY_THROW|NO_THROW|DEATH|DEBUG_DEATH|EXIT|NO_FATAL_FAILURE|THAT|PRED[1-5]|PRED_FORMAT[1-5])"
+    r"|(?:REQUIRE|CHECK)(?:_(?:FALSE|THAT|THROWS|THROWS_AS|THROWS_WITH|THROWS_MATCHES|NOTHROW|EQ|NE|GT|LT|GE|LE"
+    r"|UNARY|UNARY_FALSE))?)(?:_MESSAGE)?$")
 C_COMPARE = {"==", "!=", "<", "<=", ">", ">="}
 # Tokens that may be a comparison or a template's angle bracket: an argument with more than one is not read
 # as a comparison.
@@ -1309,11 +1320,15 @@ def _c_test_name(test):
     return test[1] if test[0] != "gtest" else f"{test[1]}.{test[2]}"
 
 
-def _c_runner_change(old, new, unity):
+def _c_runner_change(old, new, unity, others):
     """Why changing the function old to new is more than registering new Unity tests (names in unity) with
-    RUN_TEST in a program's entry point, after every test it already runs, or None."""
+    RUN_TEST in a program's entry point, after every test it already runs, or None. others is whether code of
+    the old file outside its entry points names RUN_TEST, so it may run tests after them (Arduino's loop)."""
     if old.head[:3] not in C_ENTRY or new.head != old.head:
         return "it changes code outside a test body: a helper, a fixture, a declaration or a runner"
+    if others:
+        return (f"it registers a new test in {old.head[1]} of a file that runs tests outside main, setup and "
+                "app_main too, which may run after it")
     runner = f"it changes the runner {old.head[1]} other than by adding RUN_TEST(name); once for each new test"
     statements = [_c_statements(old.body), _c_statements(new.body)]
     keys = [[_c_texts(s) for s in side] for side in statements]
@@ -1501,7 +1516,9 @@ def _c_cpp_unexempt(fd):
         if why:
             return why
     unity = {i.test[1] for i in added if i.test[0] == "unity"}
-    why = _c_pair(items[0], items[1], {id(i) for i in added}, unity, macros)
+    others = any(t.text == "RUN_TEST" for i in items[0] if not (i.kind == "function" and i.head[:3] in C_ENTRY)
+                 for t in i.tokens)
+    why = _c_pair(items[0], items[1], {id(i) for i in added}, unity, macros, others)
     if why:
         return why
     flat = list(_c_flat(items[1]))
@@ -1513,7 +1530,7 @@ def _c_cpp_unexempt(fd):
     return None
 
 
-def _c_pair(old, new, added, unity, macros):
+def _c_pair(old, new, added, unity, macros, others):
     """Why the items new, with the new tests (ids in added) left out, are more than the items old with
     assertions replaced in existing tests and new tests registered in a runner, or None."""
     rest = [i for i in new if id(i) not in added]
@@ -1523,9 +1540,9 @@ def _c_pair(old, new, added, unity, macros):
         if a.key == b.key:
             continue
         if a.kind == b.kind == "scope" and a.head == b.head:
-            why = _c_pair(a.children, b.children, added, unity, macros)
+            why = _c_pair(a.children, b.children, added, unity, macros, others)
         elif a.kind == b.kind == "function" and a.head == b.head:
-            why = _c_test_change(a, b, macros) if a.test else _c_runner_change(a, b, unity)
+            why = _c_test_change(a, b, macros) if a.test else _c_runner_change(a, b, unity, others)
         else:
             why = ("it changes code outside a test body: a test's header, a helper, a fixture, a declaration, a "
                    "directive or a runner")
