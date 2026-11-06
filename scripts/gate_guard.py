@@ -933,12 +933,14 @@ def _python_unexempt(fd):
 # outside comments and literals that is not ASCII, an unterminated comment or
 # literal, a stray # or ##, unbalanced brackets, a preprocessor branch that
 # opens or closes a bracket it does not close or open, and __LINE__ or
-# __COUNTER__, whose values move with the lines around them.
+# __COUNTER__, whose values move with the lines around them. A comment or raw
+# string runs to its end or to the end of the text, so an unclosed one is read
+# once, not once for each opening after it.
 C_TOKEN = re.compile(r"""
     (?P<space>[ \t]+)
   | (?P<newline>\n)
-  | (?P<comment>//[^\n]*|/\*.*?\*/)
-  | (?P<raw>(?:u8|[uUL])?R"(?P<delim>[^()\\\s]{0,16})\(.*?\)(?P=delim)")
+  | (?P<comment>//[^\n]*|/\*.*?(?:\*/|\Z))
+  | (?P<raw>(?:u8|[uUL])?R"(?P<delim>[^()\\\s]{0,16})\(.*?(?:\)(?P=delim)"|\Z))
   | (?P<string>(?:u8|[uUL])?"(?:\\[ -~]|[^"\\\n])*")
   | (?P<char>(?:u8|[uUL])?'(?:\\[ -~]|[^'\\\n])+')
   | (?P<number>\.?\d(?:[eEpP][-+]|'(?=\w)|[\w.])*)
@@ -1057,6 +1059,9 @@ def _c_tokens(text):
             raise ValueError(f"line {line} holds {text[pos]!r}, which the guard does not read as C/C++ outside a "
                              "comment or literal, or opens a literal it does not close")
         kind, value, pos = m.lastgroup, m.group(), m.end()
+        if (kind == "comment" and value.startswith("/*") and (len(value) < 4 or not value.endswith("*/"))) or (
+                kind == "raw" and not value.endswith(")" + m.group("delim") + '"')):
+            raise ValueError(f"line {line} opens a comment or raw string it does not close")
         if kind == "newline":
             if directive:
                 tokens.append(CToken("directive", "#" + "".join(directive[1]), directive[0], True, line))

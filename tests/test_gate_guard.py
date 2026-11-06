@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -1760,6 +1761,14 @@ class RuleDetails(unittest.TestCase):
         spaced = [gate_guard._c_tokens(text)[0].text for text in ("#define F(x) x\n", "#define F (x) x\n",
                                                                      "#  define F(x) /* c */ x\n")]
         self.assertEqual(spaced, ["#define F(x) x", "#define F (x) x", "#define F(x) x"])
+        # An unclosed comment or raw string fails closed, read once however many openings follow it.
+        for text in ("int x; /*/", "x /*\n" * 50000, 'auto s = R"x(\n' * 50000, 'R"(a)" R"(b'):
+            with self.subTest(text=text[:12]):
+                started = time.monotonic()
+                with self.assertRaisesRegex(ValueError, "opens a comment or raw string it does not close"):
+                    gate_guard._c_tokens(text)
+                self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual([t.text for t in gate_guard._c_tokens('/**/ R"x()x" /* a */')], ['R"x()x"'])
         # A directive at the end of the text, with no newline after it, is a token too.
         self.assertEqual([(t.kind, t.text) for t in gate_guard._c_tokens("int x;\n#pragma once")],
                          [("name", "int"), ("name", "x"), ("punct", ";"), ("directive", "#pragma once")])
