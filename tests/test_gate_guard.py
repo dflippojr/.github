@@ -1544,7 +1544,7 @@ class RuleDetails(unittest.TestCase):
         passes; a removed test still trips the guard, and C/C++ and files the guard cannot parse fail closed."""
         api, base, test_api = DESK_API, DESK_TREE, "backend/tests/test_api.py"
         cls = "import pytest\n\n\nclass TestLimits:\n    def test_height(self):\n        assert True\n"
-        added = "\n\ndef test_reset():\n    assert create_app()\n"
+        added = "\n\ndef test_reset():\n    assert sorted([2, 1]) == [1, 2]\n"
 
         def flagged(start, change, drop=()):
             head = {p: t for p, t in dict(start, **change).items() if p not in drop}
@@ -1561,7 +1561,7 @@ class RuleDetails(unittest.TestCase):
                    (base, {test_api: "import pytest\n" + api + "\n\n@pytest.mark.parametrize('n', [1, 2])\n"
                                                               "def test_paths(n, tmp_path) -> None:\n    assert tmp_path\n"}),
                    (base, {test_api: api + "\n\nclass TestReset:\n    \"\"\"Reset.\"\"\"\n\n"
-                                           "    def test_reset(self):\n        assert create_app()\n"}),
+                                           "    def test_reset(self):\n        assert len('ab') == 2\n"}),
                    (dict(base, **{test_api: cls}), {test_api: cls + "\n    def test_width(self):\n        assert True\n"}),
                    (base, {"backend/tests/test_reset.py": new_module}),
                    (base, {"backend/tests/unit/test_reset.py": new_module})]
@@ -1748,24 +1748,13 @@ class RuleDetails(unittest.TestCase):
             with self.subTest(fixture_file=start_text):
                 hit = judge_commits(dict(base, **{test_api: start_text}), dict(base, **{test_api: start_text + added}))
                 self.assertEqual([(h.path, "fixture" in h.detail) for h in hit], [(test_api, True)])
-        # Controls that still pass: a body of assertions, calls and local names over what the module imported, a
-        # parameter an existing test already requests, an inert built-in fixture, a literal parametrize, and a new
-        # module of tests over literals.
-        requested = api + "\n\ndef test_client(client):\n    assert client\n"
+        # A control that still passes: a new module of tests over literals, with a literal parametrize (review round
+        # 2 made calls of imported code and fixtures hits; see the next test).
         new_module = ('"""Reset checks."""\nimport pytest\n\nHEIGHTS = (60, 120)\n\n\n'
                       "@pytest.mark.parametrize('height, ok', [(60, True), (-1, False)])\ndef test_reset(height, ok):\n"
                       "    assert (height in HEIGHTS) == ok\n\n\nclass TestReset:\n    def test_twice(self):\n"
                       "        assert len(HEIGHTS) == 2\n")
-        for start, change in (
-                (dict(base, **{test_api: "import pytest\n" + api}),
-                 {test_api: body(["app = create_app()", "height: int = app.max_height", "height += 0",
-                                  "assert height == pytest.approx(120), f'{height}'", "assert [*app.limits]"],
-                                 "tmp_path, capsys", "import pytest\n" + api)}),
-                (dict(base, **{test_api: requested}), {test_api: body(["assert client.get('/') == {'ok': True}"],
-                                                                     "client", requested)}),
-                (base, {"backend/tests/test_reset.py": new_module})):
-            with self.subTest(change=change):
-                self.assertEqual(flagged(start, change), set())
+        self.assertEqual(flagged(base, {"backend/tests/test_reset.py": new_module}), set())
         # Finding 3: a Python test module beside C/C++ tests under one test directory is judged per file, as
         # Python. PlatformIO's custom test runner, which reads the C/C++ results, is not a Python test.
         shared = {"src/logic.cpp": "int clamp(int v) { return v; }\n", "backend/app.py": "def create_app():\n    pass\n",
@@ -1774,12 +1763,62 @@ class RuleDetails(unittest.TestCase):
         fewer = api.split("\n\n\ndef test_height_limits")[0] + "\n"
         runner = "test/test_custom_runner.py"
         for start, change, expected in (
-                (shared, {"tests/backend/test_api.py": api + added}, set()),
+                (shared, {"tests/backend/test_api.py": api + added.replace("create_app()", "sorted([2, 1])")}, set()),
                 (shared, {"tests/backend/test_api.py": fewer}, {"tests/backend/test_api.py"}),
                 (dict(base, **{runner: "def test_one():\n    assert True\n"}),
                  {runner: "def test_one():\n    assert True\n\n\ndef test_two():\n    assert True\n"}, {runner})):
             with self.subTest(change=change):
                 self.assertEqual(flagged(start, change), expected)
+
+    def test_mixed_repository_added_tests_call_and_read_only_what_the_guard_can_prove(self):
+        """Issue #54, review round 2 and the owner's fail-closed rule: an added test's body calls only builtins that
+        compute a value and pytest.approx, reads attributes only of its own names and literals, assigns in place
+        nothing, and reads no module binding but an immutable literal. So a call of code the module imports, a
+        fixture, traversal through an allowed module, and an alias of a shared mutable value are hits."""
+        api, base, test_api = DESK_API, DESK_TREE, "backend/tests/test_api.py"
+
+        def flagged(start, change):
+            return {h.path for h in judge_commits(dict(base, **{test_api: start}), dict(base, **{test_api: change}))}
+
+        def before_health(start, lines, params=""):
+            test = f"def test_000_added({params}):\n" + "".join(f"    {l}\n" for l in lines) + "\n\n"
+            return start.replace("def test_health(", test + "def test_health(", 1)
+
+        # Finding 1: traversal through a module the file already imports reaches os._exit with no forbidden name.
+        warned = "import warnings\n" + api
+        cases = "from backend.app import create_app\n\nCASES = [1]\n\n\ndef test_health():\n" \
+                "    for value in CASES:\n        assert create_app(value)\n"
+        hits = [(warned, ["warnings.sys.modules['builtins'].getattr(", "    warnings.sys.modules['os'], '_exit')(0)"]),
+                (warned, ["assert warnings"]),
+                # Finding 2: a local alias of a shared mutable literal emptied in place, with no call; and the same
+                # through a method, a read of the list, and any augmented assignment.
+                (cases, ["values = CASES", "values *= 0"]), (cases, ["CASES.clear()"]),
+                (cases, ["assert sorted(CASES)"]), (cases, ["count = 1", "count += 1"]),
+                # Calls and reads the guard cannot follow: code the module imports, a method, a fixture.
+                (api, ["assert create_app()"]), (api, ["probe = create_app"]), (api, ["assert create_app.ready"]),
+                (api, ["text = 'a'", "assert text.upper() == 'A'"]), (api, ["assert print.__self__"])]
+        for start, lines in hits:
+            with self.subTest(lines=lines):
+                self.assertEqual(flagged(start, before_health(start, lines)), {test_api})
+        requested = api + "\n\ndef test_client(client):\n    assert client\n"
+        for start, lines, params in ((requested, ["assert client"], "client"), (api, ["assert tmp_path"], "tmp_path"),
+                                     (api, ["assert capsys"], "capsys")):
+            with self.subTest(params=params):
+                self.assertEqual(flagged(start, before_health(start, lines, params)), {test_api})
+        cls = "class TestLimits:\n    limits = [60]\n\n    def test_height(self):\n        assert self.limits\n"
+        for method in ("        assert self.limits\n", "        values = self.limits\n"):
+            with self.subTest(method=method):
+                self.assertEqual(flagged(cls, cls + "\n    def test_width(self):\n" + method), {test_api})
+        # Controls: builtins that compute a value, pytest.approx, a literal parametrize, a literal default, local
+        # names and their attributes, and an immutable literal the module binds.
+        start = "import pytest\n" + api.replace("\n\n\ndef test_health", "\n\nLIMITS = (60, 120)\n\n\ndef test_health")
+        passing = before_health(start, ["value = abs(-n)", "assert value == pytest.approx(n), f'{value!r}'",
+                                        "assert isinstance(value, int)", "assert (1).real == 1",
+                                        "assert sorted(LIMITS, key=abs) == [60, 120]", "pair = (value, limit)",
+                                        "assert pair[0] == n", "assert list(map(len, ['ab'])) == [2]"],
+                                "n, limit=3").replace("def test_000_added", "@pytest.mark.parametrize('n', [1, 2])\n"
+                                                                           "def test_000_added")
+        self.assertEqual(flagged(start, passing), set())
 
     # Issue #43: a C/C++ test source, its old and new text, judged through a full-context diff.
     UNITY_SRC = ('#include <unity.h>\n#include "logic.h"\n\nvoid setUp(void) {}\nvoid tearDown(void) {}\n\n'
