@@ -1,7 +1,7 @@
 # gate-guard fixture: #define TEST_ASSERT_EQUAL(...) added, so the assertions expand to nothing
 # expect: removed-tests
 # hits: 1
-# detail: changes a directive line
+# detail: the guard does not expand macros
 
 diff --git a/firmware/test/test_logic/test_main.cpp b/firmware/test/test_logic/test_main.cpp
 index e6309a0..5b09113 100644

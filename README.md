@@ -178,8 +178,7 @@ any of them ending in `_MESSAGE`. A project macro named like one
 (`EXPECT_SKIP_IF`) is not an assertion. A test is Unity's `void
 test_name(void)`, GoogleTest's `TEST` or `TEST_F`, or a Catch2 or doctest
 `TEST_CASE` of plain strings. A changed assertion may hold no `&&`, `||`,
-`?:`, assignment, `++`, `--`, `throw` or `return`, no name of a macro the file
-defines, and, for a `*_MESSAGE` macro, no message but string literals, which
+`?:`, assignment, `++`, `--`, `throw` or `return`, and, for a `*_MESSAGE` macro, no message but string literals, which
 may run only when the assertion fails: Unity's message is its last argument,
 and doctest's (`CHECK_MESSAGE(cond, ...)`, variadic and logged lazily), like
 any other framework's, is every argument after the first.
@@ -210,11 +209,13 @@ close a helper and open a test at the same depth), a conditional directive
 inside a statement or declaration (anywhere but the start of the file or after
 `;`, `{` or `}`), an `#include`, `#embed` or other directive that brings in
 text inside a function or any other bracket but a namespace or `extern "C"`
-scope (it could close the test and open a helper), a `#define` whose
-replacement does not close every bracket it opens or closes one it did not
-open (`#define SPLIT } void helper(void) {`), a test whose name is a macro the
-file defines, and any use of `__LINE__` or `__COUNTER__`, whose
-values move with the lines around them. The guard does not read included files, expand macros from
+scope (it could close the test and open a helper), any `#define` or `#undef`
+in the file, and any use of `__LINE__` or `__COUNTER__`, whose values move with
+the lines around them. The guard reads code as written, not expanded, and a
+macro can give it any meaning: close a test and open a helper (`#define SPLIT
+} void helper(void) {`, or the same braces pasted from `%` and `>` with `##`),
+rename a test, or make `namespace` mean `struct`. So a test source with macros
+of its own is never exempt, whatever they hold. The guard does not read included files, expand macros from
 headers or follow the code a test reaches, so an exempt change can still give
 that code other values. For the same reason, a header's macro (`#define
 test_name helper`, or one whose replacement closes a test and opens a helper),

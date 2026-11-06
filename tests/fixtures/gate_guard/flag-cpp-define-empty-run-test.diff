@@ -1,7 +1,7 @@
 # gate-guard fixture: #define RUN_TEST(x) added, so no registration runs
 # expect: removed-tests
 # hits: 1
-# detail: changes a directive line
+# detail: the guard does not expand macros
 
 diff --git a/firmware/test/test_logic/test_main.cpp b/firmware/test/test_logic/test_main.cpp
 index e6309a0..300941a 100644

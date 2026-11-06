@@ -958,12 +958,9 @@ C_PRINTABLE = re.compile(r"[ -~\t]*")
 C_MOVING = re.compile(r"\b__(?:LINE|COUNTER)__\b")
 C_CONDITIONAL = re.compile(r"#\s*(if|ifdef|ifndef|elif|elifdef|elifndef|else|endif)\b")
 C_DEFINE = re.compile(r"#\s*(?:define|undef)\s+([A-Za-z_]\w*)")
-# A #define: its name, and its replacement after the parameters of a function-like macro, which follow the name
-# with no space between.
-C_DEFINITION = re.compile(r"#\s*define\s+([A-Za-z_]\w*)(?:\([^)]*\))?(.*)", re.S)
 # The directives that bring in no text, allowed inside a function or other bracket (see _c_branches): the null
 # directive and a GNU line marker (# 7 "x.c") too.
-C_INERT = re.compile(r"#\s*(?:(?:define|undef|pragma|line|error|warning)\b|\d|$)")
+C_INERT = re.compile(r"#\s*(?:(?:pragma|line|error|warning)\b|\d|$)")
 # What comes before the { of a namespace or extern "C" scope, read backwards: no function body opens there.
 C_SCOPE_HEAD = re.compile(r'^(?:"C(?:\+\+)?" extern|(?:\w+(?: :: \w+)* )?namespace(?: inline)?)(?: |$)')
 C_BRACKETS = {"(": ")", "[": "]", "{": "}"}
@@ -1088,8 +1085,8 @@ def _c_match(tokens, i):
 
 def _c_branches(tokens):
     """ValueError unless where each bracket, statement and function starts and ends, as the guard reads the file
-    with every preprocessor branch in, no included text and no macro expanded, is where the compiler finds it,
-    whichever branches it takes, whatever a directive brings in and whatever a macro of the file expands to:
+    with every preprocessor branch in and no included text, is where the compiler finds it, whichever branches
+    it takes and whatever a directive brings in:
 
     - each branch of a conditional closes every bracket it opens, and no bracket opened before it, so a branch
       cannot close one function and open another at the same depth;
@@ -1097,11 +1094,11 @@ def _c_branches(tokens):
       after ;, { or }, so a branch cannot end a statement that the code after it continues (if (x) then a
       dead ;);
     - inside a bracket other than a namespace or extern "C" scope (a function body, say), a directive is only
-      a conditional, #define, #undef (the guard reads the names they define), #pragma, #line, #error,
-      #warning or the null directive: not #include or #embed, whose text may close the function and open
-      another;
-    - each #define's replacement closes every bracket it opens, and no other, so a macro cannot close a test
-      and open a helper where it is used (_c_directive).
+      a conditional, #pragma, #line, #error, #warning or the null directive: not #include or #embed, whose
+      text may close the function and open another;
+    - the file defines and undefines no macro. The guard reads code as written, not expanded, and a macro can
+      give its code any meaning: close a test and open a helper, paste brace digraphs with ##, or make
+      namespace mean struct. A file of its own macros is not exempt, rather than one trick at a time.
     """
     brackets, arms, seen, unopened = [], [], [], 0
     for t in tokens:
@@ -1129,11 +1126,11 @@ def _c_directive(t, brackets, arms, last):
     (_c_branches). Updates arms."""
     m = C_CONDITIONAL.match(t.text)
     if not m:
-        definition = C_DEFINITION.match(t.text)
-        if definition and not _c_balanced(definition.group(2)):
-            raise ValueError(f"line {t.line} holds a #define whose replacement does not close every bracket it "
-                             f"opens, or closes one it does not open: {definition.group(1)} may end a test and "
-                             "begin a helper where it is used")
+        defined = C_DEFINE.match(t.text)
+        if defined:
+            raise ValueError(f"line {t.line} defines or undefines the macro {defined.group(1)}; the guard does not "
+                             "expand macros, so it cannot tell where a test starts and ends in a file that has its "
+                             "own")
         if not all(brackets) and not C_INERT.match(t.text):
             raise ValueError(f"line {t.line} holds {t.text.split()[0]} inside a bracket, where the text it brings "
                              "in may end a function and begin another")
@@ -1148,24 +1145,6 @@ def _c_directive(t, brackets, arms, last):
                          "conditionals do not pair")
     elif m.group(1) == "endif":
         arms.pop()
-
-
-def _c_balanced(text):
-    """Whether each bracket in text, a macro's replacement, is closed in order by one it opens, outside literals."""
-    want, pos = [], 0
-    while pos < len(text):
-        m = C_TOKEN.match(text, pos)
-        if not m:
-            pos += 1
-            continue
-        pos = m.end()
-        if m.lastgroup != "punct":
-            continue
-        if m.group() in C_BRACKETS:
-            want.append(C_BRACKETS[m.group()])
-        elif m.group() in (")", "]", "}") and (not want or want.pop() != m.group()):
-            return False
-    return not want
 
 
 def _c_items(tokens, lo, hi):
@@ -1315,7 +1294,7 @@ def _c_masked(arg):
     return _c_operand(arg)
 
 
-def _c_assert_change(old, new, name, macros):
+def _c_assert_change(old, new, name):
     """Why replacing the statement old of the test name with new is more than changing an assertion's literal
     arguments and the literal operands and operator of a comparison that is a whole argument, or None."""
     calls = [_c_assertion(s) for s in (old, new)]
@@ -1327,9 +1306,6 @@ def _c_assert_change(old, new, name, macros):
         if unsafe:
             return (f"it changes an assertion in {name} that holds {unsafe}, which decides what else it runs, "
                     "assigns or steps a value, or leaves the test")
-        defined = next((t.text for t in statement if t.text in macros), None)
-        if defined:
-            return f"it changes an assertion in {name} that names {defined}, a macro the file defines"
         if re.search(r"MESSAGE|_MSG$", macro):
             # Unity's message is its macro's last argument. doctest's message is every argument after the first
             # (CHECK_MESSAGE(cond, ...) logs them all lazily), and so is any other framework's, read as variadic.
@@ -1348,13 +1324,10 @@ def _c_assert_change(old, new, name, macros):
     return None
 
 
-def _c_test_change(old, new, macros):
+def _c_test_change(old, new):
     """Why changing the existing test old to new is more than replacing assertions of its own body, each by one
     that differs only in literals and comparison operators (_c_assert_change), or None."""
     name = _c_test_name(new.test)
-    renamed = next((w for w in new.head if w in macros), None)
-    if renamed:
-        return f"it changes {name}, whose header names {renamed}, a macro the file defines, so it may not be a test"
     statements = [_c_statements(old.body), _c_statements(new.body)]
     keys = [[_c_texts(s) for s in side] for side in statements]
     for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, *keys, autojunk=False).get_opcodes():
@@ -1363,7 +1336,7 @@ def _c_test_change(old, new, macros):
         if i2 - i1 != j2 - j1:
             return f"it adds, removes or moves a statement in {name}"
         for a, b in zip(statements[0][i1:i2], statements[1][j1:j2]):
-            why = _c_assert_change(a, b, name, macros)
+            why = _c_assert_change(a, b, name)
             if why:
                 return why
     return None
@@ -1420,8 +1393,6 @@ def _c_cpp_unexempt(fd):
         return "it changes a directive line, which the guard does not read"
     if any(t.kind in ("name", "directive") and C_MOVING.search(t.text) for side in tokens for t in side):
         return "it names __LINE__ or __COUNTER__, whose values move with the lines around them"
-    macros = {m.group(1) for side in tokens for t in side if t.kind == "directive"
-              for m in [C_DEFINE.match(t.text)] if m}
     tests = [[i for i in _c_flat(side) if i.test] for side in items]
     old = {i.test for i in tests[0]}
     if len(old) != len(tests[0]) or len({i.test for i in tests[1]}) != len(tests[1]):
@@ -1433,10 +1404,10 @@ def _c_cpp_unexempt(fd):
     if added:
         return (f"it adds the test {_c_test_name(added.test)}; a new test can run any code the file reaches, so "
                 "it is not exempt")
-    return _c_pair(items[0], items[1], macros)
+    return _c_pair(items[0], items[1])
 
 
-def _c_pair(old, new, macros):
+def _c_pair(old, new):
     """Why the items new are more than the items old with assertions replaced in existing tests, or None."""
     if len(new) != len(old):
         return "it adds, removes or moves code outside a test body, or removes a test"
@@ -1444,9 +1415,9 @@ def _c_pair(old, new, macros):
         if a.key == b.key:
             continue
         if a.kind == b.kind == "scope" and a.head == b.head:
-            why = _c_pair(a.children, b.children, macros)
+            why = _c_pair(a.children, b.children)
         elif a.kind == b.kind == "function" and a.head == b.head and a.test:
-            why = _c_test_change(a, b, macros)
+            why = _c_test_change(a, b)
         else:
             why = ("it changes code outside a test body: a test's header, a helper, a fixture, a declaration, a "
                    "directive or a runner")

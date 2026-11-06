@@ -25,6 +25,7 @@ TOUCHED = ("modified a file in a test directory of a C/C++ repository; the guard
 C_SOURCE = ("modified a C/C++ test source of a C/C++ repository: {}; only replacing literals or comparison operators "
             "in assertions of existing tests is exempt, so this needs approval")
 DIRECTIVE = "it changes a directive line, which the guard does not read"
+MACRO = "the guard does not expand macros"
 SPLICE = "it splices a line with a backslash at its end"
 RUNNER = ("it changes code outside a test body: a test's header, a helper, a fixture, a declaration, a directive or "
           "a runner")
@@ -622,7 +623,10 @@ class RuleDetails(unittest.TestCase):
                      "flag-fewer-tests-cpp-preprocessor-edit"):
             with self.subTest(fixture=name):
                 [hit] = self.hits(name)
-                self.assertEqual(hit.detail, detail)
+                if name == "flag-fewer-tests-cpp-undef-moved":
+                    self.assertIn(MACRO, hit.detail)
+                else:
+                    self.assertEqual(hit.detail, detail)
         changes = {
             "a registration wrapped in #if 0": """ void test_a(void) {}
  int main() {
@@ -720,6 +724,9 @@ class RuleDetails(unittest.TestCase):
         for name, body in changes.items():
             with self.subTest(name):
                 hits = analyze_text(self.platformio_diff(body, main))
+                if name in ("a changed condition around a #define", "a #define added"):
+                    self.assertTrue(any(MACRO in h.detail for h in hits), hits)
+                    continue
                 why = SPLICE if name in ("an edited continuation line", "a line spliced onto a directive") else DIRECTIVE
                 self.assertIn(C_SOURCE.format(why), [h.detail for h in hits])
         # A header in a test directory can turn tests off too.
@@ -805,8 +812,7 @@ class RuleDetails(unittest.TestCase):
 """, "test/test_c/test_main.cpp")
         hits = {h.path: h.detail for h in analyze_text(diff)}
         self.assertEqual(set(hits), {"test/test_a/test_main.cpp", "test/test_c/test_main.cpp"})
-        self.assertEqual(hits["test/test_c/test_main.cpp"], C_SOURCE.format(
-            "it adds the test test_b; a new test can run any code the file reaches, so it is not exempt"))
+        self.assertIn(MACRO, hits["test/test_c/test_main.cpp"])
 
     def test_earlier_preprocessor_escapes_are_hits(self):
         """Rounds 8 and 9: alternative directive spellings and trigraphs. The guard no longer
@@ -1560,13 +1566,9 @@ class RuleDetails(unittest.TestCase):
             "an #include in a namespace scope": (
                 "namespace desk {\n#include \"cases.h\"\n}\n" + u, "namespace desk {\n#include \"cases.h\"\n}\n" + u.replace(
                     "EQUAL(0,", "EQUAL(1,")),
-            "a #pragma, #define and line marker in a test body": (
-                u.replace("void test_clamp_low(void) {\n", "void test_clamp_low(void) {\n#pragma GCC diagnostic ignored \"-Wall\"\n#define LIMIT 10\n# 9 \"t.c\"\n"),
-                u.replace("void test_clamp_low(void) {\n", "void test_clamp_low(void) {\n#pragma GCC diagnostic ignored \"-Wall\"\n#define LIMIT 10\n# 9 \"t.c\"\n").replace(
-                    "EQUAL(0,", "EQUAL(1,")),
-            "balanced macros, a brace in a string and an object-like (x)": (
-                u.replace("void setUp", "#define WRAP(x) do { (x); } while (0)\n#define BRACE \"}\"\n#define F (x) [x]\nvoid setUp"),
-                u.replace("void setUp", "#define WRAP(x) do { (x); } while (0)\n#define BRACE \"}\"\n#define F (x) [x]\nvoid setUp").replace(
+            "a #pragma and line marker in a test body": (
+                u.replace("void test_clamp_low(void) {\n", "void test_clamp_low(void) {\n#pragma GCC diagnostic ignored \"-Wall\"\n# 9 \"t.c\"\n"),
+                u.replace("void test_clamp_low(void) {\n", "void test_clamp_low(void) {\n#pragma GCC diagnostic ignored \"-Wall\"\n# 9 \"t.c\"\n").replace(
                     "EQUAL(0,", "EQUAL(1,")),
             "an assertion in a whole-statement branch": (
                 u.replace("    TEST_ASSERT_EQUAL(0,", "#ifdef HW\n    TEST_ASSERT_EQUAL(0,").replace("10));\n", "10));\n#endif\n", 1),
@@ -1662,17 +1664,21 @@ class RuleDetails(unittest.TestCase):
                 u.replace("clamp(-5, 0, 10)", "clamp(\n#include \"args.inc\"\n)"),
                 u.replace("clamp(-5, 0, 10)", "clamp(\n#include \"args.inc\"\n)").replace("EQUAL(0,", "EQUAL(1,"),
                 "holds #include inside a bracket"),
+            "balanced macros, a brace in a string and an object-like (x)": (
+                u.replace("void setUp", "#define WRAP(x) do { (x); } while (0)\n#define BRACE \"}\"\n#define F (x) [x]\nvoid setUp"),
+                u.replace("void setUp", "#define WRAP(x) do { (x); } while (0)\n#define BRACE \"}\"\n#define F (x) [x]\nvoid setUp").replace(
+                    "EQUAL(0,", "EQUAL(1,"), MACRO),
             "a macro that opens a bracket": (u.replace("void setUp", "#define OPEN {\nvoid setUp"),
                                              u.replace("void setUp", "#define OPEN {\nvoid setUp").replace("EQUAL(0,", "EQUAL(1,"),
-                                             "OPEN may end a test and begin a helper"),
+                                             MACRO),
             "a function-like macro whose brackets cross": (
                 u.replace("void setUp", "#define CROSS(x) ( x ]\nvoid setUp"),
                 u.replace("void setUp", "#define CROSS(x) ( x ]\nvoid setUp").replace("EQUAL(0,", "EQUAL(1,"),
-                "CROSS may end a test and begin a helper"),
+                MACRO),
             "a test renamed by a #define in the file": (
                 u.replace("void setUp", "#define test_clamp_low helper\nvoid setUp"),
                 u.replace("void setUp", "#define test_clamp_low helper\nvoid setUp").replace("EQUAL(0,", "EQUAL(1,"),
-                "whose header names test_clamp_low, a macro the file defines"),
+                MACRO),
             "EXPECT_CALL, a mock expectation": (g.replace("EXPECT_EQ(0, clamp(-5, 0, 10));", "EXPECT_CALL(mock, Read(0));"),
                                                 g.replace("EXPECT_EQ(0, clamp(-5, 0, 10));", "EXPECT_CALL(mock, Read(1));"),
                                                 "not an assertion macro call"),
@@ -1756,7 +1762,7 @@ class RuleDetails(unittest.TestCase):
             "a new test named like a file macro": (u.replace("void setUp", "#define test_clamp_mid test_clamp_low\nvoid setUp"),
                                                    self.new_unity("    TEST_ASSERT_TRUE(1);\n", u.replace(
                                                        "void setUp", "#define test_clamp_mid test_clamp_low\nvoid setUp")),
-                                                   added),
+                                                   MACRO),
             "a new test registered twice": (u, self.new_unity("    TEST_ASSERT_TRUE(1);\n").replace(
                 "    return UNITY_END", "    RUN_TEST(test_clamp_mid);\n    return UNITY_END"), added),
             "a registration of a test the change does not add": (u, u.replace(

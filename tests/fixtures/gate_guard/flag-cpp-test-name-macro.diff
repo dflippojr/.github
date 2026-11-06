@@ -1,7 +1,7 @@
 # gate-guard fixture: an assertion edited in void test_synthetic(void), which an unchanged #define renames to helper for the compiler
 # expect: removed-tests
 # hits: 1
-# detail: a macro the file defines
+# detail: the guard does not expand macros
 
 diff --git a/test/test_main/test_main.cpp b/test/test_main/test_main.cpp
 index 1111111..2222222 100644

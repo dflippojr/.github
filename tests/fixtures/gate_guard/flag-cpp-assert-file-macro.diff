@@ -1,7 +1,7 @@
 # gate-guard fixture: a literal changed in an assertion that names a macro the file defines
 # expect: removed-tests
 # hits: 1
-# detail: names LIMIT, a macro the file defines
+# detail: the guard does not expand macros
 
 diff --git a/firmware/test/test_logic/test_main.cpp b/firmware/test/test_logic/test_main.cpp
 index 13c16ed..5aa4fdb 100644
