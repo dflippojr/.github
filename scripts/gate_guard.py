@@ -2135,37 +2135,62 @@ def repo_hits(repo_dir, base, head, extra=()):
 GLOB_REFUSED = re.compile(r"[\[\]{}\\!]")
 
 
-class ExtraPath(collections.namedtuple("ExtraPath", "glob regex")):
-    """One --extra-gate-path glob and the regex that matches the whole of a path it names."""
+class ExtraPath(collections.namedtuple("ExtraPath", "glob segments")):
+    """One validated --extra-gate-path glob, matched without regex backtracking.
+
+    Both levels use dynamic programming: O(len(glob) * len(path)) time and
+    O(len(path)) space, even for separated * or ** with a long near miss.
+    """
 
     def matches(self, path):
-        return self.regex.fullmatch(path) is not None
+        segments = path.split("/")
+        # reachable[n]: the glob prefix matches the first n path segments.
+        reachable = [True] + [False] * len(segments)
+        for i, part in enumerate(self.segments):
+            if part == "**":
+                if i == len(self.segments) - 1:
+                    # A final ** consumes the remaining suffix, including empty
+                    # segments. It still needs a suffix after the preceding /:
+                    # tests/golden/** matches tests/golden/, not tests/golden.
+                    return any(reachable[:-1])
+                for end, segment in enumerate(segments, 1):
+                    # Non-final ** consumes zero or more nonempty segments.
+                    reachable[end] = reachable[end] or (bool(segment) and reachable[end - 1])
+            else:
+                reachable = [False] + [reachable[n] and _segment_matches(part, segment)
+                                       for n, segment in enumerate(segments)]
+        return reachable[-1]
 
 
-def _glob_segment(segment):
-    if segment in ("", ".", ".."):
-        raise ValueError(f"it has an empty, . or .. segment ({segment!r})")
-    if "**" in segment:
-        raise ValueError("it has ** inside a segment; ** stands alone between slashes, as in tests/golden/**")
-    return "".join("[^/]*" if c == "*" else "[^/]" if c == "?" else re.escape(c) for c in segment)
+def _segment_matches(pattern, segment):
+    """Match * and ? within one segment, visiting each prefix pair once."""
+    if "*" not in pattern and "?" not in pattern:
+        return pattern == segment
+    reachable = [True] + [False] * len(segment)
+    for token in pattern:
+        if token == "*":
+            for end in range(1, len(segment) + 1):
+                # * consumes nothing, or extends its match by one character.
+                reachable[end] = reachable[end] or reachable[end - 1]
+        else:
+            reachable = [False] + [reachable[n] and (token == "?" or token == char)
+                                   for n, char in enumerate(segment)]
+    return reachable[-1]
 
 
-def _glob_regex(glob):
+def _glob_segments(glob):
     refused = GLOB_REFUSED.search(glob)
     if refused:
         raise ValueError(f"it has {refused.group()!r}; only *, ? and ** are wildcards")
     split = glob.split("/")
-    # ** after ** adds nothing, and a run of them would only backtrack. Dropping it before the regex is built keeps
-    # a trailing run such as tests/golden/**/** matching everything under tests/golden, as ** alone does.
+    # Consecutive ** segments are equivalent to one **, including at the end.
     parts = [part for i, part in enumerate(split) if not (part == "**" and i and split[i - 1] == "**")]
-    out = []
-    for i, part in enumerate(parts):
-        last = i == len(parts) - 1
-        if part == "**":
-            out.append(".*" if last else "(?:[^/]+/)*")
-        else:
-            out.append(_glob_segment(part) + ("" if last else "/"))
-    return re.compile("".join(out), re.S)
+    for part in parts:
+        if part in ("", ".", ".."):
+            raise ValueError(f"it has an empty, . or .. segment ({part!r})")
+        if part != "**" and "**" in part:
+            raise ValueError("it has ** inside a segment; ** stands alone between slashes, as in tests/golden/**")
+    return tuple(parts)
 
 
 def parse_extra_paths(values):
@@ -2179,7 +2204,7 @@ def parse_extra_paths(values):
             if not glob:
                 continue
             try:
-                globs.append(ExtraPath(glob, _glob_regex(glob)))
+                globs.append(ExtraPath(glob, _glob_segments(glob)))
             except ValueError as e:
                 raise ValueError(f"extra gate path {glob!r} is malformed: {e}") from None
     return globs
