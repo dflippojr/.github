@@ -1,10 +1,12 @@
 """The pull_request_target gate guard: owner labels dated against the head push, verdicts posted on the head."""
 import io
+import itertools
 import json
 import os
 import pathlib
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 import urllib.parse
@@ -1321,6 +1323,78 @@ class ExtraGatePaths(unittest.TestCase):
             code, _ = run_main(["--diff-file", str(path), "--extra-gate-path=tests/golden/"])
         self.assertEqual(code, 2)
         self.assertIn("tests/golden/", err.getvalue())
+
+
+class ExtraPathMatching(unittest.TestCase):
+    """Extra gate globs must keep their language without unbounded backtracking."""
+
+    def assert_bounded_match(self, glob, near_miss, match):
+        # subprocess.run kills and reaps this child on timeout, including when the
+        # old regex engine is stuck inside a match and cannot check a deadline.
+        code = """
+import json
+import sys
+sys.path.insert(0, sys.argv[1])
+import gate_guard
+glob, near_miss, match = json.loads(sys.argv[2])
+[pattern] = gate_guard.parse_extra_paths([glob])
+print(json.dumps([pattern.matches(near_miss), pattern.matches(match)]))
+"""
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", code, str(ROOT / "scripts"), json.dumps([glob, near_miss, match])],
+                capture_output=True, text=True, timeout=1, check=True)
+        except subprocess.TimeoutExpired:
+            self.fail(f"extra gate path matching exceeded 1 second for {glob!r}")
+        self.assertEqual(json.loads(result.stdout), [False, True])
+
+    def test_separated_stars_are_bounded(self):
+        self.assert_bounded_match("tests/golden/" + "*a" * 12 + "b.json",
+                                  "tests/golden/" + "a" * 200 + ".json",
+                                  "tests/golden/" + "a" * 200 + "b.json")
+
+    def test_nonadjacent_double_stars_are_bounded(self):
+        self.assert_bounded_match("tests/golden/" + "**/a/" * 12 + "b.json",
+                                  "tests/golden/" + "a/" * 200 + "c.json",
+                                  "tests/golden/" + "a/" * 200 + "b.json")
+
+    def test_matches_are_equivalent_to_the_previous_glob_language(self):
+        # Frozen reference for the original language, used only on short paths.
+        # Never run this backtracking oracle on either adversarial case above.
+        def previous_regex(glob):
+            split = glob.split("/")
+            parts = [p for i, p in enumerate(split) if not (p == "**" and i and split[i - 1] == "**")]
+            out = []
+            for i, part in enumerate(parts):
+                last = i == len(parts) - 1
+                if part == "**":
+                    out.append(".*" if last else "(?:[^/]+/)*")
+                else:
+                    out.append("".join("[^/]*" if c == "*" else "[^/]" if c == "?" else re.escape(c)
+                                       for c in part) + ("" if last else "/"))
+            return re.compile("".join(out), re.S)
+
+        # The patterns and paths from the existing examples, including repeated
+        # **, plus a bounded cross product of wildcard and path-segment choices.
+        globs = ["tests/golden/**", "tests/golden/*", "*.json", "**/*.json", "tests/**/golden/*.json",
+                 "snap?.txt", "a.b", "a+b(c)", "tests/golden/case.json", "**",
+                 "tests/**/**/golden/*.json", "tests/golden/**/**", "**/**", "**/**/*.json"]
+        paths = ["tests/golden/case.json", "tests/golden/a/b/c.json", "tests/golden/.hidden",
+                 "tests/goldenx/case.json", "tests/golden", "src/tests/golden/case.json",
+                 "tests/golden/a/case.json", "case.json", "tests/case.json", "tests/golden/case.jsonl",
+                 "tests/a/b/golden/case.json", "tests/a/goldens/case.json", "snap1.txt", "snap12.txt",
+                 "snap/.txt", "axb", "a+b(c)", "tests/golden/case.json.bak", "anything/at/all",
+                 "tests/golden/a.json", "tests/golden/a/b.json", "tests/goldenx/a.json", "x", "a/b.json",
+                 "b.json", "", "a\nb", "é/.hidden"]
+        for size in range(1, 4):
+            globs.extend("/".join(p) for p in itertools.product(("a", "*", "?", "a*b", "**"), repeat=size))
+            paths.extend("/".join(p) for p in itertools.product(("", "a", "b", ".hidden", "a\nb"), repeat=size))
+        for glob in globs:
+            [pattern] = gate_guard.parse_extra_paths([glob])
+            previous = previous_regex(glob)
+            for path in paths:
+                self.assertEqual(pattern.matches(path), previous.fullmatch(path) is not None,
+                                 f"glob={glob!r}, path={path!r}")
 
 
 class WorkflowSafety(unittest.TestCase):
