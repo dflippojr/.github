@@ -24,7 +24,7 @@ diff --git a/firmware/test/test_logic/test_main.cpp b/firmware/test/test_logic/t
 index 8034f23..1c9d0e2 100644
 --- a/firmware/test/test_logic/test_main.cpp
 +++ b/firmware/test/test_logic/test_main.cpp
-@@ -1,14 +1,14 @@
+@@ -1,15 +1,15 @@
  #include <unity.h>
  #include "logic.h"
  
