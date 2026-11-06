@@ -1,0 +1,37 @@
+# gate-guard fixture: a literal changed in an assertion of a helper, not a test
+# expect: removed-tests
+# hits: 1
+# detail: outside a test body
+
+diff --git a/firmware/test/test_logic/test_main.cpp b/firmware/test/test_logic/test_main.cpp
+index 472c8bb..58fcda9 100644
+--- a/firmware/test/test_logic/test_main.cpp
++++ b/firmware/test/test_logic/test_main.cpp
+@@ -1,26 +1,26 @@
+ #include <unity.h>
+ #include "logic.h"
+ 
+ void setUp(void) {}
+ void tearDown(void) {}
+ 
+ static void check_range(int v) {
+-    TEST_ASSERT_TRUE(v <= 10);
++    TEST_ASSERT_TRUE(v <= 100);
+ }
+ 
+ void test_clamp_low(void) {
+     // boundary
+     TEST_ASSERT_EQUAL(0, clamp(-5, 0, 10));
+     TEST_ASSERT_TRUE(clamp(5, 0, 10) == 5);
+ }
+ 
+ void test_clamp_high(void) {
+     TEST_ASSERT_EQUAL(10, clamp(50, 0, 10));
+ }
+ 
+ int main(int argc, char **argv) {
+     UNITY_BEGIN();
+     RUN_TEST(test_clamp_low);
+     RUN_TEST(test_clamp_high);
+     return UNITY_END();
+ }

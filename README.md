@@ -141,7 +141,10 @@ whatever the change:
   a line. The guard does not follow the code a comparison reaches (an
   object's `__eq__`, a `conftest.py` hook), so an exempt change can still give
   code already in the file or its imports other values to compare. Removed
-  tests and new skips are hits as in any repository;
+  tests and new skips are hits as in any repository. A C/C++ source (`.c`,
+  `.cc`, `.cpp`, `.cxx`) in a test directory is judged by the rule below;
+- any change to a CMake file (`CMakeLists.txt` or `*.cmake`) anywhere, which
+  can register or drop CTest tests (`removed-tests`);
 - an added, deleted or renamed C/C++ source or header anywhere, including
   `.c++`, `.cp`, `.h++`, `.tpp`, `.tcc`, `.inl`, `.ino`, `.pde`, `.s` and files
   with no extension, which can shadow or drop an include; and any changed
@@ -151,6 +154,74 @@ whatever the change:
   config it loads or a test it runs), or cannot be read (`skip-marker`); and
   when either tree has a symbolic link or submodule at or in a test directory
   (`removed-tests`).
+
+A C/C++ source in a test directory, edited in place, is exempt only when the
+guard can read it as the compiler does, it has the same tests as before, and
+its change does nothing but replace assertions of an existing test's own body
+(issue #43). Each new assertion is the one it replaces with only these
+changed: a literal argument (a number, a number with a minus sign, `true` or
+`false`, a string literal with the same prefix, or a character literal), or,
+where an argument is one comparison (`==`, `!=`, `<`, `<=`, `>`, `>=`), its
+operator and a literal operand. A number counts as a literal only with a
+built-in suffix (`u`, `l`, `ll` and their mixes for an integer, `f` or `l` for
+a floating literal): any other suffix, even one with no leading underscore
+such as `0f` or `1.0ff`, and C++23's `z`, makes a user-defined literal, which
+calls a literal operator a header may define. Assertions are the frameworks'
+own macros, each a statement of its own, `MACRO(...);`: Unity's `TEST_ASSERT`
+and the `TEST_ASSERT_*` names built from its words
+(`TEST_ASSERT_EQUAL_UINT32`, `TEST_ASSERT_FLOAT_WITHIN`), GoogleTest's
+`EXPECT_*` and `ASSERT_*` (`EQ`, `NE`, `LT`, `LE`, `GT`, `GE`, `TRUE`, `FALSE`,
+the string, float and exception checks, `NEAR`, `THAT`, `PRED*`, `DEATH`,
+`EXIT`; not `EXPECT_CALL`), and Catch2's and doctest's `REQUIRE`, `CHECK` and
+their `_FALSE`, `_THAT`, `_THROWS*`, `_NOTHROW`, comparison and `_UNARY` forms,
+any of them ending in `_MESSAGE`. A project macro named like one
+(`EXPECT_SKIP_IF`) is not an assertion. A test is Unity's `void
+test_name(void)`, GoogleTest's `TEST` or `TEST_F`, or a Catch2 or doctest
+`TEST_CASE` of plain strings. A changed assertion may hold no `&&`, `||`,
+`?:`, assignment, `++`, `--`, `throw` or `return`, and, for a `*_MESSAGE` macro, no message but string literals, which
+may run only when the assertion fails: Unity's message is its last argument,
+and doctest's (`CHECK_MESSAGE(cond, ...)`, variadic and logged lazily), like
+any other framework's, is every argument after the first.
+
+A new test is not exempt, as in Python test files (the owner's decision of
+2026-11-06): a new Unity, GoogleTest, Catch2 or doctest test, and its
+`RUN_TEST` registration, need approval whatever they hold. A new test can call
+code the file or its headers already reach, such as a function that ends the
+process, or write memory the framework reads, and no check of its names rules
+that out.
+
+Comments, blank lines and how a statement is split across lines do not count:
+the guard compares tokens. Anything else is a hit: a new test, a test removed
+or renamed, an assertion added, removed or moved, a call's argument, a name or
+a macro changed (`x` to `::x` too), any statement that is not an assertion of
+the test's own body (an `if`, `for`, block, declaration or `return`, even
+around an assertion), a test's header, a fixture, a helper, `setUp`, a runner
+or its registrations, a directive line changed, a rename, addition, deletion
+or mode change, and a header or any other file in a test directory. The guard
+fails closed on a file it cannot read as the compiler does: a line splice (a
+backslash at a line's end), a trigraph, a digraph, a carriage return inside a
+line, a form feed or other control character, a character that is not ASCII
+outside comments and literals, a changed line holding anything but printable
+ASCII and tabs, a literal it cannot read, a stray `#`, unbalanced brackets, a
+preprocessor branch that opens a bracket it does not close or closes one
+opened before it (even when it opens another, so a dead `#if 0` branch cannot
+close a helper and open a test at the same depth), a conditional directive
+inside a statement or declaration (anywhere but the start of the file or after
+`;`, `{` or `}`), an `#include`, `#embed` or other directive that brings in
+text inside a function or any other bracket but a namespace or `extern "C"`
+scope (it could close the test and open a helper), any `#define` or `#undef`
+in the file, and any use of `__LINE__` or `__COUNTER__`, whose values move with
+the lines around them. The guard reads code as written, not expanded, and a
+macro can give it any meaning: close a test and open a helper (`#define SPLIT
+} void helper(void) {`, or the same braces pasted from `%` and `>` with `##`),
+rename a test, or make `namespace` mean `struct`. So a test source with macros
+of its own is never exempt, whatever they hold. The guard does not read included files, expand macros from
+headers or follow the code a test reaches, so an exempt change can still give
+that code other values. For the same reason, a header's macro (`#define
+test_name helper`, or one whose replacement closes a test and opens a helper),
+or an included file whose own brackets do not pair, included at file, namespace
+or `extern "C"` scope, can rename a test or change its scope unseen: the guard
+reads only the test source.
 
 Unity `RUN_TEST(name)` registrations and `void test_name(void)` definitions are
 still counted, so a hit names the tests a change removed. Editing a source or

@@ -1,0 +1,34 @@
+# gate-guard fixture: an assertion edited in a test inside namespace desk, which an unchanged #define namespace struct makes a class, so the test is a member function
+# expect: removed-tests
+# hits: 1
+# detail: the guard does not expand macros
+
+diff --git a/test/test_main/test_main.cpp b/test/test_main/test_main.cpp
+index 1111111..2222222 100644
+--- a/test/test_main/test_main.cpp
++++ b/test/test_main/test_main.cpp
+@@ -1,23 +1,23 @@
+ #include <unity.h>
+ #include "support.h"
+ 
+ #define namespace struct
+ 
+ namespace desk {
+ void test_synthetic(void) {
+-    TEST_ASSERT_TRUE(value() == 1);
++    TEST_ASSERT_TRUE(value() == 2);
+ }
+ };
+ 
+ void helper(void) { desk().test_synthetic(); }
+ 
+ void test_existing(void) {
+     TEST_ASSERT_TRUE(ready());
+ }
+ 
+ int main(void) {
+     UNITY_BEGIN();
+     RUN_TEST(test_existing);
+     helper();
+     return UNITY_END();
+ }

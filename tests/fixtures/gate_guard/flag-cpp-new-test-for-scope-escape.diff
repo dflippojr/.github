@@ -1,0 +1,40 @@
+# gate-guard fixture: a new test declares a name in a for statement and calls the global one after it
+# expect: removed-tests
+# hits: 1
+# detail: it adds the test test_clamp_middle
+
+diff --git a/firmware/test/test_logic/test_main.cpp b/firmware/test/test_logic/test_main.cpp
+index e6309a0..facae7b 100644
+--- a/firmware/test/test_logic/test_main.cpp
++++ b/firmware/test/test_logic/test_main.cpp
+@@ -1,22 +1,30 @@
+ #include <unity.h>
+ #include "logic.h"
+ 
+ void setUp(void) {}
+ void tearDown(void) {}
+ 
+ void test_clamp_low(void) {
+     // boundary
+     TEST_ASSERT_EQUAL(0, clamp(-5, 0, 10));
+     TEST_ASSERT_TRUE(clamp(5, 0, 10) == 5);
+ }
+ 
+ void test_clamp_high(void) {
+     TEST_ASSERT_EQUAL(10, clamp(50, 0, 10));
+ }
+ 
++void test_clamp_middle(void) {
++    for (int getpid = 0; getpid < 1; getpid++) {
++        TEST_ASSERT_EQUAL(0, getpid);
++    }
++    getpid();
++}
++
+ int main(int argc, char **argv) {
+     UNITY_BEGIN();
+     RUN_TEST(test_clamp_low);
+     RUN_TEST(test_clamp_high);
++    RUN_TEST(test_clamp_middle);
+     return UNITY_END();
+ }

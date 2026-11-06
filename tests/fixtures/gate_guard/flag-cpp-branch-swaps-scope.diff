@@ -1,0 +1,32 @@
+# gate-guard fixture: an assertion edited in helper, which an unchanged #if 0 branch closes and reopens as test_synthetic at the same brace depth (Codex r3)
+# expect: removed-tests
+# hits: 1
+# detail: closes a bracket opened before it
+
+diff --git a/test/test_main/test_main.cpp b/test/test_main/test_main.cpp
+index 1111111..2222222 100644
+--- a/test/test_main/test_main.cpp
++++ b/test/test_main/test_main.cpp
+@@ -1,21 +1,21 @@
+ #include <unity.h>
+ #include "support.h"
+ 
+ void helper(void) {
+ #if 0
+ }
+ void test_synthetic(void) {
+ #endif
+-    TEST_ASSERT_TRUE(value() == 1);
++    TEST_ASSERT_TRUE(value() == 2);
+ }
+ 
+ void test_existing(void) {
+     TEST_ASSERT_TRUE(ready());
+ }
+ 
+ int main(void) {
+     UNITY_BEGIN();
+     RUN_TEST(test_existing);
+     helper();
+     return UNITY_END();
+ }

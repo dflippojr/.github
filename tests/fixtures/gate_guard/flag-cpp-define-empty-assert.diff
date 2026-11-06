@@ -1,0 +1,34 @@
+# gate-guard fixture: #define TEST_ASSERT_EQUAL(...) added, so the assertions expand to nothing
+# expect: removed-tests
+# hits: 1
+# detail: the guard does not expand macros
+
+diff --git a/firmware/test/test_logic/test_main.cpp b/firmware/test/test_logic/test_main.cpp
+index e6309a0..5b09113 100644
+--- a/firmware/test/test_logic/test_main.cpp
++++ b/firmware/test/test_logic/test_main.cpp
+@@ -1,22 +1,24 @@
+ #include <unity.h>
+ #include "logic.h"
++#undef TEST_ASSERT_EQUAL
++#define TEST_ASSERT_EQUAL(...)
+ 
+ void setUp(void) {}
+ void tearDown(void) {}
+ 
+ void test_clamp_low(void) {
+     // boundary
+     TEST_ASSERT_EQUAL(0, clamp(-5, 0, 10));
+     TEST_ASSERT_TRUE(clamp(5, 0, 10) == 5);
+ }
+ 
+ void test_clamp_high(void) {
+     TEST_ASSERT_EQUAL(10, clamp(50, 0, 10));
+ }
+ 
+ int main(int argc, char **argv) {
+     UNITY_BEGIN();
+     RUN_TEST(test_clamp_low);
+     RUN_TEST(test_clamp_high);
+     return UNITY_END();
+ }

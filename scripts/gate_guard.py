@@ -577,7 +577,10 @@ def removed_test_hits(files):
 #     replaces compared literals and comparison operators in assert statements
 #     of its existing tests (issue #40, see _python_unexempt). The guard does
 #     not model what pytest collects or skips, so any other change to such a
-#     file is a hit;
+#     file is a hit; and except a C/C++ source edited in place whose change
+#     only replaces literals and comparison operators in assertions of its
+#     existing tests; a new test is a hit (issue #43, see _c_cpp_unexempt);
+#   - a change to a CMake file anywhere, which can register or drop tests;
 #   - an added, deleted or renamed C/C++ source or header anywhere, or a
 #     changed submodule;
 #   - every pull request, when a platformio.ini names extra_configs or test_dir
@@ -918,6 +921,511 @@ def _python_unexempt(fd):
     return why or next(filter(None, map(_py_line_change, trees, tests, texts, changed)), None)
 
 
+
+# A C/C++ test source in a test directory of a C/C++ repository (issue #43):
+# what the guard reads, and the narrow change it exempts (see _c_cpp_unexempt).
+#
+# The guard reads the file as tokens, not by line, so a reflowed assertion or
+# a changed comment changes nothing. It fails closed on what could make its
+# tokens differ from the compiler's: a line splice, a trigraph, a digraph, a
+# form feed, a carriage return or other control character, a character
+# outside comments and literals that is not ASCII, an unterminated comment or
+# literal, a stray # or ##, unbalanced brackets, a preprocessor branch that
+# opens or closes a bracket it does not close or open, and __LINE__ or
+# __COUNTER__, whose values move with the lines around them. A comment or raw
+# string runs to its end or to the end of the text, so an unclosed one is read
+# once, not once for each opening after it.
+C_TOKEN = re.compile(r"""
+    (?P<space>[ \t]+)
+  | (?P<newline>\n)
+  | (?P<comment>//[^\n]*|/\*.*?(?:\*/|\Z))
+  | (?P<raw>(?:u8|[uUL])?R"(?P<delim>[^()\\\s]{0,16})\(.*?(?:\)(?P=delim)"|\Z))
+  | (?P<string>(?:u8|[uUL])?"(?:\\[ -~]|[^"\\\n])*")
+  | (?P<char>(?:u8|[uUL])?'(?:\\[ -~]|[^'\\\n])+')
+  | (?P<number>\.?\d(?:[eEpP][-+]|'(?=\w)|[\w.])*)
+  | (?P<name>[A-Za-z_]\w*)
+  | (?P<punct>\.\.\.|<<=|>>=|<=>|->\*|::|->|\+\+|--|<<|>>|<=|>=|==|!=|&&|\|\||[-+*/%&|^]=|\#\#|\.\*
+               |<:|:>|<%|%>|%:|[\]\[{}()\#;:?.,+\-*/%^&|~!=<>])
+""", re.S | re.X | re.A)
+C_DIGRAPHS = {"<:", ":>", "<%", "%>", "%:"}
+# The encoding prefixes of a string or character literal: one the tokenizer reads as a name is one it cannot read.
+C_PREFIXES = {"u8", "u", "U", "L", "R", "u8R", "uR", "UR", "LR"}
+C_SPLICE = re.compile(r"\\[ \t]*$", re.M)
+C_TRIGRAPH = re.compile(r"\?\?[-=/'()!<>]")
+C_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+# What a changed line may hold: printable ASCII and tabs, which C reads as spaces outside literals.
+C_PRINTABLE = re.compile(r"[ -~\t]*")
+C_MOVING = re.compile(r"\b__(?:LINE|COUNTER)__\b")
+C_CONDITIONAL = re.compile(r"#\s*(if|ifdef|ifndef|elif|elifdef|elifndef|else|endif)\b")
+C_DEFINE = re.compile(r"#\s*(?:define|undef)\s+([A-Za-z_]\w*)")
+# The directives that bring in no text, allowed inside a function or other bracket (see _c_branches): the null
+# directive and a GNU line marker (# 7 "x.c") too.
+C_INERT = re.compile(r"#\s*(?:(?:pragma|line|error|warning)\b|\d|$)")
+# What comes before the { of a namespace or extern "C" scope, read backwards: no function body opens there.
+C_SCOPE_HEAD = re.compile(r'^(?:"C(?:\+\+)?" extern|(?:\w+(?: :: \w+)* )?namespace(?: inline)?)(?: |$)')
+C_BRACKETS = {"(": ")", "[": "]", "{": "}"}
+# An int or float literal with a built-in suffix only: an integer's u, l or ll (in either order), a floating
+# literal's f or l. Any other suffix, such as 0f, 1.0ff or 0_wipe, makes a user-defined literal, which calls a
+# literal operator, even one whose name has no leading underscore (compilers only warn). C++23's z is left out:
+# a compiler older than it reads 1z as a user-defined literal.
+C_DIGITS = r"\d(?:'?\d)*"
+C_HEX_DIGITS = r"[\da-fA-F](?:'?[\da-fA-F])*"
+C_NUMBER = re.compile(
+    rf"(?:(?:0[xX]{C_HEX_DIGITS}|0[bB][01](?:'?[01])*|{C_DIGITS})(?:[uU](?:ll|LL|[lL])?|(?:ll|LL|[lL])[uU]?)?"
+    rf"|(?:(?:{C_DIGITS}\.(?:{C_DIGITS})?|\.{C_DIGITS})(?:[eE][-+]?{C_DIGITS})?|{C_DIGITS}[eE][-+]?{C_DIGITS}"
+    rf"|0[xX](?:{C_HEX_DIGITS}(?:\.(?:{C_HEX_DIGITS})?)?|\.{C_HEX_DIGITS})[pP][-+]?{C_DIGITS})[fFlL]?)")
+# The frameworks' own assertion macros, by name, so a project macro such as
+# EXPECT_SKIP_IF or CHECK_OR_IGNORE is not one: Unity's TEST_ASSERT and the
+# TEST_ASSERT_* names built from its words, GoogleTest's EXPECT_* and ASSERT_*
+# (not the mock expectation EXPECT_CALL), and Catch2's and doctest's REQUIRE*
+# and CHECK*. Any may end in _MESSAGE.
+C_UNITY_WORDS = ("TRUE|FALSE|UNLESS|NULL|NOT|EMPTY|EQUAL|BITS|BIT|HIGH|LOW|GREATER|LESS|THAN|OR|EACH|WITHIN|ARRAY|"
+                 "INT|INT8|INT16|INT32|INT64|UINT|UINT8|UINT16|UINT32|UINT64|HEX|HEX8|HEX16|HEX32|HEX64|CHAR|size_t|"
+                 "PTR|STRING|LEN|MEMORY|FLOAT|DOUBLE|IS|INF|NEG|NAN|DETERMINATE")
+C_ASSERT = re.compile(
+    rf"(?:TEST_ASSERT(?:_(?:{C_UNITY_WORDS}))*"
+    r"|(?:EXPECT|ASSERT)_(?:TRUE|FALSE|EQ|NE|LT|LE|GT|GE|STREQ|STRNE|STRCASEEQ|STRCASENE|FLOAT_EQ|DOUBLE_EQ|NEAR"
+    r"|THROW|ANY_THROW|NO_THROW|DEATH|DEBUG_DEATH|EXIT|NO_FATAL_FAILURE|THAT|PRED[1-5]|PRED_FORMAT[1-5])"
+    r"|(?:REQUIRE|CHECK)(?:_(?:FALSE|THAT|THROWS|THROWS_AS|THROWS_WITH|THROWS_MATCHES|NOTHROW|EQ|NE|GT|LT|GE|LE"
+    r"|UNARY|UNARY_FALSE))?)(?:_MESSAGE)?$")
+C_COMPARE = {"==", "!=", "<", "<=", ">", ">="}
+# Tokens that may be a comparison or a template's angle bracket: an argument with more than one is not read
+# as a comparison.
+C_ANGLES = C_COMPARE | {"<<", ">>", "<=>"}
+# Tokens a changed assertion may not hold: they decide whether or how often its other code runs (&&, ||, ?:),
+# assign or step a value, or leave the test.
+C_UNSAFE = {"&&", "||", "?", "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", "++", "--",
+            "and", "or", "not", "and_eq", "or_eq", "xor_eq", "not_eq", "bitand", "bitor", "xor", "compl", "throw",
+            "new", "delete", "co_await", "co_yield", "co_return", "return", "goto", "asm"}
+# Operators that bind looser than a comparison: an operand of a comparison read as one holds none of them at its
+# own level.
+C_LOOSER = {"&", "^", "|", ":"} | C_UNSAFE
+
+# line and end: the lines a token starts and ends on; spaced: whether a space or comment comes before it.
+CToken = collections.namedtuple("CToken", "kind text line spaced end")
+
+
+class CItem:
+    """A top-level item of a C/C++ file: a directive, a namespace or extern "C" scope and the items in it, a
+    function (or a test, a function-like macro with a body), or anything else up to its semicolon."""
+
+    def __init__(self, kind, tokens, header=(), body=(), children=()):
+        self.kind, self.tokens, self.header, self.body, self.children = kind, tokens, header, body, children
+        self.key = (kind, tuple(t.text for t in tokens))
+        self.head = tuple(t.text for t in header)
+        self.test = _c_test_id(self.head) if kind == "function" else None
+
+
+def _c_texts(tokens):
+    return " ".join(t.text for t in tokens)
+
+
+def _c_tokens(text):
+    """The tokens of one side of a C/C++ file, comments dropped and each directive one token, or ValueError
+    saying why the guard cannot read it as the compiler does.
+
+    A directive keeps the spaces between its tokens, as #define F(x) and
+    #define F (x) differ. A name right after a string or character literal
+    is part of it, a user-defined literal.
+    """
+    tokens, directive, pos, line, start, spaced = [], None, 0, 1, True, True
+    while pos < len(text):
+        m = C_TOKEN.match(text, pos)
+        if not m:
+            raise ValueError(f"line {line} holds {text[pos]!r}, which the guard does not read as C/C++ outside a "
+                             "comment or literal, or opens a literal it does not close")
+        kind, value, pos = m.lastgroup, m.group(), m.end()
+        if (kind == "comment" and value.startswith("/*") and (len(value) < 4 or not value.endswith("*/"))) or (
+                kind == "raw" and not value.endswith(")" + m.group("delim") + '"')):
+            raise ValueError(f"line {line} opens a comment or raw string it does not close")
+        if kind == "newline":
+            if directive:
+                tokens.append(CToken("directive", "#" + "".join(directive[1]), directive[0], True, line))
+                directive = None
+            line, start, spaced = line + 1, True, True
+            continue
+        if kind in ("space", "comment"):
+            line, spaced = line + value.count("\n"), True
+            continue
+        kind = "string" if kind == "raw" else kind
+        if value in C_DIGRAPHS:
+            raise ValueError(f"line {line} holds the digraph {value}, which the guard does not read")
+        if kind == "name" and value in C_PREFIXES and text[pos:pos + 1] in ("'", '"'):
+            raise ValueError(f"line {line} holds a literal the guard cannot read")
+        if directive is not None:
+            directive[1].append((" " if spaced and directive[1] else "") + value)
+        elif value == "#" and start:
+            directive = (line, [])
+        elif value in ("#", "##"):
+            raise ValueError(f"line {line} holds a {value} outside a directive")
+        elif kind == "name" and not spaced and tokens and tokens[-1].kind in ("string", "char", "udl"):
+            tokens[-1] = tokens[-1]._replace(kind="udl", text=tokens[-1].text + value)
+        else:
+            tokens.append(CToken(kind, value, line, spaced, line + value.count("\n")))
+        line, start, spaced = line + value.count("\n"), False, False
+    if directive:
+        tokens.append(CToken("directive", "#" + "".join(directive[1]), directive[0], True, line))
+    return tokens
+
+
+def _c_match(tokens, i):
+    """The index of the bracket that closes tokens[i]."""
+    want = []
+    for j in range(i, len(tokens)):
+        text = tokens[j].text
+        if text in C_BRACKETS:
+            want.append(C_BRACKETS[text])
+        elif text in (")", "]", "}"):
+            if not want or want.pop() != text:
+                break
+            if not want:
+                return j
+    raise ValueError("its brackets do not balance")
+
+
+def _c_branches(tokens):
+    """ValueError unless where each bracket, statement and function starts and ends, as the guard reads the file
+    with every preprocessor branch in and no included text, is where the compiler finds it, whichever branches
+    it takes and whatever a directive brings in:
+
+    - each branch of a conditional closes every bracket it opens, and no bracket opened before it, so a branch
+      cannot close one function and open another at the same depth;
+    - each conditional directive comes where a statement or declaration may start, at the text's start or
+      after ;, { or }, so a branch cannot end a statement that the code after it continues (if (x) then a
+      dead ;);
+    - inside a bracket other than a namespace or extern "C" scope (a function body, say), a directive is only
+      a conditional, #pragma, #line, #error, #warning or the null directive: not #include or #embed, whose
+      text may close the function and open another;
+    - the file defines and undefines no macro. The guard reads code as written, not expanded, and a macro can
+      give its code any meaning: close a test and open a helper, paste brace digraphs with ##, or make
+      namespace mean struct. A file of its own macros is not exempt, rather than one trick at a time.
+    """
+    brackets, arms, seen, unopened = [], [], [], 0
+    for t in tokens:
+        if t.kind == "directive":
+            _c_directive(t, brackets, arms, seen[-1] if seen else None)
+            continue
+        if t.text in C_BRACKETS:
+            # Whether the bracket is a namespace or extern "C" scope, read from the tokens before it.
+            brackets.append(t.text == "{" and bool(C_SCOPE_HEAD.match(" ".join(reversed(seen[-12:])))))
+        elif t.text in (")", "]", "}"):
+            if arms and len(brackets) == arms[-1]:
+                raise ValueError("a preprocessor branch closes a bracket opened before it")
+            if brackets:
+                brackets.pop()
+            else:
+                unopened += 1
+        seen.append(t.text)
+    if arms or len(brackets) != unopened:
+        raise ValueError("its brackets or preprocessor conditionals do not pair")
+
+
+def _c_directive(t, brackets, arms, last):
+    """ValueError when the directive t, after the token last, with brackets open (True for a namespace or extern
+    "C" scope) and arms, the bracket count at each open conditional, may move where code starts or ends
+    (_c_branches). Updates arms."""
+    m = C_CONDITIONAL.match(t.text)
+    if not m:
+        defined = C_DEFINE.match(t.text)
+        if defined:
+            raise ValueError(f"line {t.line} defines or undefines the macro {defined.group(1)}; the guard does not "
+                             "expand macros, so it cannot tell where a test starts and ends in a file that has its "
+                             "own")
+        if not all(brackets) and not C_INERT.match(t.text):
+            raise ValueError(f"line {t.line} holds {t.text.split()[0]} inside a bracket, where the text it brings "
+                             "in may end a function and begin another")
+        return
+    if last not in (None, ";", "{", "}"):
+        raise ValueError(f"a preprocessor conditional on line {t.line} comes inside a statement or declaration, "
+                         "where a branch may end or begin it")
+    if m.group(1).startswith("if"):
+        arms.append(len(brackets))
+    elif not arms or arms[-1] != len(brackets):
+        raise ValueError("a preprocessor branch opens or closes a bracket it does not close or open, or its "
+                         "conditionals do not pair")
+    elif m.group(1) == "endif":
+        arms.pop()
+
+
+def _c_items(tokens, lo, hi):
+    """The items of tokens[lo:hi] (see CItem)."""
+    items, i = [], lo
+    while i < hi:
+        if tokens[i].kind == "directive":
+            items.append(CItem("directive", tokens[i:i + 1]))
+            i += 1
+            continue
+        j = i
+        while True:
+            if j >= hi:
+                items.append(CItem("other", tokens[i:hi]))
+                return items
+            text = tokens[j].text
+            if text == ";":
+                items.append(CItem("other", tokens[i:j + 1]))
+                i = j + 1
+                break
+            if text in ("(", "["):
+                j = _c_match(tokens, j) + 1
+                continue
+            if text in (")", "]", "}"):
+                raise ValueError("its brackets do not balance")
+            if text != "{":
+                j += 1
+                continue
+            end = _c_match(tokens, j)
+            head = tokens[i:j]
+            words = [t.text for t in head]
+            if any(t.kind == "directive" for t in head):
+                j = end + 1
+                continue
+            if (words[:1] == ["namespace"] or words[:2] == ["inline", "namespace"]
+                    or words in (["extern", '"C"'], ["extern", '"C++"'])):
+                items.append(CItem("scope", tokens[i:end + 1], head, (), _c_items(tokens, j + 1, end)))
+            elif words and words[-1] == ")":
+                items.append(CItem("function", tokens[i:end + 1], head, tokens[j + 1:end]))
+            else:
+                j = end + 1
+                continue
+            i = end + 1
+            break
+    return items
+
+
+def _c_test_id(head):
+    """The identity of the test a function item's header declares, or None: ("unity", name) for void
+    test_name(void), ("gtest", suite, name) for TEST or TEST_F, and ("case", name) for a Catch2 or doctest
+    TEST_CASE whose arguments are plain strings."""
+    words = list(head[1:] if head[:1] == ("static",) else head)
+    if len(words) in (4, 5) and words[0] == "void" and re.match(r"test_\w*$", words[1]) and words[2] == "(" \
+            and words[3:] in (["void", ")"], [")"]):
+        return ("unity", words[1])
+    if len(words) == 6 and words[0] in ("TEST", "TEST_F") and words[1::2] == ["(", ",", ")"] \
+            and all(re.match(r"[A-Za-z]\w*$", w) for w in words[2::2]):
+        return ("gtest", words[2], words[4])
+    plain = [re.match(r'"(?:\\.|[^"\\])*"$', w) for w in words[2:-1:2]]
+    if words[:2] == ["TEST_CASE", "("] and words[-1] == ")" and len(words) in (4, 6) and all(plain) \
+            and words[3:-1:2] in ([], [","]):
+        return ("case", words[2])
+    return None
+
+
+def _c_flat(items):
+    for item in items:
+        yield item
+        yield from _c_flat(item.children)
+
+
+def _c_statements(body):
+    """The statements of a function body: up to a semicolon or a closing brace at its own level, and each
+    directive at that level."""
+    out, current, depth = [], [], 0
+    for t in body:
+        if t.kind == "directive" and not depth and not current:
+            out.append([t])
+            continue
+        current.append(t)
+        if t.text in C_BRACKETS:
+            depth += 1
+        elif t.text in (")", "]", "}"):
+            depth -= 1
+        if not depth and t.text in (";", "}"):
+            out.append(current)
+            current = []
+    return out + ([current] if current else [])
+
+
+def _c_top(tokens):
+    """The indexes of tokens at their own bracket level."""
+    out, depth = [], 0
+    for i, t in enumerate(tokens):
+        if t.text in (")", "]", "}"):
+            depth -= 1
+        if not depth:
+            out.append(i)
+        if t.text in C_BRACKETS:
+            depth += 1
+    return out
+
+
+def _c_assertion(statement):
+    """(macro, [argument tokens]) when statement is an assertion macro call on its own, NAME(...);, or None."""
+    if len(statement) < 4 or statement[0].kind != "name" or not C_ASSERT.match(statement[0].text) \
+            or statement[1].text != "(" or statement[-1].text != ";" or any(t.kind == "directive" for t in statement) \
+            or _c_match(statement, 1) != len(statement) - 2:
+        return None
+    inner = statement[2:-2]
+    args, last = [], 0
+    for i in _c_top(inner):
+        if inner[i].text == ",":
+            args.append(inner[last:i])
+            last = i + 1
+    return statement[0].text, (args + [inner[last:]]) if inner else []
+
+
+def _c_literal(arg):
+    """The kind of literal arg is, or None: a number (a minus on one counts as part of it), true or false, one
+    or more string literals with the same prefix, or a character literal; a user-defined suffix is not one."""
+    words = [t.text for t in arg]
+    if len(arg) in (1, 2) and arg[-1].kind == "number" and words[:-1] in ([], ["-"]) and C_NUMBER.fullmatch(words[-1]):
+        return "number"
+    if words in (["true"], ["false"]):
+        return "bool"
+    prefixes = {t.text.split(t.text[-1])[0] for t in arg if t.kind in ("string", "char")}
+    if arg and len(prefixes) == 1 and (all(t.kind == "string" for t in arg) or (len(arg) == 1 and arg[0].kind == "char")):
+        return arg[0].kind + ":" + prefixes.pop()
+    return None
+
+
+def _c_operand(tokens):
+    kind = _c_literal(tokens)
+    return (f"<{kind}>",) if kind else tuple(t.text for t in tokens)
+
+
+def _c_masked(arg):
+    """An assertion's argument as text, with a literal argument, and a literal operand and the operator of a
+    comparison that is the whole argument, as placeholders."""
+    top = _c_top(arg)
+    angles = [i for i in top if arg[i].text in C_ANGLES]
+    if len(angles) == 1 and arg[angles[0]].text in C_COMPARE and not any(arg[i].text in C_LOOSER for i in top):
+        left, right = arg[:angles[0]], arg[angles[0] + 1:]
+        if left and right:
+            return _c_operand(left) + ("<comparison>",) + _c_operand(right)
+    return _c_operand(arg)
+
+
+def _c_assert_change(old, new, name):
+    """Why replacing the statement old of the test name with new is more than changing an assertion's literal
+    arguments and the literal operands and operator of a comparison that is a whole argument, or None."""
+    calls = [_c_assertion(s) for s in (old, new)]
+    if None in calls:
+        return (f"it changes a statement of {name} that is not an assertion macro call of the test's own body, "
+                "such as a declaration, a call, or an if, for, while or block, even around an assertion")
+    for statement, (macro, args) in zip((old, new), calls):
+        unsafe = next((t.text for t in statement if t.text in C_UNSAFE), None)
+        if unsafe:
+            return (f"it changes an assertion in {name} that holds {unsafe}, which decides what else it runs, "
+                    "assigns or steps a value, or leaves the test")
+        if re.search(r"MESSAGE|_MSG$", macro):
+            # Unity's message is its macro's last argument. doctest's message is every argument after the first
+            # (CHECK_MESSAGE(cond, ...) logs them all lazily), and so is any other framework's, read as variadic.
+            unity = macro.startswith("TEST_ASSERT")
+            message = args[-1:] if unity else args[1:]
+            if not message or not all((_c_literal(a) or "").startswith("string") for a in message):
+                return (f"it changes an assertion in {name} whose message is not a string literal"
+                        f"{'' if unity else ' in every argument after the first'}; a message may run only when the "
+                        "assertion fails")
+    (old_macro, old_args), (new_macro, new_args) = calls
+    if old_macro != new_macro or len(old_args) != len(new_args) or any(
+            _c_masked(a) != _c_masked(b) for a, b in zip(old_args, new_args)):
+        return (f"it changes an assertion in {name} outside its literal arguments and the literal operands and "
+                "operator of a comparison that is a whole argument: the macro, a name, a call or its argument, or "
+                "the expression's shape")
+    return None
+
+
+def _c_test_change(old, new):
+    """Why changing the existing test old to new is more than replacing assertions of its own body, each by one
+    that differs only in literals and comparison operators (_c_assert_change), or None."""
+    name = _c_test_name(new.test)
+    statements = [_c_statements(old.body), _c_statements(new.body)]
+    keys = [[_c_texts(s) for s in side] for side in statements]
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, *keys, autojunk=False).get_opcodes():
+        if op == "equal":
+            continue
+        if i2 - i1 != j2 - j1:
+            return f"it adds, removes or moves a statement in {name}"
+        for a, b in zip(statements[0][i1:i2], statements[1][j1:j2]):
+            why = _c_assert_change(a, b, name)
+            if why:
+                return why
+    return None
+
+
+def _c_test_name(test):
+    return test[1] if test[0] != "gtest" else f"{test[1]}.{test[2]}"
+
+
+def _c_unreadable(text):
+    """Why the guard cannot read one side of a C/C++ file as the compiler does, or None."""
+    if C_CONTROL.search(text) or "\r" in text:
+        return "it holds a carriage return, form feed or other control character"
+    if C_SPLICE.search(text):
+        return "it splices a line with a backslash at its end"
+    if C_TRIGRAPH.search(text):
+        return "it holds a trigraph"
+    return None
+
+
+def _c_cpp_unexempt(fd):
+    """Why fd, a C/C++ source in a test directory of a C/C++ repository, is not exempt, or None.
+
+    Issue #43: only an edit in place is exempt, and only when, read as
+    tokens, it has the same tests, every item outside their bodies is
+    unchanged, and its change does nothing but replace assertions of an
+    existing test's own body (_c_test_change), each new assertion the old one
+    with only literal arguments and the literal operands and operator of a
+    comparison that is a whole argument changed (_c_assert_change). A new
+    test is not exempt (the owner's decision of 2026-11-06): even of names the
+    file already uses, it can call code that ends the process or write memory
+    the framework reads.
+    """
+    if fd.status != "modified" or fd.mode_changed or fd.modes & LINK_MODES:
+        return "only an edit in place can be exempt, not a rename, an addition, a deletion or a mode change"
+    sides = _whole_sides(fd)
+    if sides is None:
+        return "the diff does not show the whole file"
+    why = next(filter(None, map(_c_unreadable, sides)), None)
+    if why:
+        return why
+    if not all(C_PRINTABLE.fullmatch(l.text) for l in fd.changed()):
+        return "a changed line holds a character that is not printable ASCII or a tab"
+    try:
+        tokens = [_c_tokens(text) for text in sides]
+        for side in tokens:
+            _c_branches(side)
+        items = [_c_items(side, 0, len(side)) for side in tokens]
+    except ValueError as e:
+        return str(e)
+    changed = [{l.old for l in fd.changed("-")}, {l.new for l in fd.changed("+")}]
+    if any(t.kind == "directive" and changed[i] & set(range(t.line, t.end + 1))
+           for i, side in enumerate(tokens) for t in side):
+        return "it changes a directive line, which the guard does not read"
+    if any(t.kind in ("name", "directive") and C_MOVING.search(t.text) for side in tokens for t in side):
+        return "it names __LINE__ or __COUNTER__, whose values move with the lines around them"
+    tests = [[i for i in _c_flat(side) if i.test] for side in items]
+    old = {i.test for i in tests[0]}
+    if len(old) != len(tests[0]) or len({i.test for i in tests[1]}) != len(tests[1]):
+        return "it defines a test twice"
+    removed = next((i for i in tests[0] if i.test not in {i.test for i in tests[1]}), None)
+    if removed:
+        return f"it removes a test or renames it: {_c_test_name(removed.test)}"
+    added = next((i for i in tests[1] if i.test not in old), None)
+    if added:
+        return (f"it adds the test {_c_test_name(added.test)}; a new test can run any code the file reaches, so "
+                "it is not exempt")
+    return _c_pair(items[0], items[1])
+
+
+def _c_pair(old, new):
+    """Why the items new are more than the items old with assertions replaced in existing tests, or None."""
+    if len(new) != len(old):
+        return "it adds, removes or moves code outside a test body, or removes a test"
+    for a, b in zip(old, new):
+        if a.key == b.key:
+            continue
+        if a.kind == b.kind == "scope" and a.head == b.head:
+            why = _c_pair(a.children, b.children)
+        elif a.kind == b.kind == "function" and a.head == b.head and a.test:
+            why = _c_test_change(a, b)
+        else:
+            why = ("it changes code outside a test body: a test's header, a helper, a fixture, a declaration, a "
+                   "directive or a runner")
+        if why:
+            return why
+    return None
+
+
 def c_cpp_hits(files, facts, flagged):
     """removed-tests hits for a C/C++ repository's changes that may change which tests run or what they include.
 
@@ -932,15 +1440,26 @@ def c_cpp_hits(files, facts, flagged):
         if not _touched(fd) or fd.path in flagged or fd.path in facts.blind:
             continue
         if any(_at_test_dir(p) for p in fd.paths):
-            if not all(_python_test(p, facts) for p in fd.paths):
-                detail = f"{fd.status} a file in a test directory of a C/C++ repository"
-            else:
+            if all(_python_test(p, facts) for p in fd.paths):
                 why = _python_unexempt(fd)
                 if why:
                     hits.append(Hit("removed-tests", fd.path, None, f"{fd.status} a Python test file of a C/C++ "
                                     f"repository: {why}; only replacing compared literals or comparison operators in "
                                     "assert statements of existing tests is exempt, so this needs approval"))
                 continue
+            if fd.status == "modified" and all(_ext(p) in C_EXTS for p in fd.paths):
+                why = _c_cpp_unexempt(fd)
+                if why:
+                    hits.append(Hit("removed-tests", fd.path, None, f"modified a C/C++ test source of a C/C++ "
+                                    f"repository: {why}; only replacing literals or comparison operators in "
+                                    "assertions of existing tests is exempt, so this needs approval"))
+                continue
+            detail = f"{fd.status} a file in a test directory of a C/C++ repository"
+        elif any(_name(p) == "cmakelists.txt" or _ext(p) == ".cmake" for p in fd.paths):
+            hits.append(Hit("removed-tests", fd.path, None, f"{fd.status} a CMake file of a C/C++ repository, which "
+                            "can register or drop CTest tests; the guard does not read CMake, so this needs approval "
+                            "whatever the change"))
+            continue
         elif fd.modes & {"160000"}:
             detail = f"{fd.status} a submodule of a C/C++ repository, which may hold sources or headers"
         elif fd.status != "modified" and any(_ext(p) in C_FILE_EXTS for p in fd.paths):
