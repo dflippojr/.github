@@ -156,73 +156,56 @@ whatever the change:
   (`removed-tests`).
 
 A C/C++ source in a test directory, edited in place, is exempt only when the
-guard can read it as the compiler does and its change does nothing but these
-(issue #43):
+guard can read it as the compiler does, it has the same tests as before, and
+its change does nothing but replace assertions of an existing test's own body
+(issue #43). Each new assertion is the one it replaces with only these
+changed: a literal argument (a number, a number with a minus sign, `true` or
+`false`, a string literal with the same prefix, or a character literal), or,
+where an argument is one comparison (`==`, `!=`, `<`, `<=`, `>`, `>=`), its
+operator and a literal operand. A number counts as a literal only with a
+built-in suffix (`u`, `l`, `ll` and their mixes for an integer, `f` or `l` for
+a floating literal): any other suffix, even one with no leading underscore
+such as `0f` or `1.0ff`, and C++23's `z`, makes a user-defined literal, which
+calls a literal operator a header may define. Assertions are the frameworks'
+own macros, each a statement of its own, `MACRO(...);`: Unity's `TEST_ASSERT`
+and the `TEST_ASSERT_*` names built from its words
+(`TEST_ASSERT_EQUAL_UINT32`, `TEST_ASSERT_FLOAT_WITHIN`), GoogleTest's
+`EXPECT_*` and `ASSERT_*` (`EQ`, `NE`, `LT`, `LE`, `GT`, `GE`, `TRUE`, `FALSE`,
+the string, float and exception checks, `NEAR`, `THAT`, `PRED*`, `DEATH`,
+`EXIT`; not `EXPECT_CALL`), and Catch2's and doctest's `REQUIRE`, `CHECK` and
+their `_FALSE`, `_THAT`, `_THROWS*`, `_NOTHROW`, comparison and `_UNARY` forms,
+any of them ending in `_MESSAGE`. A project macro named like one
+(`EXPECT_SKIP_IF`) is not an assertion. A test is Unity's `void
+test_name(void)`, GoogleTest's `TEST` or `TEST_F`, or a Catch2 or doctest
+`TEST_CASE` of plain strings. A changed assertion may hold no `&&`, `||`,
+`?:`, assignment, `++`, `--`, `throw` or `return`, no name of a macro the file
+defines, and, for a `*_MESSAGE` macro, no message but a string literal, which
+may run only when the assertion fails.
 
-- replace assertions of an existing test's own body, each new assertion the one
-  it replaces with only these changed: a literal argument (a number, a number
-  with a minus sign, `true` or `false`, a string literal with the same prefix,
-  or a character literal), or, where an argument is one comparison (`==`,
-  `!=`, `<`, `<=`, `>`, `>=`), its operator and a literal operand. Assertions
-  are the frameworks' own macros, each a statement of its own, `MACRO(...);`:
-  Unity's `TEST_ASSERT` and the `TEST_ASSERT_*` names built from its words
-  (`TEST_ASSERT_EQUAL_UINT32`, `TEST_ASSERT_FLOAT_WITHIN`), GoogleTest's
-  `EXPECT_*` and `ASSERT_*` (`EQ`, `NE`, `LT`, `LE`, `GT`, `GE`, `TRUE`,
-  `FALSE`, the string, float and exception checks, `NEAR`, `THAT`, `PRED*`,
-  `DEATH`, `EXIT`; not `EXPECT_CALL`), and Catch2's and doctest's `REQUIRE`,
-  `CHECK` and their `_FALSE`, `_THAT`, `_THROWS*`, `_NOTHROW`, comparison and
-  `_UNARY` forms, any of them ending in `_MESSAGE`. A project macro named like
-  one (`EXPECT_SKIP_IF`) is not an assertion. A test is Unity's `void test_name(void)`,
-  GoogleTest's `TEST` or `TEST_F`, or a Catch2 or doctest `TEST_CASE` of plain
-  strings. A changed assertion may hold no `&&`, `||`, `?:`, assignment, `++`,
-  `--`, `throw` or `return`, no name of a macro the file defines, and, for a
-  `*_MESSAGE` macro, no message but a string literal, which may run only when
-  the assertion fails;
-- add whole new tests of a kind the file already has. Every name in a new test
-  is one the file's code already uses (not after `.` or `->`), an assertion
-  macro, a local the test declares at its own level (`auto x = ...`, `int
-  x{...}`, `T x;`, a pointer or reference only after a keyword such as `auto*`
-  or `const T&`) or in a `for` head, used after the declaration in its scope,
-  or one of these keywords: types and qualifiers, `static`, `sizeof`,
-  `static_cast`, `this`, `true`, `false`, `nullptr`, `if`, `else`, `for`,
-  `while`, `do`, `switch`, `case`, `default`, `break`, `continue`, and `using`
-  only as `using namespace a::b;` or `using a::b;`. No name in it may end the
-  process, jump out of a test, skip or end a test, or reach the framework's
-  own state, even where the file uses it (`exit`, `abort`, `longjmp`,
-  `system`, `fork`, `exec*`, `signal`, `raise`, `main`, `setUp`, `tearDown`,
-  `RUN_TEST`, `UNITY_END`, `TEST_IGNORE`, `TEST_PASS`, `GTEST_SKIP`, `SKIP`,
-  `testing`, `Catch`, `doctest`, and any name starting with `_`, `Unity`,
-  `UNITY_`, `GTEST_`, `DOCTEST_` or `CATCH_`), and none may be a macro the
-  file defines. So that the existing tests run as before, a new `TEST`,
-  `TEST_F` or `TEST_CASE` comes after every existing test, and a new Unity
-  test is registered, if at all, only with `RUN_TEST(name);` in `main`,
-  Arduino's `setup` or ESP-IDF's `app_main`, after every statement but
-  `UNITY_END();`, `return UNITY_END();`, `return 0;` and directives, and only
-  in a file where no other code names `RUN_TEST` (Arduino's `loop` runs after
-  `setup`).
+A new test is not exempt, as in Python test files (the owner's decision of
+2026-11-06): a new Unity, GoogleTest, Catch2 or doctest test, and its
+`RUN_TEST` registration, need approval whatever they hold. A new test can call
+code the file or its headers already reach, such as a function that ends the
+process, or write memory the framework reads, and no check of its names rules
+that out.
 
 Comments, blank lines and how a statement is split across lines do not count:
-the guard compares tokens. Anything else is a hit: an assertion added, removed
-or moved, a call's argument, a name or a macro changed, any statement that is
-not an assertion of the test's own body (an `if`, `for`, block, declaration or
-`return`, even around an assertion), a test's header, a fixture, a helper,
-`setUp`, a runner, a registration reordered, a directive line changed, a
-rename, addition, deletion or mode change, and a header or any other file in a
-test directory. The guard fails closed on a file it cannot read as the compiler
-does: a line splice (a backslash at a line's end), a trigraph, a digraph, a
-carriage return inside a line, a form feed or other control character, a
-character that is not ASCII outside comments and literals, a changed line
-holding anything but printable ASCII and tabs, a literal it cannot read, a stray `#`, unbalanced
-brackets, a preprocessor branch that opens or closes a bracket it does not
-close or open, and any use of `__LINE__` or `__COUNTER__`, whose values move
-with the lines around them. The guard does not expand macros from headers or
-follow the code a test reaches, so an exempt change can still give that code
-other values, and a new test can still run code the file already names (a
-function that ends the process, or an out-of-bounds write through a pointer
-the file already uses). A new test runs after its own file's tests, not
-necessarily after another file's in the same binary, and a runner set to
-shuffle tests can run it first. A new Unity test that is not `static` can
-replace a weak function of the same name elsewhere.
+the guard compares tokens. Anything else is a hit: a new test, a test removed
+or renamed, an assertion added, removed or moved, a call's argument, a name or
+a macro changed (`x` to `::x` too), any statement that is not an assertion of
+the test's own body (an `if`, `for`, block, declaration or `return`, even
+around an assertion), a test's header, a fixture, a helper, `setUp`, a runner
+or its registrations, a directive line changed, a rename, addition, deletion
+or mode change, and a header or any other file in a test directory. The guard
+fails closed on a file it cannot read as the compiler does: a line splice (a
+backslash at a line's end), a trigraph, a digraph, a carriage return inside a
+line, a form feed or other control character, a character that is not ASCII
+outside comments and literals, a changed line holding anything but printable
+ASCII and tabs, a literal it cannot read, a stray `#`, unbalanced brackets, a
+preprocessor branch that opens or closes a bracket it does not close or open,
+and any use of `__LINE__` or `__COUNTER__`, whose values move with the lines
+around them. The guard does not expand macros from headers or follow the code
+a test reaches, so an exempt change can still give that code other values.
 
 Unity `RUN_TEST(name)` registrations and `void test_name(void)` definitions are
 still counted, so a hit names the tests a change removed. Editing a source or

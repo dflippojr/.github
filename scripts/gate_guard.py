@@ -579,8 +579,7 @@ def removed_test_hits(files):
 #     not model what pytest collects or skips, so any other change to such a
 #     file is a hit; and except a C/C++ source edited in place whose change
 #     only replaces literals and comparison operators in assertions of its
-#     existing tests or adds new tests of the file's own names, run after the
-#     existing ones (issue #43, see _c_cpp_unexempt);
+#     existing tests; a new test is a hit (issue #43, see _c_cpp_unexempt);
 #   - a change to a CMake file anywhere, which can register or drop tests;
 #   - an added, deleted or renamed C/C++ source or header anywhere, or a
 #     changed submodule;
@@ -960,9 +959,16 @@ C_MOVING = re.compile(r"\b__(?:LINE|COUNTER)__\b")
 C_CONDITIONAL = re.compile(r"#\s*(if|ifdef|ifndef|elif|elifdef|elifndef|else|endif)\b")
 C_DEFINE = re.compile(r"#\s*(?:define|undef)\s+([A-Za-z_]\w*)")
 C_BRACKETS = {"(": ")", "[": "]", "{": "}"}
-# An int or float literal, with no user-defined suffix.
-C_NUMBER = re.compile(r"(?:0[xX][\da-fA-F'.]+(?:[pP][-+]?\d+)?|0[bB][01']+"
-                      r"|(?:\d[\d']*(?:\.[\d']*)?|\.\d[\d']*)(?:[eE][-+]?\d+)?)[uUlLfFzZ]*")
+# An int or float literal with a built-in suffix only: an integer's u, l or ll (in either order), a floating
+# literal's f or l. Any other suffix, such as 0f, 1.0ff or 0_wipe, makes a user-defined literal, which calls a
+# literal operator, even one whose name has no leading underscore (compilers only warn). C++23's z is left out:
+# a compiler older than it reads 1z as a user-defined literal.
+C_DIGITS = r"\d(?:'?\d)*"
+C_HEX_DIGITS = r"[\da-fA-F](?:'?[\da-fA-F])*"
+C_NUMBER = re.compile(
+    rf"(?:(?:0[xX]{C_HEX_DIGITS}|0[bB][01](?:'?[01])*|{C_DIGITS})(?:[uU](?:ll|LL|[lL])?|(?:ll|LL|[lL])[uU]?)?"
+    rf"|(?:(?:{C_DIGITS}\.(?:{C_DIGITS})?|\.{C_DIGITS})(?:[eE][-+]?{C_DIGITS})?|{C_DIGITS}[eE][-+]?{C_DIGITS}"
+    rf"|0[xX](?:{C_HEX_DIGITS}(?:\.(?:{C_HEX_DIGITS})?)?|\.{C_HEX_DIGITS})[pP][-+]?{C_DIGITS})[fFlL]?)")
 # The frameworks' own assertion macros, by name, so a project macro such as
 # EXPECT_SKIP_IF or CHECK_OR_IGNORE is not one: Unity's TEST_ASSERT and the
 # TEST_ASSERT_* names built from its words, GoogleTest's EXPECT_* and ASSERT_*
@@ -989,41 +995,6 @@ C_UNSAFE = {"&&", "||", "?", "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^="
 # Operators that bind looser than a comparison: an operand of a comparison read as one holds none of them at its
 # own level.
 C_LOOSER = {"&", "^", "|", ":"} | C_UNSAFE
-C_KEYWORDS = frozenset("""
-    alignas alignof and and_eq asm auto bitand bitor bool break case catch char char8_t char16_t char32_t class
-    compl concept const consteval constexpr constinit const_cast continue co_await co_return co_yield decltype
-    default delete do double dynamic_cast else enum explicit export extern false float for friend goto if inline
-    int long mutable namespace new noexcept not not_eq nullptr operator or or_eq private protected public register
-    reinterpret_cast requires restrict return short signed sizeof static static_assert static_cast struct switch
-    template this thread_local throw true try typedef typeid typename union unsigned using virtual void volatile
-    wchar_t while xor xor_eq""".split())
-# The keywords a new test may use: types, qualifiers, literals, sizeof, static_cast and control flow that stays
-# in the test. Not return, goto, throw, asm, extern, new, delete, a reinterpreting cast or a type definition;
-# using and namespace only as using namespace a::b; or using a::b; (C_USING).
-C_NEW_KEYWORDS = frozenset("""
-    auto bool break case char char8_t char16_t char32_t const constexpr continue decltype default do double else
-    false float for if int long nullptr short signed sizeof static static_cast switch this true unsigned void
-    wchar_t while""".split())
-# Keywords that can start a declaration a new test makes.
-C_DECL_KEYWORDS = frozenset("""
-    auto bool char char8_t char16_t char32_t const constexpr double float int long short signed static unsigned
-    void wchar_t""".split())
-C_USING = re.compile(r"using (?:namespace \w+(?: :: \w+)*|\w+(?: :: \w+)+) ;")
-# Names a new test may not use even where the file already does: they end or replace the process, jump out of
-# a test, change what the test framework records or runs, or skip or end a test.
-C_DENIED = frozenset("""
-    abort alarm app_main at_quick_exit atexit close dlopen dlsym doctest dup dup2 dup3 execl execle execlp execv
-    execve execvp execvpe exit fclose fexecve fork freopen kill killpg longjmp loop main popen posix_spawn
-    posix_spawnp pthread_exit pthread_kill quick_exit raise set_terminate setjmp setUp setup siglongjmp sigaction
-    signal sigsetjmp suiteSetUp suiteTearDown syscall system tearDown terminate testing thrd_exit vfork Catch SKIP
-    SUCCEED RUN_TEST RUN_TEST_CASE RUN_TEST_GROUP RUN_ALL_TESTS TEST_PROTECT TEST_ABORT TEST_IGNORE
-    TEST_IGNORE_MESSAGE TEST_PASS TEST_PASS_MESSAGE""".split())
-C_DENIED_PREFIX = re.compile(r"_|Unity|UNITY_|GTEST_|DOCTEST_|CATCH_|INTERNAL_CATCH")
-# The statements a runner may hold after the RUN_TEST of a new test: nothing that runs a test.
-C_TAIL = {"UNITY_END ( ) ;", "return UNITY_END ( ) ;", "( void ) UNITY_END ( ) ;", "return 0 ;", "return ;"}
-# The functions that start a test program, where a new Unity test may be registered: main, Arduino's setup and
-# ESP-IDF's app_main.
-C_ENTRY = {("int", "main", "("), ("void", "setup", "("), ("void", "app_main", "(")}
 
 # line and end: the lines a token starts and ends on; spaced: whether a space or comment comes before it.
 CToken = collections.namedtuple("CToken", "kind text line spaced end")
@@ -1325,129 +1296,6 @@ def _c_test_name(test):
     return test[1] if test[0] != "gtest" else f"{test[1]}.{test[2]}"
 
 
-def _c_runner_change(old, new, unity, others):
-    """Why changing the function old to new is more than registering new Unity tests (names in unity) with
-    RUN_TEST in a program's entry point, after every test it already runs, or None. others is whether code of
-    the old file outside its entry points names RUN_TEST, so it may run tests after them (Arduino's loop)."""
-    if old.head[:3] not in C_ENTRY or new.head != old.head:
-        return "it changes code outside a test body: a helper, a fixture, a declaration or a runner"
-    if others:
-        return (f"it registers a new test in {old.head[1]} of a file that runs tests outside main, setup and "
-                "app_main too, which may run after it")
-    runner = f"it changes the runner {old.head[1]} other than by adding RUN_TEST(name); once for each new test"
-    statements = [_c_statements(old.body), _c_statements(new.body)]
-    keys = [[_c_texts(s) for s in side] for side in statements]
-    registered = set()
-    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, *keys, autojunk=False).get_opcodes():
-        if op == "equal":
-            continue
-        if op != "insert":
-            return runner
-        for s in statements[1][j1:j2]:
-            words = [t.text for t in s]
-            if len(words) != 5 or words[:2] != ["RUN_TEST", "("] or words[3:] != [")", ";"] \
-                    or words[2] not in unity or words[2] in registered:
-                return runner
-            registered.add(words[2])
-        if any(s[0].kind != "directive" and _c_texts(s) not in C_TAIL for s in statements[0][i1:]):
-            return (f"it registers a new test in {old.head[1]} before a statement that may run an existing test; "
-                    "a new test runs after the tests the file already runs")
-    return None
-
-
-def _c_declares(statement, start, vocabulary, loop):
-    """The index of the name a declaration at statement[start:] declares, or None. A declaration here is a
-    type the file already names or a type keyword, then the name, then =, {, [, ; or, in a range for, :. A
-    pointer or reference declaration must start with a keyword, so it cannot be read as an expression."""
-    angle, end = 0, None
-    for k in range(start, len(statement)):
-        t = statement[k]
-        if t.text in ("=", "{", "[", ";") or (loop and t.text == ":"):
-            if not angle:
-                end = k
-                break
-        if t.text == "<":
-            angle += 1
-        elif t.text in (">", ">>"):
-            angle -= len(t.text)
-        elif t.text == "," and angle > 0 or t.kind == "number" and angle > 0:
-            pass
-        elif t.text not in ("::", "*", "&", "&&") and not (t.kind == "name" and (
-                t.text in C_DECL_KEYWORDS or t.text not in C_KEYWORDS)):
-            return None
-        if angle < 0:
-            return None
-    if end is None or end - start < 2 or statement[end - 1].kind != "name" or statement[end - 1].text in C_KEYWORDS:
-        return None
-    specs = statement[start:end - 1]
-    if any(t.kind == "name" and t.text not in C_DECL_KEYWORDS and t.text not in vocabulary for t in specs):
-        return None
-    if specs[0].text not in C_DECL_KEYWORDS and (specs[0].kind != "name" or any(
-            t.text in ("*", "&", "&&") for t in specs)):
-        return None
-    return end - 1
-
-
-def _c_name_unsafe(name, allowed, macros):
-    """Why a new test may not use the name, or None."""
-    if name in C_KEYWORDS:
-        return None if name in C_NEW_KEYWORDS else f"it uses the keyword {name}"
-    if name in C_DENIED or C_DENIED_PREFIX.match(name):
-        return (f"it names {name}, which can end the process, jump out of a test, skip a test, or reach the test "
-                "framework's own state")
-    if name in macros:
-        return f"it names {name}, a macro the file defines"
-    if C_ASSERT.match(name) or name in allowed:
-        return None
-    return f"it names {name}, which the file's existing code does not"
-
-
-def _c_new_test_unsafe(item, vocabulary, macros):
-    """Why the new test item is more than a test of names the file already uses, or None.
-
-    Every name in its body is one the old file's code already uses, an
-    assertion macro, a keyword of C_NEW_KEYWORDS, or a local it declares
-    (_c_declares) at its body's own level, used after the declaration, or in
-    a for statement's head, used in that for statement. None is denied
-    (C_DENIED, C_DENIED_PREFIX) or a macro the file defines. A member name
-    after . or -> is not checked: it names a member of an object, not a
-    function or variable of its own.
-    """
-    name = _c_test_name(item.test)
-    named = next((w for w in item.head if w in macros or C_DENIED_PREFIX.match(w)), None)
-    if named:
-        return f"the new test {name} is named with {named}, a macro the file defines or a reserved name"
-    if item.test[0] == "gtest" and item.head[0] == "TEST_F" and item.test[1] not in vocabulary:
-        return f"the new test {name} uses the fixture {item.test[1]}, which the file's existing code does not name"
-    known = set()
-    for statement in _c_statements(item.body):
-        declared = {}
-        top = _c_declares(statement, 0, vocabulary, False)
-        if top is not None:
-            declared[top] = known
-        if [t.text for t in statement[:2]] == ["for", "("]:
-            loop = _c_declares(statement, 2, vocabulary, True)
-            if loop is not None:
-                declared[loop] = set()
-        allowed = set(vocabulary) | known
-        using = C_USING.fullmatch(_c_texts(statement))
-        for k, t in enumerate(statement):
-            if t.kind != "name" or (k and statement[k - 1].text in (".", "->")) or (
-                    using and t.text in ("using", "namespace")):
-                continue
-            if k in declared:
-                why = _c_name_unsafe(t.text, {t.text}, macros)
-                if why:
-                    return f"the new test {name} declares a local that {why[3:]}"
-                declared[k].add(t.text)
-                allowed.add(t.text)
-                continue
-            why = _c_name_unsafe(t.text, allowed, macros)
-            if why:
-                return f"the new test {name} {why[3:]}" if why.startswith("it ") else why
-    return None
-
-
 def _c_unreadable(text):
     """Why the guard cannot read one side of a C/C++ file as the compiler does, or None."""
     if C_CONTROL.search(text) or "\r" in text:
@@ -1463,20 +1311,14 @@ def _c_cpp_unexempt(fd):
     """Why fd, a C/C++ source in a test directory of a C/C++ repository, is not exempt, or None.
 
     Issue #43: only an edit in place is exempt, and only when, read as
-    tokens, every item of the file outside its tests is unchanged and its
-    change does nothing but these:
-
-    - replace assertions of an existing test's own body (_c_test_change),
-      each new assertion the old one with only literal arguments and the
-      literal operands and operator of a comparison that is a whole argument
-      changed (_c_assert_change);
-    - add whole new tests of a kind the file already has: Unity void
-      test_name(void), GoogleTest TEST or TEST_F, or a Catch2 or doctest
-      TEST_CASE of plain strings, each of names the file already uses
-      (_c_new_test_unsafe). A self-registering test (TEST, TEST_F, TEST_CASE)
-      comes after every existing test, and a Unity test is registered, if at
-      all, with RUN_TEST in a program's entry point after every test it
-      already runs (_c_runner_change), so existing tests run as before.
+    tokens, it has the same tests, every item outside their bodies is
+    unchanged, and its change does nothing but replace assertions of an
+    existing test's own body (_c_test_change), each new assertion the old one
+    with only literal arguments and the literal operands and operator of a
+    comparison that is a whole argument changed (_c_assert_change). A new
+    test is not exempt (the owner's decision of 2026-11-06): even of names the
+    file already uses, it can call code that ends the process or write memory
+    the framework reads.
     """
     if fd.status != "modified" or fd.mode_changed or fd.modes & LINK_MODES:
         return "only an edit in place can be exempt, not a rename, an addition, a deletion or a mode change"
@@ -1503,51 +1345,31 @@ def _c_cpp_unexempt(fd):
         return "it names __LINE__ or __COUNTER__, whose values move with the lines around them"
     macros = {m.group(1) for side in tokens for t in side if t.kind == "directive"
               for m in [C_DEFINE.match(t.text)] if m}
-    # The names the old file's code uses, but for directives and member names after . or ->.
-    vocabulary = {t.text for k, t in enumerate(tokens[0])
-                  if t.kind == "name" and not (k and tokens[0][k - 1].text in (".", "->"))}
     tests = [[i for i in _c_flat(side) if i.test] for side in items]
     old = {i.test for i in tests[0]}
     if len(old) != len(tests[0]) or len({i.test for i in tests[1]}) != len(tests[1]):
         return "it defines a test twice"
-    added = [i for i in tests[1] if i.test not in old]
-    kinds = {i.test[0] for i in tests[0]}
-    for item in added:
-        if item.test[0] not in kinds:
-            return f"it adds {_c_test_name(item.test)}, a kind of test the file did not have"
-        if item.test[0] == "unity" and item.test[1] in vocabulary:
-            return f"it adds the test {item.test[1]}, a name the file's existing code already uses"
-        why = _c_new_test_unsafe(item, vocabulary, macros)
-        if why:
-            return why
-    unity = {i.test[1] for i in added if i.test[0] == "unity"}
-    others = any(t.text == "RUN_TEST" for i in items[0] if not (i.kind == "function" and i.head[:3] in C_ENTRY)
-                 for t in i.tokens)
-    why = _c_pair(items[0], items[1], {id(i) for i in added}, unity, macros, others)
-    if why:
-        return why
-    flat = list(_c_flat(items[1]))
-    last = max((k for k, i in enumerate(flat) if i.test in old), default=-1)
-    early = next((i for i in added if i.test[0] != "unity" and flat.index(i) < last), None)
-    if early:
-        return (f"it adds {_c_test_name(early.test)} before an existing test; a new test that registers itself "
-                "comes after the tests the file already has, so they run as before")
-    return None
+    removed = next((i for i in tests[0] if i.test not in {i.test for i in tests[1]}), None)
+    if removed:
+        return f"it removes a test or renames it: {_c_test_name(removed.test)}"
+    added = next((i for i in tests[1] if i.test not in old), None)
+    if added:
+        return (f"it adds the test {_c_test_name(added.test)}; a new test can run any code the file reaches, so "
+                "it is not exempt")
+    return _c_pair(items[0], items[1], macros)
 
 
-def _c_pair(old, new, added, unity, macros, others):
-    """Why the items new, with the new tests (ids in added) left out, are more than the items old with
-    assertions replaced in existing tests and new tests registered in a runner, or None."""
-    rest = [i for i in new if id(i) not in added]
-    if len(rest) != len(old):
-        return "it adds, removes or moves code that is not a new test, or removes a test"
-    for a, b in zip(old, rest):
+def _c_pair(old, new, macros):
+    """Why the items new are more than the items old with assertions replaced in existing tests, or None."""
+    if len(new) != len(old):
+        return "it adds, removes or moves code outside a test body, or removes a test"
+    for a, b in zip(old, new):
         if a.key == b.key:
             continue
         if a.kind == b.kind == "scope" and a.head == b.head:
-            why = _c_pair(a.children, b.children, added, unity, macros, others)
-        elif a.kind == b.kind == "function" and a.head == b.head:
-            why = _c_test_change(a, b, macros) if a.test else _c_runner_change(a, b, unity, others)
+            why = _c_pair(a.children, b.children, macros)
+        elif a.kind == b.kind == "function" and a.head == b.head and a.test:
+            why = _c_test_change(a, b, macros)
         else:
             why = ("it changes code outside a test body: a test's header, a helper, a fixture, a declaration, a "
                    "directive or a runner")
@@ -1581,8 +1403,8 @@ def c_cpp_hits(files, facts, flagged):
                 why = _c_cpp_unexempt(fd)
                 if why:
                     hits.append(Hit("removed-tests", fd.path, None, f"modified a C/C++ test source of a C/C++ "
-                                    f"repository: {why}; only adding tests and replacing literals or comparison "
-                                    "operators in assertions of existing tests is exempt, so this needs approval"))
+                                    f"repository: {why}; only replacing literals or comparison operators in "
+                                    "assertions of existing tests is exempt, so this needs approval"))
                 continue
             detail = f"{fd.status} a file in a test directory of a C/C++ repository"
         elif any(_name(p) == "cmakelists.txt" or _ext(p) == ".cmake" for p in fd.paths):
