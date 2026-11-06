@@ -22,11 +22,12 @@ TOUCHED = ("modified a file in a test directory of a C/C++ repository; the guard
            "so this needs approval whatever the change")
 # The hit for a modified C/C++ test source of a C/C++ repository that is not exempt (issue #43):
 # C_SOURCE.format(why).
-C_SOURCE = ("modified a C/C++ test source of a C/C++ repository: {}; only adding tests and replacing literals or "
-            "comparison operators in assertions of existing tests is exempt, so this needs approval")
+C_SOURCE = ("modified a C/C++ test source of a C/C++ repository: {}; only replacing literals or comparison operators "
+            "in assertions of existing tests is exempt, so this needs approval")
 DIRECTIVE = "it changes a directive line, which the guard does not read"
 SPLICE = "it splices a line with a backslash at its end"
-RUNNER = "it changes the runner main other than by adding RUN_TEST(name); once for each new test"
+RUNNER = ("it changes code outside a test body: a test's header, a helper, a fixture, a declaration, a directive or "
+          "a runner")
 # A platformio.ini whose extra_configs or test_dir the guard does not follow: OPEN.format(path, option).
 OPEN = "PlatformIO {} names {}, so any changed file may be a config PlatformIO loads or a test it runs"
 # A symbolic link or submodule at or in a test directory of a C/C++ repository.
@@ -791,7 +792,7 @@ class RuleDetails(unittest.TestCase):
 """, "test/test_c/test_main.cpp")
         hits = {h.path: h.detail for h in analyze_text(diff)}
         self.assertEqual(hits, {"test/test_a/test_main.cpp": C_SOURCE.format(
-            "it adds, removes or moves code that is not a new test, or removes a test"),
+            "it removes a test or renames it: test_b"),
                                 "test/test_c/test_main.cpp": C_SOURCE.format(DIRECTIVE)})
         # Into a file with a #define that may rename the test, too.
         diff = removed + self.platformio_diff(""" #define test_b test_c
@@ -805,7 +806,7 @@ class RuleDetails(unittest.TestCase):
         hits = {h.path: h.detail for h in analyze_text(diff)}
         self.assertEqual(set(hits), {"test/test_a/test_main.cpp", "test/test_c/test_main.cpp"})
         self.assertEqual(hits["test/test_c/test_main.cpp"], C_SOURCE.format(
-            "the new test test_b is named with test_b, a macro the file defines or a reserved name"))
+            "it adds the test test_b; a new test can run any code the file reaches, so it is not exempt"))
 
     def test_earlier_preprocessor_escapes_are_hits(self):
         """Rounds 8 and 9: alternative directive spellings and trigraphs. The guard no longer
@@ -1531,10 +1532,10 @@ class RuleDetails(unittest.TestCase):
         text = (base or self.UNITY_SRC).replace("int main", "void test_clamp_mid(void) {\n" + body + "}\n\nint main")
         return text.replace("    return UNITY_END", "    RUN_TEST(test_clamp_mid);\n    return UNITY_END") if register else text
 
-    def test_c_cpp_test_sources_are_exempt_only_for_new_tests_and_assertion_literals(self):
+    def test_c_cpp_test_sources_are_exempt_only_for_assertion_literals(self):
         """Issue #43: in a C/C++ test source edited in place, only replaced literal arguments and whole-argument
-        comparisons of existing tests' assertions, and new tests of the file's own names, run after the
-        existing ones, are exempt."""
+        comparisons of existing tests' assertions are exempt. A new test is not (the owner's decision of
+        2026-11-06), whatever it holds and wherever it is registered."""
         u, g, c = self.UNITY_SRC, self.GTEST_SRC, self.CATCH_SRC
         no_hit = {
             "a number, a negative number and a string": (u, u.replace("EQUAL(0,", "EQUAL(-1,").replace('"low"', '"min"')),
@@ -1556,30 +1557,13 @@ class RuleDetails(unittest.TestCase):
                 u.replace("void setUp", "#if defined(ARDUINO)\n#include <Arduino.h>\n#endif\n\nvoid setUp").replace(
                     "EQUAL(0,", "EQUAL(1,")),
             "a C source": (u, u.replace("EQUAL(0,", "EQUAL(2,")),
-            "a new Unity test defined before the others and registered last": (
-                u, u.replace("void test_clamp_low", "void test_clamp_mid(void) {\n    TEST_ASSERT_EQUAL(5, clamp(5, 0, 10));"
-                                                    "\n}\n\nvoid test_clamp_low").replace(
-                    "    return UNITY_END", "    RUN_TEST(test_clamp_mid);\n    return UNITY_END")),
-            "a new Unity test, not registered": (u, self.new_unity("    TEST_ASSERT_EQUAL(5, clamp(5, 0, 10));\n",
-                                                                   register=False)),
-            "a new test's locals, loop, using and static": (u.replace("int main", "namespace desk {}\n\nint main"), self.new_unity(
-                "    using namespace desk;\n    static const int top = 10;\n    int low = clamp(-5, 0, top);\n"
-                "    const auto& same = low;\n    auto* where = &low;\n    for (int v = 0; v < top; v++) {\n"
-                "        TEST_ASSERT_EQUAL(v, clamp(v, low, top));\n    }\n    TEST_ASSERT_EQUAL(same, *where);\n"
-                "    TEST_ASSERT_TRUE(label(0).empty() == false);\n",
-                u.replace("int main", "namespace desk {}\n\nint main"))),
-            "new GoogleTest tests after the others, in the namespace": (g, g.replace(
-                "\n}  // namespace", "\nTEST(Clamp, Mid) {\n  EXPECT_EQ(5, clamp(5, 0, 10));\n}\n\nTEST_F(ClampTest, Top) {\n"
-                                     "  EXPECT_LE(clamp(99, 0, limit_), limit_);\n}\n\n}  // namespace")),
+            "built-in integer and floating suffixes": (
+                u.replace("EQUAL(0,", "EQUAL(1u,").replace("== 5);", "== 0x1p3);"),
+                u.replace("EQUAL(0,", "EQUAL(2ULL,").replace("== 5);", "== 0x1.8p-3f);")),
+            "digit separators, octal, binary and a floating suffix": (
+                u.replace("EQUAL(0,", "EQUAL(1'000,").replace("== 5);", "== 1.5L);"),
+                u.replace("EQUAL(0,", "EQUAL(0b1'0,").replace("== 5);", "== .5e+2f);")),
             "a GoogleTest literal": (g, g.replace("EXPECT_EQ(0,", "EXPECT_EQ(1,")),
-            "a new Catch2 and doctest TEST_CASE": (c, c + 'TEST_CASE("clamp high", "[clamp]") {\n    REQUIRE(clamp(50, 0, 10) '
-                                                      '== 10);\n}\n\nTEST_CASE("clamp mid") {\n    CHECK_EQ(clamp(5, 0, '
-                                                      '10), 5);\n}\n'),
-            "a new test's template declarations": (u.replace("void setUp", "static std::array<int, 3> kCases;\nvoid setUp"),
-                                                   self.new_unity("    std::array<int, 3> values{};\n    TEST_ASSERT_EQUAL(0, "
-                                                                  "values[0]);\n", u.replace(
-                                                                      "void setUp", "static std::array<int, 3> kCases;\n"
-                                                                                    "void setUp"))),
             "an edit beside a trailing item with no semicolon": (u + "CLAMP_SUITE_END\n",
                                                                   u.replace("EQUAL(0,", "EQUAL(1,") + "CLAMP_SUITE_END\n"),
             "a directive at the end with no newline": (u + "#pragma once", u.replace("EQUAL(0,", "EQUAL(1,") + "#pragma once"),
@@ -1591,13 +1575,17 @@ class RuleDetails(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(self.c_reasons(old, new, path), [])
         outside = "outside its literal arguments and the literal operands and operator of a comparison"
-        new_name = "the new test test_clamp_mid names {}, which the file's existing code does not"
-        denied = ("the new test test_clamp_mid names {}, which can end the process, jump out of a test, skip a test, or "
-                  "reach the test framework's own state")
-        tail = "a new test runs after the tests the file already runs"
+        added = "it adds the test test_clamp_mid; a new test can run any code the file reaches, so it is not exempt"
         hit = {
             "a call's argument": (u, u.replace("clamp(-5, 0, 10)", "clamp(-5, 1, 10)"), outside),
             "+1": (u, u.replace("EQUAL(0,", "EQUAL(+1,"), outside),
+            "a user-defined suffix with no underscore, 0f": (u, u.replace("EQUAL(0,", "EQUAL(0f,"), outside),
+            "a user-defined suffix on a float, 1.0ff": (u, u.replace("EQUAL(0,", "EQUAL(1.0ff,"), outside),
+            "C++23's z, a user-defined literal to an older compiler": (u, u.replace("EQUAL(0,", "EQUAL(1z,"), outside),
+            "a fourth L": (u, u.replace("EQUAL(0,", "EQUAL(1LLL,"), outside),
+            "an integer suffix on a float, 1e5ul": (u, u.replace("EQUAL(0,", "EQUAL(1e5ul,"), outside),
+            "a numeric user-defined literal": (u, u.replace("EQUAL(0,", "EQUAL(0_wipe,"), outside),
+            "a qualified global for a name": (u, u.replace("label(0)", "::label(0)"), outside),
             "~1": (u, u.replace("EQUAL(0,", "EQUAL(~1,"), outside),
             "- -1": (u, u.replace("EQUAL(0,", "EQUAL(- -1,"), outside),
             "-x": (u, u.replace("EQUAL(0,", "EQUAL(-x,"), outside),
@@ -1650,21 +1638,21 @@ class RuleDetails(unittest.TestCase):
             "a stray #": (u, u.replace("label(0));", "label(0)); # x"), "holds a # outside a directive"),
             "## outside a directive": (u, u.replace("label(0));", "label(0)); a ## b;"), "holds a ## outside a directive"),
             "a dollar sign": (u, self.new_unity("    int a$b = 0;\n"), "which the guard does not read as C/C++"),
-            "a new test: an unknown name": (u, self.new_unity("    TEST_ASSERT_TRUE(getpid() > 0);\n"), new_name.format("getpid")),
-            "a new test: a qualified unknown name": (u, self.new_unity("    std::quick_exit(0);\n"), new_name.format("std")),
+            "a new test: an unknown name": (u, self.new_unity("    TEST_ASSERT_TRUE(getpid() > 0);\n"), added),
+            "a new test: a qualified unknown name": (u, self.new_unity("    std::quick_exit(0);\n"), added),
             "a new test: a member of an unknown object": (u, self.new_unity("    Unity_state.failures = 0;\n"),
-                                                          denied.format("Unity_state")),
+                                                          added),
         }
         for name in ("exit", "abort", "longjmp", "UNITY_END", "RUN_TEST", "main", "setUp", "GTEST_SKIP", "TEST_IGNORE",
                      "TEST_PASS", "Unity", "UnityEnd", "_exit", "__builtin_trap", "testing", "Catch", "doctest", "SKIP"):
             hit[f"a new test names {name}, though the file does"] = (
                 u.replace("void setUp", f"void ({name});\nvoid setUp"),
                 self.new_unity(f"    {name}();\n", u.replace("void setUp", f"void ({name});\nvoid setUp")),
-                denied.format(name))
+                added)
         for keyword in ("goto", "throw", "asm", "new", "delete", "reinterpret_cast", "typedef", "struct", "operator",
                         "extern", "return", "try"):
             hit[f"a new test uses {keyword}"] = (u, self.new_unity(f"    {keyword} x;\n"),
-                                                 f"the new test test_clamp_mid uses the keyword {keyword}")
+                                                 added)
         hit.update({
             "mismatched brackets": (u, self.new_unity("    int a = (clamp];\n    int b = [clamp);\n"),
                                     "its brackets do not balance"),
@@ -1675,43 +1663,43 @@ class RuleDetails(unittest.TestCase):
                 u.replace("void test_clamp_low(void) {", "void test_clamp_low(void)\n#ifdef HW\n#endif\n{").replace(
                     "EQUAL(0,", "EQUAL(1,"), "it changes code outside a test body"),
             "a new test: a declaration of a type the file does not name": (u, self.new_unity("    Gauge g = 1;\n"),
-                                                                            new_name.format("Gauge")),
+                                                                            added),
             "a new test: a template closed before it opens": (u, self.new_unity("    int x = 0;\n    x > getpid = 1;\n"),
-                                                              new_name.format("getpid")),
+                                                              added),
             "a new test: a local named exit": (u, self.new_unity("    int exit = 0;\n"),
-                                               "the new test test_clamp_mid declares a local that names exit"),
+                                               added),
             "a new test: a pointer to a type the file names": (u.replace("void setUp", "struct Range;\nvoid setUp"),
                                                               self.new_unity("    Range* r = 0;\n", u.replace(
                                                                   "void setUp", "struct Range;\nvoid setUp")),
-                                                              new_name.format("r")),
+                                                              added),
             "a new test: a constructor call is no declaration": (u, self.new_unity("    int getpid(0);\n"),
-                                                                 new_name.format("getpid")),
-            "a new test: a second declarator": (u, self.new_unity("    int a = 0, getpid = 1;\n"), new_name.format("getpid")),
-            "a new test: a structured binding": (u, self.new_unity("    auto [lo, hi] = range();\n"), new_name.format("lo")),
-            "a new test: a type alias": (u, self.new_unity("    using T = int;\n"), "uses the keyword using"),
+                                                                 added),
+            "a new test: a second declarator": (u, self.new_unity("    int a = 0, getpid = 1;\n"), added),
+            "a new test: a structured binding": (u, self.new_unity("    auto [lo, hi] = range();\n"), added),
+            "a new test: a type alias": (u, self.new_unity("    using T = int;\n"), added),
             "a new test: using a denied namespace": (u.replace("void setUp", "namespace testing {}\nvoid setUp"),
                                                     self.new_unity("    using namespace testing;\n", u.replace(
                                                         "void setUp", "namespace testing {}\nvoid setUp")),
-                                                    denied.format("testing")),
+                                                    added),
             "a new test: a declaration in a nested block": (u, self.new_unity("    if (1) {\n        int getpid = 0;\n"
                                                                               "        TEST_ASSERT_EQUAL(0, getpid);\n    }\n"),
-                                                            new_name.format("getpid")),
+                                                            added),
             "a new test: a lambda's parameter": (u, self.new_unity("    auto f = [](int getpid) { TEST_ASSERT_TRUE(getpid); };\n"),
-                                                 new_name.format("getpid")),
+                                                 added),
             "a new test named like a file macro": (u.replace("void setUp", "#define test_clamp_mid test_clamp_low\nvoid setUp"),
                                                    self.new_unity("    TEST_ASSERT_TRUE(1);\n", u.replace(
                                                        "void setUp", "#define test_clamp_mid test_clamp_low\nvoid setUp")),
-                                                   "named with test_clamp_mid, a macro the file defines"),
+                                                   added),
             "a new test registered twice": (u, self.new_unity("    TEST_ASSERT_TRUE(1);\n").replace(
-                "    return UNITY_END", "    RUN_TEST(test_clamp_mid);\n    return UNITY_END"), "changes the runner main"),
+                "    return UNITY_END", "    RUN_TEST(test_clamp_mid);\n    return UNITY_END"), added),
             "a registration of a test the change does not add": (u, u.replace(
-                "    return UNITY_END", "    RUN_TEST(test_elsewhere);\n    return UNITY_END"), "changes the runner main"),
+                "    return UNITY_END", "    RUN_TEST(test_elsewhere);\n    return UNITY_END"), "outside a test body"),
             "a new test registered before a statement that is not the runner's end": (
                 u.replace("    return UNITY_END();", "    int failures = UNITY_END();\n    return failures;"),
                 self.new_unity("    TEST_ASSERT_TRUE(1);\n", u.replace("    return UNITY_END();",
                                                                     "    int failures = UNITY_END();\n    return failures;"),
                                register=False).replace("    int failures", "    RUN_TEST(test_clamp_mid);\n    int failures"),
-                tail),
+                added),
             "a project macro named like an assertion": (
                 g.replace("  EXPECT_EQ(0, clamp", "  EXPECT_SKIP_IF(board() == 0);\n  EXPECT_EQ(0, clamp"),
                 g.replace("  EXPECT_EQ(0, clamp", "  EXPECT_SKIP_IF(board() == 1);\n  EXPECT_EQ(0, clamp"),
@@ -1722,20 +1710,50 @@ class RuleDetails(unittest.TestCase):
                 u.replace("int main(int argc, char **argv)", "void test_clamp_mid(void) {\n    TEST_ASSERT_TRUE(1);\n}"
                           "\n\nvoid loop() {\n    RUN_TEST(test_clamp_low);\n}\n\nvoid setup()").replace(
                     "    return UNITY_END", "    RUN_TEST(test_clamp_mid);\n    return UNITY_END"),
-                "runs tests outside main, setup and app_main"),
+                added),
             "a new GoogleTest test between existing ones": (g, g.replace("TEST_F(ClampTest, High)", "TEST(Clamp, Mid) {\n"
                                                                          "  EXPECT_EQ(5, clamp(5, 0, 10));\n}\n\n"
                                                                          "TEST_F(ClampTest, High)"),
-                                                           "it adds Clamp.Mid before an existing test"),
+                                                           "it adds the test Clamp.Mid"),
             "a new TEST_F with a fixture the file does not name": (g, g.replace("\n}  // namespace", "\nTEST_F(Other, Mid) {\n"
                                                                                 "  EXPECT_EQ(5, clamp(5, 0, 10));\n}\n\n"
                                                                                 "}  // namespace"),
-                                                                  "uses the fixture Other"),
+                                                                  "it adds the test Other.Mid"),
             "a new test in a new namespace": (g, g + "\nnamespace more {\nTEST(Clamp, Mid) {\n  EXPECT_EQ(5, clamp(5, 0, 10));"
-                                                     "\n}\n}  // namespace more\n", "not a new test"),
+                                                     "\n}\n}  // namespace more\n", "it adds the test Clamp.Mid"),
             "a new test with a doctest decorator": (c, c + 'TEST_CASE("clamp high" * doctest::skip()) {\n    REQUIRE(true);\n}\n',
-                                                    "not a new test"),
+                                                    "outside a test body"),
         })
+        # New tests of every shape the reverted new-test exemption once accepted are hits now.
+        new_tests = {
+            "a new Unity test defined before the others and registered last": (
+                u, u.replace("void test_clamp_low", "void test_clamp_mid(void) {\n    TEST_ASSERT_EQUAL(5, clamp(5, 0, 10));"
+                                                    "\n}\n\nvoid test_clamp_low").replace(
+                    "    return UNITY_END", "    RUN_TEST(test_clamp_mid);\n    return UNITY_END")),
+            "a new Unity test, not registered": (u, self.new_unity("    TEST_ASSERT_EQUAL(5, clamp(5, 0, 10));\n",
+                                                                   register=False)),
+            "a new test's locals, loop, using and static": (u.replace("int main", "namespace desk {}\n\nint main"), self.new_unity(
+                "    using namespace desk;\n    static const int top = 10;\n    int low = clamp(-5, 0, top);\n"
+                "    const auto& same = low;\n    auto* where = &low;\n    for (int v = 0; v < top; v++) {\n"
+                "        TEST_ASSERT_EQUAL(v, clamp(v, low, top));\n    }\n    TEST_ASSERT_EQUAL(same, *where);\n"
+                "    TEST_ASSERT_TRUE(label(0).empty() == false);\n",
+                u.replace("int main", "namespace desk {}\n\nint main"))),
+            "new GoogleTest tests after the others, in the namespace": (g, g.replace(
+                "\n}  // namespace", "\nTEST(Clamp, Mid) {\n  EXPECT_EQ(5, clamp(5, 0, 10));\n}\n\nTEST_F(ClampTest, Top) {\n"
+                                     "  EXPECT_LE(clamp(99, 0, limit_), limit_);\n}\n\n}  // namespace")),
+            "a new Catch2 and doctest TEST_CASE": (c, c + 'TEST_CASE("clamp high", "[clamp]") {\n    REQUIRE(clamp(50, 0, 10) '
+                                                      '== 10);\n}\n\nTEST_CASE("clamp mid") {\n    CHECK_EQ(clamp(5, 0, '
+                                                      '10), 5);\n}\n'),
+            "a new test's template declarations": (u.replace("void setUp", "static std::array<int, 3> kCases;\nvoid setUp"),
+                                                   self.new_unity("    std::array<int, 3> values{};\n    TEST_ASSERT_EQUAL(0, "
+                                                                  "values[0]);\n", u.replace(
+                                                                      "void setUp", "static std::array<int, 3> kCases;\n"
+                                                                                    "void setUp"))),
+        }
+        others = {"new GoogleTest tests after the others, in the namespace": "it adds the test Clamp.Mid",
+                  "a new Catch2 and doctest TEST_CASE": 'it adds the test "clamp high"'}
+        for name, (old, new) in new_tests.items():
+            hit[name] = (old, new, others.get(name, added))
         for name, (old, new, why) in hit.items():
             with self.subTest(name):
                 reasons = self.c_reasons(old, new)
@@ -1781,12 +1799,12 @@ class RuleDetails(unittest.TestCase):
         added = unity.replace("int main() {", "void test_clamp_high(void) {\n  TEST_ASSERT_EQUAL(10, clamp(50, 0, 10));\n}\n"
                                               "int main() {").replace("  RUN_TEST(test_clamp_low);\n",
                                                                        "  RUN_TEST(test_clamp_low);\n  RUN_TEST(test_clamp_high);\n")
-        for head in (unity.replace("(0, clamp", "(2, clamp"), added):
+        self.assertEqual(judge_commits(base, dict(base, **{"firmware/test/test_logic/test_main.cpp": unity.replace(
+            "(0, clamp", "(2, clamp")})), [])
+        for head in (added, added.replace("TEST_ASSERT_EQUAL(10, clamp(50, 0, 10));", "exit(0);")):
             with self.subTest(head=head):
-                self.assertEqual(judge_commits(base, dict(base, **{"firmware/test/test_logic/test_main.cpp": head})), [])
-        [hit] = judge_commits(base, dict(base, **{"firmware/test/test_logic/test_main.cpp": added.replace(
-            "TEST_ASSERT_EQUAL(10, clamp(50, 0, 10));", "exit(0);")}))
-        self.assertIn("names exit", hit.detail)
+                [hit] = judge_commits(base, dict(base, **{"firmware/test/test_logic/test_main.cpp": head}))
+                self.assertIn("it adds the test test_clamp_high", hit.detail)
         # Any change to a CMake file of a C/C++ repository is a hit: CTest registers tests there.
         cmake = {"CMakeLists.txt": "enable_testing()\nadd_test(NAME logic COMMAND logic_test)\n",
                  "cmake/tests.cmake": "set(TESTS logic)\n"}
@@ -2375,12 +2393,13 @@ class GitEndToEnd(unittest.TestCase):
                      "flag-python-cpp-collect-ignore-multiline", "pass-python-cpp-assert-approx-tolerance",
                      "pass-python-cpp-assert-beside-skipif", "flag-python-cpp-computed-globals-key",
                      "flag-python-cpp-assert-in-with", "flag-python-cpp-assert-unary-none",
-                     "pass-python-cpp-assert-negative-literal", "pass-cpp-feature-with-new-test",
-                     "pass-cpp-unity-assert-literal", "pass-cpp-gtest-new-test", "pass-cpp-catch2-new-test-case",
+                     "pass-python-cpp-assert-negative-literal", "flag-cpp-feature-with-new-test",
+                     "pass-cpp-unity-assert-literal", "flag-cpp-gtest-new-test", "flag-cpp-catch2-new-test-case",
                      "pass-cpp-assert-with-python-tests", "flag-cpp-test-edit-with-python-tests",
                      "flag-cpp-assert-call-argument", "flag-cpp-new-test-exit", "flag-cpp-run-test-before-existing",
                      "flag-cpp-line-splice", "flag-cpp-if0-around-test", "flag-cpp-ctest-registration",
-                     "flag-cpp-rename-disabled-dir"] + sorted(p.stem for p in FIXTURES.glob("*-floor-*.diff")):
+                     "flag-cpp-rename-disabled-dir", "flag-cpp-assert-udl-reserved-suffix",
+                     "flag-cpp-new-test-qualified-call"] + sorted(p.stem for p in FIXTURES.glob("*-floor-*.diff")):
             with self.subTest(fixture=name), tempfile.TemporaryDirectory() as tmp:
                 subprocess.run(["git", "init", "-q", tmp], check=True, capture_output=True)
                 text = (FIXTURES / f"{name}.diff").read_text(encoding="utf-8")

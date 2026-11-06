@@ -1,7 +1,7 @@
 # gate-guard fixture: a new test calls exit(0), a name the file already uses
 # expect: removed-tests
 # hits: 1
-# detail: names exit
+# detail: it adds the test test_clamp_middle
 
 diff --git a/firmware/test/test_logic/test_main.cpp b/firmware/test/test_logic/test_main.cpp
 index 79b38c6..0af966d 100644

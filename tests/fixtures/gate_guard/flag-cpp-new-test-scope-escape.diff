@@ -1,7 +1,7 @@
 # gate-guard fixture: a new test declares a name in an inner block and calls the global one after it
 # expect: removed-tests
 # hits: 1
-# detail: names getpid
+# detail: it adds the test test_clamp_middle
 
 diff --git a/firmware/test/test_logic/test_main.cpp b/firmware/test/test_logic/test_main.cpp
 index e6309a0..8969a09 100644

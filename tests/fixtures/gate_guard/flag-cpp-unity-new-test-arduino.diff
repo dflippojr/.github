@@ -1,6 +1,7 @@
-# gate-guard fixture: a new Unity test registered last in an Arduino setup() runner
-# expect: 
-# hits: 0
+# gate-guard fixture: a new Unity test registered last in an Arduino setup() runner; new tests are not exempt (owner decision 2026-11-06)
+# expect: removed-tests
+# hits: 1
+# detail: it adds the test test_clamp_middle
 
 diff --git a/firmware/test/test_logic/test_main.cpp b/firmware/test/test_logic/test_main.cpp
 index 0b2254e..9aca24e 100644

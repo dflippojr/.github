@@ -1,7 +1,7 @@
 # gate-guard fixture: a new Unity test named like a name the file already uses
 # expect: removed-tests
 # hits: 1
-# detail: a name the file's existing code already uses
+# detail: it adds the test test_clamp_middle_cases
 
 diff --git a/firmware/test/test_logic/test_main.cpp b/firmware/test/test_logic/test_main.cpp
 index b3579a4..d57710e 100644

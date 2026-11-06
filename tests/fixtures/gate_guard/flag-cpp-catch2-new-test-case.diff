@@ -1,6 +1,7 @@
-# gate-guard fixture: a Catch2 REQUIRE's operator changed and a new TEST_CASE after the existing one
-# expect: 
-# hits: 0
+# gate-guard fixture: a Catch2 REQUIRE's operator changed and a new TEST_CASE after the existing one; new tests are not exempt (owner decision 2026-11-06)
+# expect: removed-tests
+# hits: 1
+# detail: it adds the test "clamp high"
 
 diff --git a/tests/clamp_test.cpp b/tests/clamp_test.cpp
 index 474dc7a..38f2e5a 100644

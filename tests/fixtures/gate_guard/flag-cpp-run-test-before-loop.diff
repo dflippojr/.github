@@ -1,7 +1,7 @@
 # gate-guard fixture: a new Unity test registered in setup() while loop() still runs an existing test after it
 # expect: removed-tests
 # hits: 1
-# detail: runs tests outside main, setup and app_main
+# detail: it adds the test test_clamp_middle
 
 diff --git a/firmware/test/test_logic/test_main.cpp b/firmware/test/test_logic/test_main.cpp
 index 19730ed..87741c4 100644

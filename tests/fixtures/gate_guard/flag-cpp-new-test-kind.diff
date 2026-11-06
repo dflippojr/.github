@@ -1,7 +1,7 @@
 # gate-guard fixture: a Catch2 TEST_CASE added to a Unity test file
 # expect: removed-tests
 # hits: 1
-# detail: a kind of test the file did not have
+# detail: it adds the test "clamp middle"
 
 diff --git a/firmware/test/test_logic/test_main.cpp b/firmware/test/test_logic/test_main.cpp
 index e6309a0..25c76a3 100644

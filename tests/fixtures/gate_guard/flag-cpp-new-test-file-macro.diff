@@ -1,7 +1,7 @@
 # gate-guard fixture: a new test names a macro the file defines
 # expect: removed-tests
 # hits: 1
-# detail: names FAST_PATH, a macro the file defines
+# detail: it adds the test test_clamp_middle
 
 diff --git a/firmware/test/test_logic/test_main.cpp b/firmware/test/test_logic/test_main.cpp
 index f0da16d..7d1f4b5 100644

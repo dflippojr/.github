@@ -1,6 +1,7 @@
-# gate-guard fixture: a GoogleTest assertion's literal fixed and a new TEST_F after the existing tests
-# expect: 
-# hits: 0
+# gate-guard fixture: a GoogleTest assertion's literal fixed and a new TEST_F after the existing tests; new tests are not exempt (owner decision 2026-11-06)
+# expect: removed-tests
+# hits: 1
+# detail: it adds the test ClampTest.Middle
 
 diff --git a/test/unit/clamp_test.cpp b/test/unit/clamp_test.cpp
 index 4234354..4027425 100644

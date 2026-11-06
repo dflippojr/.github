@@ -1,6 +1,7 @@
-# gate-guard fixture: a feature lands with a new Unity test, registered after the existing ones; issue #43 exempts it
-# expect:
-# hits: 0
+# gate-guard fixture: a feature lands with a new Unity test, registered after the existing ones; new tests are not exempt (owner decision 2026-11-06)
+# expect: removed-tests
+# hits: 1
+# detail: it adds the test test_clamp_high
 
 diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
 index b384dce..3925a03 100644

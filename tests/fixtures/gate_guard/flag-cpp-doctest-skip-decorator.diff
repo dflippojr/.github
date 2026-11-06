@@ -1,7 +1,7 @@
 # gate-guard fixture: a doctest test gains a skip decorator
 # expect: removed-tests
 # hits: 1
-# detail: outside a test body
+# detail: it removes a test or renames it
 
 diff --git a/tests/clamp_test.cpp b/tests/clamp_test.cpp
 index 474dc7a..a5292f2 100644

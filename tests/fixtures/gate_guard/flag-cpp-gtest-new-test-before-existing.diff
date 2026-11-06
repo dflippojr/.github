@@ -1,7 +1,7 @@
 # gate-guard fixture: a new GoogleTest test placed before the existing tests
 # expect: removed-tests
 # hits: 1
-# detail: before an existing test
+# detail: it adds the test Clamp.Middle
 
 diff --git a/test/unit/clamp_test.cpp b/test/unit/clamp_test.cpp
 index 4234354..e29e91b 100644

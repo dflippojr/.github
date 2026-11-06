@@ -1,7 +1,7 @@
 # gate-guard fixture: a new helper function next to a new test
 # expect: removed-tests
 # hits: 1
-# detail: not a new test
+# detail: it adds the test test_clamp_middle
 
 diff --git a/firmware/test/test_logic/test_main.cpp b/firmware/test/test_logic/test_main.cpp
 index e6309a0..e5024c4 100644
