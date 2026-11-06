@@ -64,8 +64,10 @@ def analyze_text(text):
 def c_diff(path, old, new):
     """A full-context diff of one file from old to new text, as git_diff gives it: a carriage return inside a
     line stays in it."""
-    lines = [[l + "\n" for l in text.split("\n")[:-1]] for text in (old, new)]
-    body = "".join(difflib.unified_diff(*lines, f"a/{path}", f"b/{path}", n=10 ** 6))
+    lines = [[l + "\n" for l in text.split("\n")[:-1]] + ([text.split("\n")[-1]] if not text.endswith("\n") else [])
+             for text in (old, new)]
+    body = "".join(l if l.endswith("\n") else l + "\n\\ No newline at end of file\n"
+                   for l in difflib.unified_diff(*lines, f"a/{path}", f"b/{path}", n=10 ** 6))
     return f"diff --git a/{path} b/{path}\nindex 1111111..2222222 100644\n" + body
 
 class Link(str):
@@ -1572,6 +1574,14 @@ class RuleDetails(unittest.TestCase):
             "a new Catch2 and doctest TEST_CASE": (c, c + 'TEST_CASE("clamp high", "[clamp]") {\n    REQUIRE(clamp(50, 0, 10) '
                                                       '== 10);\n}\n\nTEST_CASE("clamp mid") {\n    CHECK_EQ(clamp(5, 0, '
                                                       '10), 5);\n}\n'),
+            "a new test's template declarations": (u.replace("void setUp", "static std::array<int, 3> kCases;\nvoid setUp"),
+                                                   self.new_unity("    std::array<int, 3> values{};\n    TEST_ASSERT_EQUAL(0, "
+                                                                  "values[0]);\n", u.replace(
+                                                                      "void setUp", "static std::array<int, 3> kCases;\n"
+                                                                                    "void setUp"))),
+            "an edit beside a trailing item with no semicolon": (u + "CLAMP_SUITE_END\n",
+                                                                  u.replace("EQUAL(0,", "EQUAL(1,") + "CLAMP_SUITE_END\n"),
+            "a directive at the end with no newline": (u + "#pragma once", u.replace("EQUAL(0,", "EQUAL(1,") + "#pragma once"),
             "a test in extern C": ('extern "C" {\n' + u.replace("int main", "}\nint main"),
                                    'extern "C" {\n' + u.replace("int main", "}\nint main").replace("EQUAL(0,", "EQUAL(1,")),
         }
@@ -1655,6 +1665,20 @@ class RuleDetails(unittest.TestCase):
             hit[f"a new test uses {keyword}"] = (u, self.new_unity(f"    {keyword} x;\n"),
                                                  f"the new test test_clamp_mid uses the keyword {keyword}")
         hit.update({
+            "mismatched brackets": (u, self.new_unity("    int a = (clamp];\n    int b = [clamp);\n"),
+                                    "its brackets do not balance"),
+            "a closing brace before its opening one": (u, u.replace("int main", "}\nint stray = 0;\n{\nint main"),
+                                                       "its brackets do not balance"),
+            "a test whose header holds a directive": (
+                u.replace("void test_clamp_low(void) {", "void test_clamp_low(void)\n#ifdef HW\n#endif\n{"),
+                u.replace("void test_clamp_low(void) {", "void test_clamp_low(void)\n#ifdef HW\n#endif\n{").replace(
+                    "EQUAL(0,", "EQUAL(1,"), "it changes code outside a test body"),
+            "a new test: a declaration of a type the file does not name": (u, self.new_unity("    Gauge g = 1;\n"),
+                                                                            new_name.format("Gauge")),
+            "a new test: a template closed before it opens": (u, self.new_unity("    int x = 0;\n    x > getpid = 1;\n"),
+                                                              new_name.format("getpid")),
+            "a new test: a local named exit": (u, self.new_unity("    int exit = 0;\n"),
+                                               "the new test test_clamp_mid declares a local that names exit"),
             "a new test: a pointer to a type the file names": (u.replace("void setUp", "struct Range;\nvoid setUp"),
                                                               self.new_unity("    Range* r = 0;\n", u.replace(
                                                                   "void setUp", "struct Range;\nvoid setUp")),
@@ -1725,6 +1749,9 @@ class RuleDetails(unittest.TestCase):
         spaced = [gate_guard._c_tokens(text)[0].text for text in ("#define F(x) x\n", "#define F (x) x\n",
                                                                      "#  define F(x) /* c */ x\n")]
         self.assertEqual(spaced, ["#define F(x) x", "#define F (x) x", "#define F(x) x"])
+        # A directive at the end of the text, with no newline after it, is a token too.
+        self.assertEqual([(t.kind, t.text) for t in gate_guard._c_tokens("int x;\n#pragma once")],
+                         [("name", "int"), ("name", "x"), ("punct", ";"), ("directive", "#pragma once")])
         # A user-defined literal is one token, apart from a string and a name beside it.
         self.assertEqual([t.kind for t in gate_guard._c_tokens('"a"_s "a" _s')], ["udl", "string", "name"])
 

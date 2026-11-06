@@ -1217,12 +1217,8 @@ def _c_top(tokens):
 def _c_assertion(statement):
     """(macro, [argument tokens]) when statement is an assertion macro call on its own, NAME(...);, or None."""
     if len(statement) < 4 or statement[0].kind != "name" or not C_ASSERT.match(statement[0].text) \
-            or statement[1].text != "(" or statement[-1].text != ";" or any(t.kind == "directive" for t in statement):
-        return None
-    try:
-        if _c_match(statement, 1) != len(statement) - 2:
-            return None
-    except ValueError:
+            or statement[1].text != "(" or statement[-1].text != ";" or any(t.kind == "directive" for t in statement) \
+            or _c_match(statement, 1) != len(statement) - 2:
         return None
     inner = statement[2:-2]
     args, last = [], 0
@@ -1398,8 +1394,6 @@ def _c_new_test_unsafe(item, vocabulary, macros):
     function or variable of its own.
     """
     name = _c_test_name(item.test)
-    if any(t.kind == "directive" for t in item.tokens):
-        return f"the new test {name} holds a directive"
     named = next((w for w in item.head if w in macros or C_DENIED_PREFIX.match(w)), None)
     if named:
         return f"the new test {name} is named with {named}, a macro the file defines or a reserved name"
