@@ -18,6 +18,13 @@ FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures" / "gate_guard"
 # The hit for a modified file in a test directory of a C/C++ repository that no other rule flags.
 TOUCHED = ("modified a file in a test directory of a C/C++ repository; the guard does not read C/C++ tests, "
            "so this needs approval whatever the change")
+# The hit for a modified C/C++ test source of a C/C++ repository that is not exempt (issue #43):
+# C_SOURCE.format(why).
+C_SOURCE = ("modified a C/C++ test source of a C/C++ repository: {}; only adding tests and replacing literals or "
+            "comparison operators in assertions of existing tests is exempt, so this needs approval")
+DIRECTIVE = "it changes a directive line, which the guard does not read"
+SPLICE = "it splices a line with a backslash at its end"
+RUNNER = "it changes the runner main other than by adding RUN_TEST(name); once for each new test"
 # A platformio.ini whose extra_configs or test_dir the guard does not follow: OPEN.format(path, option).
 OPEN = "PlatformIO {} names {}, so any changed file may be a config PlatformIO loads or a test it runs"
 # A symbolic link or submodule at or in a test directory of a C/C++ repository.
@@ -544,8 +551,8 @@ class RuleDetails(unittest.TestCase):
                 [hit] = analyze_text(self.platformio_diff(body, main))
                 self.assertEqual(hit.detail, "1 fewer test in this file; removed test_b")
         # A registration reflowed across lines, or a definition split from its name, is the same
-        # test: no fewer tests, but still a change to a C/C++ test directory.
-        [hit] = analyze_text(self.platformio_diff(""" void test_a(void) {}
+        # test, and the same tokens: no hit (issue #43 reads a C/C++ test source as tokens).
+        self.assertEqual(analyze_text(self.platformio_diff(""" void test_a(void) {}
 -void test_b(void) {}
 +void
 +test_b(void) {}
@@ -555,8 +562,7 @@ class RuleDetails(unittest.TestCase):
 +  RUN_TEST(
 +      test_b);
  }
-""", main))
-        self.assertEqual(hit.detail, TOUCHED)
+""", main)), [])
 
     def test_unity_file_the_diff_does_not_show_whole_fails_closed(self):
         diff = """diff --git a/test/test_a/test_main.cpp b/test/test_a/test_main.cpp
@@ -568,7 +574,7 @@ class RuleDetails(unittest.TestCase):
    RUN_TEST(test_b);
 """
         [hit] = analyze_text(diff)
-        self.assertEqual(hit.detail, TOUCHED)
+        self.assertEqual(hit.detail, C_SOURCE.format("the diff does not show the whole file"))
 
     def test_unity_preprocessor_and_other_frameworks_fail_closed(self):
         main = "test/test_a/test_main.cpp"
@@ -598,7 +604,7 @@ class RuleDetails(unittest.TestCase):
 
     def test_unity_preprocessor_change_fails_closed(self):
         main = "test/test_a/test_main.cpp"
-        detail = TOUCHED
+        detail = C_SOURCE.format(DIRECTIVE)
         for name in ("flag-fewer-tests-cpp-elif-changed", "flag-fewer-tests-cpp-undef-moved",
                      "flag-fewer-tests-cpp-preprocessor-edit"):
             with self.subTest(fixture=name):
@@ -701,7 +707,8 @@ class RuleDetails(unittest.TestCase):
         for name, body in changes.items():
             with self.subTest(name):
                 hits = analyze_text(self.platformio_diff(body, main))
-                self.assertIn(detail, [h.detail for h in hits])
+                why = SPLICE if name in ("an edited continuation line", "a line spliced onto a directive") else DIRECTIVE
+                self.assertIn(C_SOURCE.format(why), [h.detail for h in hits])
         # A header in a test directory can turn tests off too.
         header = "test/test_a/config.h"
         for body in ("""-#define ENABLE_A 1
@@ -710,7 +717,7 @@ class RuleDetails(unittest.TestCase):
 """):
             with self.subTest(header=body):
                 [hit] = analyze_text(self.platformio_diff(body, header))
-                self.assertEqual(hit.detail, detail)
+                self.assertEqual(hit.detail, TOUCHED)
         deleted = f"diff --git a/{header} b/{header}\ndeleted file mode 100644\n--- a/{header}\n+++ /dev/null\n" \
                   "@@ -1 +0,0 @@\n-#define ENABLE_A 1\n"
         [hit] = analyze_text(deleted)
@@ -738,8 +745,8 @@ class RuleDetails(unittest.TestCase):
 """):
             with self.subTest(body=body):
                 hits = analyze_text(self.platformio_diff(body, main))
-                self.assertIn(TOUCHED, [h.detail for h in hits])
-        # Reordering registrations is no removal, but still a change to a C/C++ test directory.
+                self.assertIn(C_SOURCE.format(RUNNER), [h.detail for h in hits])
+        # Reordering registrations is no removal, but still a hit: a new order may run a test after a changed one.
         [hit] = analyze_text(self.platformio_diff(""" #include <unity.h>
  void test_a(void) {}
  void test_b(void) {}
@@ -749,7 +756,7 @@ class RuleDetails(unittest.TestCase):
 +  RUN_TEST(test_a);
  }
 """, main))
-        self.assertEqual(hit.detail, TOUCHED)
+        self.assertEqual(hit.detail, C_SOURCE.format(RUNNER))
 
     def test_unity_move_into_a_branch_of_another_file_is_a_removal(self):
         removed = self.platformio_diff(""" void test_a(void) {}
@@ -771,7 +778,9 @@ class RuleDetails(unittest.TestCase):
  }
 """, "test/test_c/test_main.cpp")
         hits = {h.path: h.detail for h in analyze_text(diff)}
-        self.assertEqual(hits, {"test/test_a/test_main.cpp": TOUCHED, "test/test_c/test_main.cpp": TOUCHED})
+        self.assertEqual(hits, {"test/test_a/test_main.cpp": C_SOURCE.format(
+            "it adds, removes or moves code that is not a new test, or removes a test"),
+                                "test/test_c/test_main.cpp": C_SOURCE.format(DIRECTIVE)})
         # Into a file with a #define that may rename the test, too.
         diff = removed + self.platformio_diff(""" #define test_b test_c
  void test_c(void) {}
@@ -781,14 +790,17 @@ class RuleDetails(unittest.TestCase):
 +  RUN_TEST(test_b);
  }
 """, "test/test_c/test_main.cpp")
-        self.assertEqual({h.path for h in analyze_text(diff)}, {"test/test_a/test_main.cpp", "test/test_c/test_main.cpp"})
+        hits = {h.path: h.detail for h in analyze_text(diff)}
+        self.assertEqual(set(hits), {"test/test_a/test_main.cpp", "test/test_c/test_main.cpp"})
+        self.assertEqual(hits["test/test_c/test_main.cpp"], C_SOURCE.format(
+            "the new test test_b is named with test_b, a macro the file defines or a reserved name"))
 
     def test_earlier_preprocessor_escapes_are_hits(self):
         """Rounds 8 and 9: alternative directive spellings and trigraphs. The guard no longer
         reads directives; each change is a hit because it changes a C/C++ test directory."""
         main = "test/test_a/test_main.cpp"
         [hit] = self.hits("flag-fewer-tests-cpp-digraph-directive")
-        self.assertEqual(hit.detail, TOUCHED)
+        self.assertEqual(hit.detail, C_SOURCE.format("line 8 holds the digraph %:, which the guard does not read"))
         wrapped = """ void test_a(void) {{}}
  int main() {{
 +{0}
@@ -796,14 +808,19 @@ class RuleDetails(unittest.TestCase):
 +{1}
  }}
 """
-        for opening, closing in (("%:if 0", "%:endif"), ("??=if 0", "??=endif"), ("  %:  if 0", "%: endif"),
-                                 ("/* off */ %:if 0", "%:endif"), ("/* off\n+*/ %:if 0", "%:endif"),
-                                 ("\f#if 0", "\v#endif"), ("#", "# 7 \"x.c\""),
-                                 ("// the next line is commented out ??/", "")):
+        digraph = "line {} holds the digraph %:, which the guard does not read"
+        control = "it holds a carriage return, form feed or other control character"
+        for opening, closing, why in (("%:if 0", "%:endif", digraph.format(3)),
+                                      ("??=if 0", "??=endif", "it holds a trigraph"),
+                                      ("  %:  if 0", "%: endif", digraph.format(3)),
+                                      ("/* off */ %:if 0", "%:endif", digraph.format(3)),
+                                      ("/* off\n+*/ %:if 0", "%:endif", digraph.format(4)),
+                                      ("\f#if 0", "\v#endif", control), ("#", "# 7 \"x.c\"", DIRECTIVE),
+                                      ("// the next line is commented out ??/", "", "it holds a trigraph")):
             with self.subTest(opening=opening):
                 [hit] = analyze_text(self.platformio_diff(wrapped.format(opening, closing), main))
-                self.assertEqual(hit.detail, TOUCHED)
-        # A new test next to an unchanged digraph directive is a change to the test directory too.
+                self.assertEqual(hit.detail, C_SOURCE.format(why))
+        # A new test next to an unchanged digraph directive is a hit too.
         [hit] = analyze_text(self.platformio_diff(""" %:include <unity.h>
  void test_a(void) {}
 +void test_b(void) {}
@@ -812,7 +829,7 @@ class RuleDetails(unittest.TestCase):
 +  RUN_TEST(test_b);
  }
 """, main))
-        self.assertEqual(hit.detail, TOUCHED)
+        self.assertEqual(hit.detail, C_SOURCE.format("line 1 holds the digraph %:, which the guard does not read"))
 
     def test_unity_registrations_in_test_headers_are_counted(self):
         [hit] = self.hits("flag-fewer-tests-cpp-header")
@@ -838,7 +855,7 @@ class RuleDetails(unittest.TestCase):
  }
 """, "test/test_a/cases.h")
         self.assertEqual({(h.path, h.detail) for h in analyze_text(diff)},
-                         {("test/test_a/test_main.cpp", TOUCHED), ("test/test_a/cases.h", TOUCHED)})
+                         {("test/test_a/test_main.cpp", C_SOURCE.format(RUNNER)), ("test/test_a/cases.h", TOUCHED)})
 
     def test_any_change_to_a_c_cpp_test_directory_is_a_hit(self):
         """Rounds 8 and 9: included fragments of any extension, and links."""
@@ -1021,10 +1038,16 @@ class RuleDetails(unittest.TestCase):
                 hits = judge_commits(base, dict(base, **{"backend/tests/test_api.py": skipped}))
                 self.assertEqual({(h.rule, h.path) for h in hits}, {("skip-marker", "backend/tests/test_api.py"),
                                                                     ("removed-tests", "backend/tests/test_api.py")})
-        # (d) The C/C++ rules stand: a Unity test edit, a Python file in the firmware
-        # test directory, and a Python test directory that gains a C/C++ file.
-        cases = [({"firmware/test/test_logic/test_main.cpp": unity.replace("0, clamp", "1, clamp")},
-                  {("firmware/test/test_logic/test_main.cpp", TOUCHED)}),
+        # (d) The C/C++ rules stand: a Unity test edit beyond an assertion's literal arguments (issue #43: a
+        # call's argument), a Python file in the firmware test directory, and a Python test directory that
+        # gains a C/C++ file. A Unity assertion's literal argument fixed is no hit.
+        self.assertEqual(judge_commits(base, dict(base, **{
+            "firmware/test/test_logic/test_main.cpp": unity.replace("0, clamp", "1, clamp")})), [])
+        call = C_SOURCE.format("it changes an assertion in test_clamp_low outside its literal arguments and the "
+                               "literal operands and operator of a comparison that is a whole argument: the macro, a "
+                               "name, a call or its argument, or the expression's shape")
+        cases = [({"firmware/test/test_logic/test_main.cpp": unity.replace("0, 10", "1, 10")},
+                  {("firmware/test/test_logic/test_main.cpp", call)}),
                  ({"firmware/test/test_logic/gen_cases.py": "CASES = 3\n"},
                   {("firmware/test/test_logic/gen_cases.py", TOUCHED.replace("modified", "added"))}),
                  ({"backend/tests/test_api.py": edited, "backend/tests/native.c": "int x;\n"},

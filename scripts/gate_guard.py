@@ -918,6 +918,618 @@ def _python_unexempt(fd):
     return why or next(filter(None, map(_py_line_change, trees, tests, texts, changed)), None)
 
 
+
+# A C/C++ test source in a test directory of a C/C++ repository (issue #43):
+# what the guard reads, and the narrow change it exempts (see _c_cpp_unexempt).
+#
+# The guard reads the file as tokens, not by line, so a reflowed assertion or
+# a changed comment changes nothing. It fails closed on what could make its
+# tokens differ from the compiler's: a line splice, a trigraph, a digraph, a
+# form feed, a carriage return or other control character, a character
+# outside comments and literals that is not ASCII, an unterminated comment or
+# literal, a stray # or ##, unbalanced brackets, a preprocessor branch that
+# opens or closes a bracket it does not close or open, and __LINE__ or
+# __COUNTER__, whose values move with the lines around them.
+C_TOKEN = re.compile(r"""
+    (?P<space>[ \t]+)
+  | (?P<newline>\n)
+  | (?P<comment>//[^\n]*|/\*.*?\*/)
+  | (?P<raw>(?:u8|[uUL])?R"(?P<delim>[^()\\\s]{0,16})\(.*?\)(?P=delim)")
+  | (?P<string>(?:u8|[uUL])?"(?:\\[ -~]|[^"\\\n])*")
+  | (?P<char>(?:u8|[uUL])?'(?:\\[ -~]|[^'\\\n])+')
+  | (?P<number>\.?\d(?:[eEpP][-+]|'(?=\w)|[\w.])*)
+  | (?P<name>[A-Za-z_]\w*)
+  | (?P<punct>\.\.\.|<<=|>>=|<=>|->\*|::|->|\+\+|--|<<|>>|<=|>=|==|!=|&&|\|\||[-+*/%&|^]=|\#\#|\.\*
+               |<:|:>|<%|%>|%:|[\]\[{}()\#;:?.,+\-*/%^&|~!=<>])
+""", re.S | re.X | re.A)
+C_DIGRAPHS = {"<:", ":>", "<%", "%>", "%:"}
+# The encoding prefixes of a string or character literal: one the tokenizer reads as a name is one it cannot read.
+C_PREFIXES = {"u8", "u", "U", "L", "R", "u8R", "uR", "UR", "LR"}
+C_SPLICE = re.compile(r"\\[ \t]*$", re.M)
+C_TRIGRAPH = re.compile(r"\?\?[-=/'()!<>]")
+C_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+# What a changed line may hold: printable ASCII and tabs, which C reads as spaces outside literals.
+C_PRINTABLE = re.compile(r"[ -~\t]*")
+C_MOVING = re.compile(r"\b__(?:LINE|COUNTER)__\b")
+C_CONDITIONAL = re.compile(r"#\s*(if|ifdef|ifndef|elif|elifdef|elifndef|else|endif)\b")
+C_DEFINE = re.compile(r"#\s*(?:define|undef)\s+([A-Za-z_]\w*)")
+C_BRACKETS = {"(": ")", "[": "]", "{": "}"}
+# An int or float literal, with no user-defined suffix.
+C_NUMBER = re.compile(r"(?:0[xX][\da-fA-F'.]+(?:[pP][-+]?\d+)?|0[bB][01']+"
+                      r"|(?:\d[\d']*(?:\.[\d']*)?|\.\d[\d']*)(?:[eE][-+]?\d+)?)[uUlLfFzZ]*")
+# Assertion macros: Unity's TEST_ASSERT*, GoogleTest's EXPECT_*/ASSERT_* (not the
+# mock expectation EXPECT_CALL), and Catch2's and doctest's REQUIRE*/CHECK*.
+C_ASSERT = re.compile(r"(?:TEST_ASSERT(?:_\w+)?|EXPECT_(?!CALL$)\w+|ASSERT_\w+|REQUIRE(?:_\w+)?|CHECK(?:_\w+)?)$")
+C_COMPARE = {"==", "!=", "<", "<=", ">", ">="}
+# Tokens that may be a comparison or a template's angle bracket: an argument with more than one is not read
+# as a comparison.
+C_ANGLES = C_COMPARE | {"<<", ">>", "<=>"}
+# Tokens a changed assertion may not hold: they decide whether or how often its other code runs (&&, ||, ?:),
+# assign or step a value, or leave the test.
+C_UNSAFE = {"&&", "||", "?", "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", "++", "--",
+            "and", "or", "not", "and_eq", "or_eq", "xor_eq", "not_eq", "bitand", "bitor", "xor", "compl", "throw",
+            "new", "delete", "co_await", "co_yield", "co_return", "return", "goto", "asm"}
+# Operators that bind looser than a comparison: an operand of a comparison read as one holds none of them at its
+# own level.
+C_LOOSER = {"&", "^", "|", ":"} | C_UNSAFE
+C_KEYWORDS = frozenset("""
+    alignas alignof and and_eq asm auto bitand bitor bool break case catch char char8_t char16_t char32_t class
+    compl concept const consteval constexpr constinit const_cast continue co_await co_return co_yield decltype
+    default delete do double dynamic_cast else enum explicit export extern false float for friend goto if inline
+    int long mutable namespace new noexcept not not_eq nullptr operator or or_eq private protected public register
+    reinterpret_cast requires restrict return short signed sizeof static static_assert static_cast struct switch
+    template this thread_local throw true try typedef typeid typename union unsigned using virtual void volatile
+    wchar_t while xor xor_eq""".split())
+# The keywords a new test may use: types, qualifiers, literals, sizeof, static_cast and control flow that stays
+# in the test. Not return, goto, throw, asm, extern, static, new, delete, using, a reinterpreting cast or a type
+# definition.
+C_NEW_KEYWORDS = frozenset("""
+    auto bool break case char char8_t char16_t char32_t const constexpr continue decltype default do double else
+    false float for if int long nullptr short signed sizeof static_cast switch this true unsigned void wchar_t
+    while""".split())
+# Keywords that can start a declaration a new test makes.
+C_DECL_KEYWORDS = frozenset("""
+    auto bool char char8_t char16_t char32_t const constexpr double float int long short signed unsigned void
+    wchar_t""".split())
+# Names a new test may not use even where the file already does: they end or replace the process, jump out of
+# a test, change what the test framework records or runs, or skip or end a test.
+C_DENIED = frozenset("""
+    abort alarm app_main at_quick_exit atexit close dlopen dlsym doctest dup dup2 dup3 execl execle execlp execv
+    execve execvp execvpe exit fclose fexecve fork freopen kill killpg longjmp loop main popen posix_spawn
+    posix_spawnp pthread_exit pthread_kill quick_exit raise set_terminate setjmp setUp setup siglongjmp sigaction
+    signal sigsetjmp suiteSetUp suiteTearDown syscall system tearDown terminate testing thrd_exit vfork Catch SKIP
+    SUCCEED RUN_TEST RUN_TEST_CASE RUN_TEST_GROUP RUN_ALL_TESTS TEST_PROTECT TEST_ABORT TEST_IGNORE
+    TEST_IGNORE_MESSAGE TEST_PASS TEST_PASS_MESSAGE""".split())
+C_DENIED_PREFIX = re.compile(r"_|Unity|UNITY_|GTEST_|DOCTEST_|CATCH_|INTERNAL_CATCH")
+# The statements a runner may hold after the RUN_TEST of a new test: nothing that runs a test.
+C_TAIL = {"UNITY_END ( ) ;", "return UNITY_END ( ) ;", "( void ) UNITY_END ( ) ;", "return 0 ;", "return ;"}
+# The functions that start a test program, where a new Unity test may be registered: main, Arduino's setup and
+# ESP-IDF's app_main.
+C_ENTRY = {("int", "main", "("), ("void", "setup", "("), ("void", "app_main", "(")}
+
+# line and end: the lines a token starts and ends on; spaced: whether a space or comment comes before it.
+CToken = collections.namedtuple("CToken", "kind text line spaced end")
+
+
+class CItem:
+    """A top-level item of a C/C++ file: a directive, a namespace or extern "C" scope and the items in it, a
+    function (or a test, a function-like macro with a body), or anything else up to its semicolon."""
+
+    def __init__(self, kind, tokens, header=(), body=(), children=()):
+        self.kind, self.tokens, self.header, self.body, self.children = kind, tokens, header, body, children
+        self.key = (kind, tuple(t.text for t in tokens))
+        self.head = tuple(t.text for t in header)
+        self.test = _c_test_id(self.head) if kind == "function" else None
+
+
+def _c_texts(tokens):
+    return " ".join(t.text for t in tokens)
+
+
+def _c_tokens(text):
+    """The tokens of one side of a C/C++ file, comments dropped and each directive one token, or ValueError
+    saying why the guard cannot read it as the compiler does.
+
+    A directive keeps the spaces between its tokens, as #define F(x) and
+    #define F (x) differ. A name right after a string or character literal
+    is part of it, a user-defined literal.
+    """
+    tokens, directive, pos, line, start, spaced = [], None, 0, 1, True, True
+    while pos < len(text):
+        m = C_TOKEN.match(text, pos)
+        if not m:
+            raise ValueError(f"line {line} holds {text[pos]!r}, which the guard does not read as C/C++ outside a "
+                             "comment or literal, or opens a literal it does not close")
+        kind, value, pos = m.lastgroup, m.group(), m.end()
+        if kind == "newline":
+            if directive:
+                tokens.append(CToken("directive", "#" + "".join(directive[1]), directive[0], True, line))
+                directive = None
+            line, start, spaced = line + 1, True, True
+            continue
+        if kind in ("space", "comment"):
+            line, spaced = line + value.count("\n"), True
+            continue
+        kind = "string" if kind == "raw" else kind
+        if value in C_DIGRAPHS:
+            raise ValueError(f"line {line} holds the digraph {value}, which the guard does not read")
+        if kind == "name" and value in C_PREFIXES and text[pos:pos + 1] in ("'", '"'):
+            raise ValueError(f"line {line} holds a literal the guard cannot read")
+        if directive is not None:
+            directive[1].append((" " if spaced and directive[1] else "") + value)
+        elif value == "#" and start:
+            directive = (line, [])
+        elif value in ("#", "##"):
+            raise ValueError(f"line {line} holds a {value} outside a directive")
+        elif kind == "name" and not spaced and tokens and tokens[-1].kind in ("string", "char", "udl"):
+            tokens[-1] = tokens[-1]._replace(kind="udl", text=tokens[-1].text + value)
+        else:
+            tokens.append(CToken(kind, value, line, spaced, line + value.count("\n")))
+        line, start, spaced = line + value.count("\n"), False, False
+    if directive:
+        tokens.append(CToken("directive", "#" + "".join(directive[1]), directive[0], True, line))
+    return tokens
+
+
+def _c_match(tokens, i):
+    """The index of the bracket that closes tokens[i]."""
+    want = []
+    for j in range(i, len(tokens)):
+        text = tokens[j].text
+        if text in C_BRACKETS:
+            want.append(C_BRACKETS[text])
+        elif text in (")", "]", "}"):
+            if not want or want.pop() != text:
+                break
+            if not want:
+                return j
+    raise ValueError("its brackets do not balance")
+
+
+def _c_branches(tokens):
+    """ValueError when a preprocessor branch opens or closes a bracket it does not close or open, or its
+    conditionals do not pair, so which branch the compiler takes cannot change where a test ends."""
+    depth, stack = 0, []
+    for t in tokens:
+        m = C_CONDITIONAL.match(t.text) if t.kind == "directive" else None
+        if m and m.group(1).startswith("if"):
+            stack.append(depth)
+        elif m:
+            if not stack or stack[-1] != depth:
+                raise ValueError("a preprocessor branch opens or closes a bracket it does not close or open, or "
+                                 "its conditionals do not pair")
+            if m.group(1) == "endif":
+                stack.pop()
+        elif t.text in C_BRACKETS:
+            depth += 1
+        elif t.text in (")", "]", "}"):
+            depth -= 1
+    if stack or depth:
+        raise ValueError("its brackets or preprocessor conditionals do not pair")
+
+
+def _c_items(tokens, lo, hi):
+    """The items of tokens[lo:hi] (see CItem)."""
+    items, i = [], lo
+    while i < hi:
+        if tokens[i].kind == "directive":
+            items.append(CItem("directive", tokens[i:i + 1]))
+            i += 1
+            continue
+        j = i
+        while True:
+            if j >= hi:
+                items.append(CItem("other", tokens[i:hi]))
+                return items
+            text = tokens[j].text
+            if text == ";":
+                items.append(CItem("other", tokens[i:j + 1]))
+                i = j + 1
+                break
+            if text in ("(", "["):
+                j = _c_match(tokens, j) + 1
+                continue
+            if text in (")", "]", "}"):
+                raise ValueError("its brackets do not balance")
+            if text != "{":
+                j += 1
+                continue
+            end = _c_match(tokens, j)
+            head = tokens[i:j]
+            words = [t.text for t in head]
+            if any(t.kind == "directive" for t in head):
+                j = end + 1
+                continue
+            if (words[:1] == ["namespace"] or words[:2] == ["inline", "namespace"]
+                    or words in (["extern", '"C"'], ["extern", '"C++"'])):
+                items.append(CItem("scope", tokens[i:end + 1], head, (), _c_items(tokens, j + 1, end)))
+            elif words and words[-1] == ")":
+                items.append(CItem("function", tokens[i:end + 1], head, tokens[j + 1:end]))
+            else:
+                j = end + 1
+                continue
+            i = end + 1
+            break
+    return items
+
+
+def _c_test_id(head):
+    """The identity of the test a function item's header declares, or None: ("unity", name) for void
+    test_name(void), ("gtest", suite, name) for TEST or TEST_F, and ("case", name) for a Catch2 or doctest
+    TEST_CASE whose arguments are plain strings."""
+    words = list(head[1:] if head[:1] == ("static",) else head)
+    if len(words) in (4, 5) and words[0] == "void" and re.match(r"test_\w*$", words[1]) and words[2] == "(" \
+            and words[3:] in (["void", ")"], [")"]):
+        return ("unity", words[1])
+    if len(words) == 6 and words[0] in ("TEST", "TEST_F") and words[1::2] == ["(", ",", ")"] \
+            and all(re.match(r"[A-Za-z]\w*$", w) for w in words[2::2]):
+        return ("gtest", words[2], words[4])
+    plain = [re.match(r'"(?:\\.|[^"\\])*"$', w) for w in words[2:-1:2]]
+    if words[:2] == ["TEST_CASE", "("] and words[-1] == ")" and len(words) in (4, 6) and all(plain) \
+            and words[3:-1:2] in ([], [","]):
+        return ("case", words[2])
+    return None
+
+
+def _c_flat(items):
+    for item in items:
+        yield item
+        yield from _c_flat(item.children)
+
+
+def _c_statements(body):
+    """The statements of a function body: up to a semicolon or a closing brace at its own level, and each
+    directive at that level."""
+    out, current, depth = [], [], 0
+    for t in body:
+        if t.kind == "directive" and not depth and not current:
+            out.append([t])
+            continue
+        current.append(t)
+        if t.text in C_BRACKETS:
+            depth += 1
+        elif t.text in (")", "]", "}"):
+            depth -= 1
+        if not depth and t.text in (";", "}"):
+            out.append(current)
+            current = []
+    return out + ([current] if current else [])
+
+
+def _c_top(tokens):
+    """The indexes of tokens at their own bracket level."""
+    out, depth = [], 0
+    for i, t in enumerate(tokens):
+        if t.text in (")", "]", "}"):
+            depth -= 1
+        if not depth:
+            out.append(i)
+        if t.text in C_BRACKETS:
+            depth += 1
+    return out
+
+
+def _c_assertion(statement):
+    """(macro, [argument tokens]) when statement is an assertion macro call on its own, NAME(...);, or None."""
+    if len(statement) < 4 or statement[0].kind != "name" or not C_ASSERT.match(statement[0].text) \
+            or statement[1].text != "(" or statement[-1].text != ";" or any(t.kind == "directive" for t in statement):
+        return None
+    try:
+        if _c_match(statement, 1) != len(statement) - 2:
+            return None
+    except ValueError:
+        return None
+    inner = statement[2:-2]
+    args, last = [], 0
+    for i in _c_top(inner):
+        if inner[i].text == ",":
+            args.append(inner[last:i])
+            last = i + 1
+    return statement[0].text, (args + [inner[last:]]) if inner else []
+
+
+def _c_literal(arg):
+    """The kind of literal arg is, or None: a number (a minus on one counts as part of it), true or false, one
+    or more string literals with the same prefix, or a character literal; a user-defined suffix is not one."""
+    words = [t.text for t in arg]
+    if len(arg) in (1, 2) and arg[-1].kind == "number" and words[:-1] in ([], ["-"]) and C_NUMBER.fullmatch(words[-1]):
+        return "number"
+    if words in (["true"], ["false"]):
+        return "bool"
+    prefixes = {t.text.split(t.text[-1])[0] for t in arg if t.kind in ("string", "char")}
+    if arg and len(prefixes) == 1 and (all(t.kind == "string" for t in arg) or (len(arg) == 1 and arg[0].kind == "char")):
+        return arg[0].kind + ":" + prefixes.pop()
+    return None
+
+
+def _c_operand(tokens):
+    kind = _c_literal(tokens)
+    return (f"<{kind}>",) if kind else tuple(t.text for t in tokens)
+
+
+def _c_masked(arg):
+    """An assertion's argument as text, with a literal argument, and a literal operand and the operator of a
+    comparison that is the whole argument, as placeholders."""
+    top = _c_top(arg)
+    angles = [i for i in top if arg[i].text in C_ANGLES]
+    if len(angles) == 1 and arg[angles[0]].text in C_COMPARE and not any(arg[i].text in C_LOOSER for i in top):
+        left, right = arg[:angles[0]], arg[angles[0] + 1:]
+        if left and right:
+            return _c_operand(left) + ("<comparison>",) + _c_operand(right)
+    return _c_operand(arg)
+
+
+def _c_assert_change(old, new, name, macros):
+    """Why replacing the statement old of the test name with new is more than changing an assertion's literal
+    arguments and the literal operands and operator of a comparison that is a whole argument, or None."""
+    calls = [_c_assertion(s) for s in (old, new)]
+    if None in calls:
+        return (f"it changes a statement of {name} that is not an assertion macro call of the test's own body, "
+                "such as a declaration, a call, or an if, for, while or block, even around an assertion")
+    for statement, (macro, args) in zip((old, new), calls):
+        unsafe = next((t.text for t in statement if t.text in C_UNSAFE), None)
+        if unsafe:
+            return (f"it changes an assertion in {name} that holds {unsafe}, which decides what else it runs, "
+                    "assigns or steps a value, or leaves the test")
+        defined = next((t.text for t in statement if t.text in macros), None)
+        if defined:
+            return f"it changes an assertion in {name} that names {defined}, a macro the file defines"
+        if re.search(r"MESSAGE|_MSG$", macro) and not (args and _c_literal(args[-1]) or "").startswith("string"):
+            return (f"it changes an assertion in {name} whose message is not a string literal; a message may run "
+                    "only when the assertion fails")
+    (old_macro, old_args), (new_macro, new_args) = calls
+    if old_macro != new_macro or len(old_args) != len(new_args) or any(
+            _c_masked(a) != _c_masked(b) for a, b in zip(old_args, new_args)):
+        return (f"it changes an assertion in {name} outside its literal arguments and the literal operands and "
+                "operator of a comparison that is a whole argument: the macro, a name, a call or its argument, or "
+                "the expression's shape")
+    return None
+
+
+def _c_test_change(old, new, macros):
+    """Why changing the existing test old to new is more than replacing assertions of its own body, each by one
+    that differs only in literals and comparison operators (_c_assert_change), or None."""
+    name = _c_test_name(new.test)
+    statements = [_c_statements(old.body), _c_statements(new.body)]
+    keys = [[_c_texts(s) for s in side] for side in statements]
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, *keys, autojunk=False).get_opcodes():
+        if op == "equal":
+            continue
+        if i2 - i1 != j2 - j1:
+            return f"it adds, removes or moves a statement in {name}"
+        for a, b in zip(statements[0][i1:i2], statements[1][j1:j2]):
+            why = _c_assert_change(a, b, name, macros)
+            if why:
+                return why
+    return None
+
+
+def _c_test_name(test):
+    return test[1] if test[0] != "gtest" else f"{test[1]}.{test[2]}"
+
+
+def _c_runner_change(old, new, unity):
+    """Why changing the function old to new is more than registering new Unity tests (names in unity) with
+    RUN_TEST in a program's entry point, after every test it already runs, or None."""
+    if old.head[:3] not in C_ENTRY or new.head != old.head:
+        return "it changes code outside a test body: a helper, a fixture, a declaration or a runner"
+    runner = f"it changes the runner {old.head[1]} other than by adding RUN_TEST(name); once for each new test"
+    statements = [_c_statements(old.body), _c_statements(new.body)]
+    keys = [[_c_texts(s) for s in side] for side in statements]
+    registered = set()
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, *keys, autojunk=False).get_opcodes():
+        if op == "equal":
+            continue
+        if op != "insert":
+            return runner
+        for s in statements[1][j1:j2]:
+            words = [t.text for t in s]
+            if len(words) != 5 or words[:2] != ["RUN_TEST", "("] or words[3:] != [")", ";"] \
+                    or words[2] not in unity or words[2] in registered:
+                return runner
+            registered.add(words[2])
+        if any(s[0].kind != "directive" and _c_texts(s) not in C_TAIL for s in statements[0][i1:]):
+            return (f"it registers a new test in {old.head[1]} before a statement that may run an existing test; "
+                    "a new test runs after the tests the file already runs")
+    return None
+
+
+def _c_declares(statement, start, vocabulary, loop):
+    """The index of the name a declaration at statement[start:] declares, or None. A declaration here is a
+    type the file already names or a type keyword, then the name, then =, {, [, ; or, in a range for, :. A
+    pointer or reference declaration must start with a keyword, so it cannot be read as an expression."""
+    angle, end = 0, None
+    for k in range(start, len(statement)):
+        t = statement[k]
+        if t.text in ("=", "{", "[", ";") or (loop and t.text == ":"):
+            if not angle:
+                end = k
+                break
+        if t.text == "<":
+            angle += 1
+        elif t.text in (">", ">>"):
+            angle -= len(t.text)
+        elif t.text == "," and angle > 0 or t.kind == "number" and angle > 0:
+            pass
+        elif t.text not in ("::", "*", "&", "&&") and not (t.kind == "name" and (
+                t.text in C_DECL_KEYWORDS or t.text not in C_KEYWORDS)):
+            return None
+        if angle < 0:
+            return None
+    if end is None or end - start < 2 or statement[end - 1].kind != "name" or statement[end - 1].text in C_KEYWORDS:
+        return None
+    specs = statement[start:end - 1]
+    if any(t.kind == "name" and t.text not in C_DECL_KEYWORDS and t.text not in vocabulary for t in specs):
+        return None
+    if specs[0].text not in C_DECL_KEYWORDS and (specs[0].kind != "name" or any(
+            t.text in ("*", "&", "&&") for t in specs)):
+        return None
+    return end - 1
+
+
+def _c_name_unsafe(name, allowed, macros):
+    """Why a new test may not use the name, or None."""
+    if name in C_KEYWORDS:
+        return None if name in C_NEW_KEYWORDS else f"it uses the keyword {name}"
+    if name in C_DENIED or C_DENIED_PREFIX.match(name):
+        return (f"it names {name}, which can end the process, jump out of a test, skip a test, or reach the test "
+                "framework's own state")
+    if name in macros:
+        return f"it names {name}, a macro the file defines"
+    if C_ASSERT.match(name) or name in allowed:
+        return None
+    return f"it names {name}, which the file's existing code does not"
+
+
+def _c_new_test_unsafe(item, vocabulary, macros):
+    """Why the new test item is more than a test of names the file already uses, or None.
+
+    Every name in its body is one the old file's code already uses, an
+    assertion macro, a keyword of C_NEW_KEYWORDS, or a local it declares
+    (_c_declares) at its body's own level, used after the declaration, or in
+    a for statement's head, used in that for statement. None is denied
+    (C_DENIED, C_DENIED_PREFIX) or a macro the file defines. A member name
+    after . or -> is not checked: it names a member of an object, not a
+    function or variable of its own.
+    """
+    name = _c_test_name(item.test)
+    if any(t.kind == "directive" for t in item.tokens):
+        return f"the new test {name} holds a directive"
+    named = next((w for w in item.head if w in macros or C_DENIED_PREFIX.match(w)), None)
+    if named:
+        return f"the new test {name} is named with {named}, a macro the file defines or a reserved name"
+    if item.test[0] == "gtest" and item.head[0] == "TEST_F" and item.test[1] not in vocabulary:
+        return f"the new test {name} uses the fixture {item.test[1]}, which the file's existing code does not name"
+    known = set()
+    for statement in _c_statements(item.body):
+        declared = {}
+        top = _c_declares(statement, 0, vocabulary, False)
+        if top is not None:
+            declared[top] = known
+        if [t.text for t in statement[:2]] == ["for", "("]:
+            loop = _c_declares(statement, 2, vocabulary, True)
+            if loop is not None:
+                declared[loop] = set()
+        allowed = set(vocabulary) | known
+        for k, t in enumerate(statement):
+            if t.kind != "name" or (k and statement[k - 1].text in (".", "->")):
+                continue
+            if k in declared:
+                why = _c_name_unsafe(t.text, {t.text}, macros)
+                if why:
+                    return f"the new test {name} declares a local that {why[3:]}"
+                declared[k].add(t.text)
+                allowed.add(t.text)
+                continue
+            why = _c_name_unsafe(t.text, allowed, macros)
+            if why:
+                return f"the new test {name} {why[3:]}" if why.startswith("it ") else why
+    return None
+
+
+def _c_unreadable(text):
+    """Why the guard cannot read one side of a C/C++ file as the compiler does, or None."""
+    if C_CONTROL.search(text) or "\r" in text:
+        return "it holds a carriage return, form feed or other control character"
+    if C_SPLICE.search(text):
+        return "it splices a line with a backslash at its end"
+    if C_TRIGRAPH.search(text):
+        return "it holds a trigraph"
+    return None
+
+
+def _c_cpp_unexempt(fd):
+    """Why fd, a C/C++ source in a test directory of a C/C++ repository, is not exempt, or None.
+
+    Issue #43: only an edit in place is exempt, and only when, read as
+    tokens, every item of the file outside its tests is unchanged and its
+    change does nothing but these:
+
+    - replace assertions of an existing test's own body (_c_test_change),
+      each new assertion the old one with only literal arguments and the
+      literal operands and operator of a comparison that is a whole argument
+      changed (_c_assert_change);
+    - add whole new tests of a kind the file already has: Unity void
+      test_name(void), GoogleTest TEST or TEST_F, or a Catch2 or doctest
+      TEST_CASE of plain strings, each of names the file already uses
+      (_c_new_test_unsafe). A self-registering test (TEST, TEST_F, TEST_CASE)
+      comes after every existing test, and a Unity test is registered, if at
+      all, with RUN_TEST in a program's entry point after every test it
+      already runs (_c_runner_change), so existing tests run as before.
+    """
+    if fd.status != "modified" or fd.mode_changed or fd.modes & LINK_MODES:
+        return "only an edit in place can be exempt, not a rename, an addition, a deletion or a mode change"
+    sides = _whole_sides(fd)
+    if sides is None:
+        return "the diff does not show the whole file"
+    why = next(filter(None, map(_c_unreadable, sides)), None)
+    if why:
+        return why
+    if not all(C_PRINTABLE.fullmatch(l.text) for l in fd.changed()):
+        return "a changed line holds a character that is not printable ASCII or a tab"
+    try:
+        tokens = [_c_tokens(text) for text in sides]
+        for side in tokens:
+            _c_branches(side)
+        items = [_c_items(side, 0, len(side)) for side in tokens]
+    except ValueError as e:
+        return str(e)
+    changed = [{l.old for l in fd.changed("-")}, {l.new for l in fd.changed("+")}]
+    if any(t.kind == "directive" and changed[i] & set(range(t.line, t.end + 1))
+           for i, side in enumerate(tokens) for t in side):
+        return "it changes a directive line, which the guard does not read"
+    if any(t.kind in ("name", "directive") and C_MOVING.search(t.text) for side in tokens for t in side):
+        return "it names __LINE__ or __COUNTER__, whose values move with the lines around them"
+    macros = {m.group(1) for side in tokens for t in side if t.kind == "directive"
+              for m in [C_DEFINE.match(t.text)] if m}
+    # The names the old file's code uses, but for directives and member names after . or ->.
+    vocabulary = {t.text for k, t in enumerate(tokens[0])
+                  if t.kind == "name" and not (k and tokens[0][k - 1].text in (".", "->"))}
+    tests = [[i for i in _c_flat(side) if i.test] for side in items]
+    old = {i.test for i in tests[0]}
+    if len(old) != len(tests[0]) or len({i.test for i in tests[1]}) != len(tests[1]):
+        return "it defines a test twice"
+    added = [i for i in tests[1] if i.test not in old]
+    kinds = {i.test[0] for i in tests[0]}
+    for item in added:
+        if item.test[0] not in kinds:
+            return f"it adds {_c_test_name(item.test)}, a kind of test the file did not have"
+        if item.test[0] == "unity" and item.test[1] in vocabulary:
+            return f"it adds the test {item.test[1]}, a name the file's existing code already uses"
+        why = _c_new_test_unsafe(item, vocabulary, macros)
+        if why:
+            return why
+    flat = list(_c_flat(items[1]))
+    last = max((k for k, i in enumerate(flat) if i.test in old), default=-1)
+    early = next((i for i in added if i.test[0] != "unity" and flat.index(i) < last), None)
+    if early:
+        return (f"it adds {_c_test_name(early.test)} before an existing test; a new test that registers itself "
+                "comes after the tests the file already has, so they run as before")
+    unity = {i.test[1] for i in added if i.test[0] == "unity"}
+    return _c_pair(items[0], items[1], {id(i) for i in added}, unity, macros)
+
+
+def _c_pair(old, new, added, unity, macros):
+    """Why the items new, with the new tests (ids in added) left out, are more than the items old with
+    assertions replaced in existing tests and new tests registered in a runner, or None."""
+    rest = [i for i in new if id(i) not in added]
+    if len(rest) != len(old):
+        return "it adds, removes or moves code that is not a new test, or removes a test"
+    for a, b in zip(old, rest):
+        if a.key == b.key:
+            continue
+        if a.kind == b.kind == "scope" and a.head == b.head:
+            why = _c_pair(a.children, b.children, added, unity, macros)
+        elif a.kind == b.kind == "function" and a.head == b.head:
+            why = _c_test_change(a, b, macros) if a.test else _c_runner_change(a, b, unity)
+        else:
+            why = ("it changes code outside a test body: a test's header, a helper, a fixture, a declaration, a "
+                   "directive or a runner")
+        if why:
+            return why
+    return None
+
+
 def c_cpp_hits(files, facts, flagged):
     """removed-tests hits for a C/C++ repository's changes that may change which tests run or what they include.
 
@@ -932,15 +1544,21 @@ def c_cpp_hits(files, facts, flagged):
         if not _touched(fd) or fd.path in flagged or fd.path in facts.blind:
             continue
         if any(_at_test_dir(p) for p in fd.paths):
-            if not all(_python_test(p, facts) for p in fd.paths):
-                detail = f"{fd.status} a file in a test directory of a C/C++ repository"
-            else:
+            if all(_python_test(p, facts) for p in fd.paths):
                 why = _python_unexempt(fd)
                 if why:
                     hits.append(Hit("removed-tests", fd.path, None, f"{fd.status} a Python test file of a C/C++ "
                                     f"repository: {why}; only replacing compared literals or comparison operators in "
                                     "assert statements of existing tests is exempt, so this needs approval"))
                 continue
+            if fd.status == "modified" and all(_ext(p) in C_EXTS for p in fd.paths):
+                why = _c_cpp_unexempt(fd)
+                if why:
+                    hits.append(Hit("removed-tests", fd.path, None, f"modified a C/C++ test source of a C/C++ "
+                                    f"repository: {why}; only adding tests and replacing literals or comparison "
+                                    "operators in assertions of existing tests is exempt, so this needs approval"))
+                continue
+            detail = f"{fd.status} a file in a test directory of a C/C++ repository"
         elif fd.modes & {"160000"}:
             detail = f"{fd.status} a submodule of a C/C++ repository, which may hold sources or headers"
         elif fd.status != "modified" and any(_ext(p) in C_FILE_EXTS for p in fd.paths):
