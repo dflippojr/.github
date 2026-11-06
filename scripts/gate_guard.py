@@ -1262,9 +1262,15 @@ def _c_assert_change(old, new, name, macros):
         defined = next((t.text for t in statement if t.text in macros), None)
         if defined:
             return f"it changes an assertion in {name} that names {defined}, a macro the file defines"
-        if re.search(r"MESSAGE|_MSG$", macro) and not (args and _c_literal(args[-1]) or "").startswith("string"):
-            return (f"it changes an assertion in {name} whose message is not a string literal; a message may run "
-                    "only when the assertion fails")
+        if re.search(r"MESSAGE|_MSG$", macro):
+            # Unity's message is its macro's last argument. doctest's message is every argument after the first
+            # (CHECK_MESSAGE(cond, ...) logs them all lazily), and so is any other framework's, read as variadic.
+            unity = macro.startswith("TEST_ASSERT")
+            message = args[-1:] if unity else args[1:]
+            if not message or not all((_c_literal(a) or "").startswith("string") for a in message):
+                return (f"it changes an assertion in {name} whose message is not a string literal"
+                        f"{'' if unity else ' in every argument after the first'}; a message may run only when the "
+                        "assertion fails")
     (old_macro, old_args), (new_macro, new_args) = calls
     if old_macro != new_macro or len(old_args) != len(new_args) or any(
             _c_masked(a) != _c_masked(b) for a, b in zip(old_args, new_args)):

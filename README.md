@@ -179,8 +179,10 @@ any of them ending in `_MESSAGE`. A project macro named like one
 test_name(void)`, GoogleTest's `TEST` or `TEST_F`, or a Catch2 or doctest
 `TEST_CASE` of plain strings. A changed assertion may hold no `&&`, `||`,
 `?:`, assignment, `++`, `--`, `throw` or `return`, no name of a macro the file
-defines, and, for a `*_MESSAGE` macro, no message but a string literal, which
-may run only when the assertion fails.
+defines, and, for a `*_MESSAGE` macro, no message but string literals, which
+may run only when the assertion fails: Unity's message is its last argument,
+and doctest's (`CHECK_MESSAGE(cond, ...)`, variadic and logged lazily), like
+any other framework's, is every argument after the first.
 
 A new test is not exempt, as in Python test files (the owner's decision of
 2026-11-06): a new Unity, GoogleTest, Catch2 or doctest test, and its
