@@ -1,0 +1,35 @@
+# gate-guard fixture: a literal changed in an assertion that names a macro the file defines
+# expect: removed-tests
+# hits: 1
+# detail: names LIMIT, a macro the file defines
+
+diff --git a/firmware/test/test_logic/test_main.cpp b/firmware/test/test_logic/test_main.cpp
+index 13c16ed..5aa4fdb 100644
+--- a/firmware/test/test_logic/test_main.cpp
++++ b/firmware/test/test_logic/test_main.cpp
+@@ -1,24 +1,24 @@
+ #include <unity.h>
+ #include "logic.h"
+ 
+ #define LIMIT 10
+ 
+ void setUp(void) {}
+ void tearDown(void) {}
+ 
+ void test_clamp_low(void) {
+     // boundary
+     TEST_ASSERT_EQUAL(0, clamp(-5, 0, 10));
+     TEST_ASSERT_TRUE(clamp(5, 0, 10) == 5);
+ }
+ 
+ void test_clamp_high(void) {
+-    TEST_ASSERT_EQUAL(LIMIT, clamp(50, 0, 10));
++    TEST_ASSERT_EQUAL(LIMIT, clamp(50, 0, 10) + 0);
+ }
+ 
+ int main(int argc, char **argv) {
+     UNITY_BEGIN();
+     RUN_TEST(test_clamp_low);
+     RUN_TEST(test_clamp_high);
+     return UNITY_END();
+ }

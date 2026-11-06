@@ -1,0 +1,39 @@
+# gate-guard fixture: a new test names a macro the file defines
+# expect: removed-tests
+# hits: 1
+# detail: names FAST_PATH, a macro the file defines
+
+diff --git a/firmware/test/test_logic/test_main.cpp b/firmware/test/test_logic/test_main.cpp
+index f0da16d..7d1f4b5 100644
+--- a/firmware/test/test_logic/test_main.cpp
++++ b/firmware/test/test_logic/test_main.cpp
+@@ -1,24 +1,29 @@
+ #include <unity.h>
+ #include "logic.h"
+ 
+ #define FAST_PATH 1
+ 
+ void setUp(void) {}
+ void tearDown(void) {}
+ 
+ void test_clamp_low(void) {
+     // boundary
+     TEST_ASSERT_EQUAL(0, clamp(-5, 0, 10));
+     TEST_ASSERT_TRUE(clamp(5, 0, 10) == 5);
+ }
+ 
+ void test_clamp_high(void) {
+     TEST_ASSERT_EQUAL(10, clamp(50, 0, 10));
+ }
+ 
++void test_clamp_middle(void) {
++    TEST_ASSERT_EQUAL(FAST_PATH, clamp(1, 0, 10));
++}
++
+ int main(int argc, char **argv) {
+     UNITY_BEGIN();
+     RUN_TEST(test_clamp_low);
+     RUN_TEST(test_clamp_high);
++    RUN_TEST(test_clamp_middle);
+     return UNITY_END();
+ }

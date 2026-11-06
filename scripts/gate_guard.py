@@ -981,16 +981,17 @@ C_KEYWORDS = frozenset("""
     template this thread_local throw true try typedef typeid typename union unsigned using virtual void volatile
     wchar_t while xor xor_eq""".split())
 # The keywords a new test may use: types, qualifiers, literals, sizeof, static_cast and control flow that stays
-# in the test. Not return, goto, throw, asm, extern, static, new, delete, using, a reinterpreting cast or a type
-# definition.
+# in the test. Not return, goto, throw, asm, extern, new, delete, a reinterpreting cast or a type definition;
+# using and namespace only as using namespace a::b; or using a::b; (C_USING).
 C_NEW_KEYWORDS = frozenset("""
     auto bool break case char char8_t char16_t char32_t const constexpr continue decltype default do double else
-    false float for if int long nullptr short signed sizeof static_cast switch this true unsigned void wchar_t
-    while""".split())
+    false float for if int long nullptr short signed sizeof static static_cast switch this true unsigned void
+    wchar_t while""".split())
 # Keywords that can start a declaration a new test makes.
 C_DECL_KEYWORDS = frozenset("""
-    auto bool char char8_t char16_t char32_t const constexpr double float int long short signed unsigned void
-    wchar_t""".split())
+    auto bool char char8_t char16_t char32_t const constexpr double float int long short signed static unsigned
+    void wchar_t""".split())
+C_USING = re.compile(r"using (?:namespace \w+(?: :: \w+)*|\w+(?: :: \w+)+) ;")
 # Names a new test may not use even where the file already does: they end or replace the process, jump out of
 # a test, change what the test framework records or runs, or skip or end a test.
 C_DENIED = frozenset("""
@@ -1411,8 +1412,10 @@ def _c_new_test_unsafe(item, vocabulary, macros):
             if loop is not None:
                 declared[loop] = set()
         allowed = set(vocabulary) | known
+        using = C_USING.fullmatch(_c_texts(statement))
         for k, t in enumerate(statement):
-            if t.kind != "name" or (k and statement[k - 1].text in (".", "->")):
+            if t.kind != "name" or (k and statement[k - 1].text in (".", "->")) or (
+                    using and t.text in ("using", "namespace")):
                 continue
             if k in declared:
                 why = _c_name_unsafe(t.text, {t.text}, macros)
@@ -1499,14 +1502,17 @@ def _c_cpp_unexempt(fd):
         why = _c_new_test_unsafe(item, vocabulary, macros)
         if why:
             return why
+    unity = {i.test[1] for i in added if i.test[0] == "unity"}
+    why = _c_pair(items[0], items[1], {id(i) for i in added}, unity, macros)
+    if why:
+        return why
     flat = list(_c_flat(items[1]))
     last = max((k for k, i in enumerate(flat) if i.test in old), default=-1)
     early = next((i for i in added if i.test[0] != "unity" and flat.index(i) < last), None)
     if early:
         return (f"it adds {_c_test_name(early.test)} before an existing test; a new test that registers itself "
                 "comes after the tests the file already has, so they run as before")
-    unity = {i.test[1] for i in added if i.test[0] == "unity"}
-    return _c_pair(items[0], items[1], {id(i) for i in added}, unity, macros)
+    return None
 
 
 def _c_pair(old, new, added, unity, macros):
@@ -1559,6 +1565,11 @@ def c_cpp_hits(files, facts, flagged):
                                     "operators in assertions of existing tests is exempt, so this needs approval"))
                 continue
             detail = f"{fd.status} a file in a test directory of a C/C++ repository"
+        elif any(_name(p) == "cmakelists.txt" or _ext(p) == ".cmake" for p in fd.paths):
+            hits.append(Hit("removed-tests", fd.path, None, f"{fd.status} a CMake file of a C/C++ repository, which "
+                            "can register or drop CTest tests; the guard does not read CMake, so this needs approval "
+                            "whatever the change"))
+            continue
         elif fd.modes & {"160000"}:
             detail = f"{fd.status} a submodule of a C/C++ repository, which may hold sources or headers"
         elif fd.status != "modified" and any(_ext(p) in C_FILE_EXTS for p in fd.paths):

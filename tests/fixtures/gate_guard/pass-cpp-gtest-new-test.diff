@@ -1,0 +1,36 @@
+# gate-guard fixture: a GoogleTest assertion's literal fixed and a new TEST_F after the existing tests
+# expect: 
+# hits: 0
+
+diff --git a/test/unit/clamp_test.cpp b/test/unit/clamp_test.cpp
+index 4234354..4027425 100644
+--- a/test/unit/clamp_test.cpp
++++ b/test/unit/clamp_test.cpp
+@@ -1,21 +1,26 @@
+ #include <gtest/gtest.h>
+ #include "logic.h"
+ 
+ namespace {
+ 
+ class ClampTest : public ::testing::Test {
+  protected:
+   void SetUp() override { limit_ = 10; }
+   int limit_ = 0;
+ };
+ 
+ TEST(Clamp, Low) {
+-  EXPECT_EQ(0, clamp(-5, 0, 10));
++  EXPECT_EQ(1, clamp(-5, 0, 10));
+   EXPECT_TRUE(clamp(5, 0, 10) == 5);
+ }
+ 
+ TEST_F(ClampTest, High) {
+   EXPECT_EQ(limit_, clamp(50, 0, limit_));
+ }
+ 
++TEST_F(ClampTest, Middle) {
++  const int value = clamp(5, 0, limit_);
++  EXPECT_EQ(5, value);
++}
++
+ }  // namespace

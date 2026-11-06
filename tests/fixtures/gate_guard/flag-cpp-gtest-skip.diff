@@ -1,0 +1,32 @@
+# gate-guard fixture: GTEST_SKIP() added to an existing GoogleTest test
+# expect: removed-tests
+# hits: 1
+# detail: adds, removes or moves a statement in Clamp.Low
+
+diff --git a/test/unit/clamp_test.cpp b/test/unit/clamp_test.cpp
+index 4234354..6e4e7c4 100644
+--- a/test/unit/clamp_test.cpp
++++ b/test/unit/clamp_test.cpp
+@@ -1,21 +1,22 @@
+ #include <gtest/gtest.h>
+ #include "logic.h"
+ 
+ namespace {
+ 
+ class ClampTest : public ::testing::Test {
+  protected:
+   void SetUp() override { limit_ = 10; }
+   int limit_ = 0;
+ };
+ 
+ TEST(Clamp, Low) {
++  GTEST_SKIP();
+   EXPECT_EQ(0, clamp(-5, 0, 10));
+   EXPECT_TRUE(clamp(5, 0, 10) == 5);
+ }
+ 
+ TEST_F(ClampTest, High) {
+   EXPECT_EQ(limit_, clamp(50, 0, limit_));
+ }
+ 
+ }  // namespace

@@ -1,0 +1,12 @@
+# gate-guard fixture: a header in the test directory changes what the tests include
+# expect: removed-tests
+# hits: 1
+# detail: a file in a test directory
+
+diff --git a/firmware/test/test_logic/cases.h b/firmware/test/test_logic/cases.h
+index 7c12fda..9f14d22 100644
+--- a/firmware/test/test_logic/cases.h
++++ b/firmware/test/test_logic/cases.h
+@@ -1 +1 @@
+-#define CLAMP_CASES 3
++#define CLAMP_CASES 0

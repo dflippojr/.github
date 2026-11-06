@@ -1,6 +1,7 @@
-# gate-guard fixture: a Unity assertion changes next to a Python test fix; the C/C++ test directory change still needs approval
+# gate-guard fixture: a Unity assertion's call argument changes next to a Python test fix; issue #43 exempts only literal arguments, so it still needs approval
 # expect: removed-tests
 # hits: 1
+# detail: it changes an assertion in test_clamp_low outside its literal arguments
 
 diff --git a/backend/tests/test_api.py b/backend/tests/test_api.py
 index 5d1e2f0..8a3c4b7 100644

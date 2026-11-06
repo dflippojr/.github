@@ -1,0 +1,9 @@
+# gate-guard fixture: a Unity test file moved unchanged into a dot directory
+# expect: removed-tests
+# hits: 1
+# detail: renamed a file in a test directory
+
+diff --git a/firmware/test/test_logic/test_main.cpp b/firmware/test/.disabled/test_logic/test_main.cpp
+similarity index 100%
+rename from firmware/test/test_logic/test_main.cpp
+rename to firmware/test/.disabled/test_logic/test_main.cpp
