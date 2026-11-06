@@ -1540,13 +1540,13 @@ class RuleDetails(unittest.TestCase):
         # (1) Added-only edits to a Python test module pass: a test appended or inserted between two, with a new
         # import and literal pytest marks, an async test, a new test class, a method added to a test class, and a
         # new test module.
-        new_module = ('"""Reset checks."""\nimport pytest\n\nfrom backend.app import create_app\n\n\n'
+        new_module = ('"""Reset checks."""\nimport pytest\n\nfrom backend.app import create_app\n\nHEIGHTS = (60, 120)\n\n\n'
                       "@pytest.mark.parametrize('height', [60, -1, (1, 2)])\ndef test_reset(height):\n"
                       "    assert create_app()\n\n\nclass TestReset:\n    def test_twice(self):\n        assert True\n")
         passing = [(base, {test_api: api + added}),
                    (base, {test_api: api.replace("\n\n\ndef test_height_limits", added + "\n\ndef test_height_limits")}),
                    (base, {test_api: "import pathlib\nimport pytest\n" + api
-                           + "\n\nHEIGHTS = (60, 120)\n\n\n@pytest.mark.slow\n@pytest.mark.parametrize('n', [1, 2])\n"
+                           + "\n\n@pytest.mark.slow\n@pytest.mark.parametrize('n', [1, 2])\n"
                              "def test_paths(n, tmp_path: pathlib.Path) -> None:\n    assert tmp_path\n"}),
                    (base, {test_api: api + "\n\nasync def test_status():\n    assert create_app()\n"}),
                    (base, {test_api: api + "\n\nclass TestReset:\n    \"\"\"Reset.\"\"\"\n\n"
@@ -1574,6 +1574,8 @@ class RuleDetails(unittest.TestCase):
                   api.replace("create_app\n", "create_app\nfrom os import *\n", 1),
                   "__test__ = False\n" + api,
                   api + "\n\ncreate_app = None\n",
+                  # A literal a conftest.py hook may read from the module, such as a flag that skips its tests.
+                  api + "\n\nREQUIRES_DEVICE = True\n",
                   api + "\n\nLIMIT = len('ab')\n",
                   api.replace("create_app\n", "create_app\nfrom pathlib import Path\n", 1),
                   api + "\n\npytestmark = []\n",
@@ -1608,6 +1610,24 @@ class RuleDetails(unittest.TestCase):
             with self.subTest(header=header):
                 self.assertEqual(flagged(start, {test_api: start[test_api] + "\n    def test_width(self):\n"
                                                                             "        assert True\n"}), expected)
+        # A module that may define tests the guard does not see: a name added there may shadow one.
+        for start_text in ("from shared_suite import *\n" + api,
+                           api + "\n\nfor n in range(2):\n    globals()['test_gen_%d' % n] = test_health\n"):
+            with self.subTest(start=start_text):
+                self.assertEqual(flagged(dict(base, **{test_api: start_text}),
+                                         {test_api: start_text + "\n\ndef test_gen_0():\n    pass\n"}), {test_api})
+        # A new module with a wildcard import, a class nested in a test class changed, and a base named object
+        # where the module rebinds object.
+        nested = cls + "\n    class TestInner:\n        def test_a(self):\n            assert True\n"
+        rebound = "import pytest\nfrom shared import Base as object\n\n\n" + cls.split("\n\n\n", 1)[1].replace(
+            "class TestLimits:", "class TestLimits(object):")
+        for start, change in ((base, {"backend/tests/test_reset.py": "from shared_suite import *\n" + added}),
+                              (dict(base, **{test_api: nested}),
+                               {test_api: nested + "\n        def test_b(self):\n            assert True\n"}),
+                              (dict(base, **{test_api: rebound}),
+                               {test_api: rebound + "\n    def test_width(self):\n        assert True\n"})):
+            with self.subTest(change=change):
+                self.assertEqual(flagged(start, change), set(change))
         # A file that is not a test module stays a hit, even when it only adds lines.
         for path in ("backend/tests/conftest.py", "backend/tests/helpers.py", "backend/tests/__init__.py"):
             with self.subTest(path=path):

@@ -960,6 +960,95 @@ def _py_inserted(old, new):
     return inserted if i == len(old) else None
 
 
+# Names through which a module can define or rebind names the guard does not see.
+PY_DYNAMIC = frozenset(("globals", "vars", "locals", "exec", "eval", "setattr", "*"))
+
+
+class _PyAddition:
+    """The statements an edit adds to a Python test module, checked one by one (see _py_added_change)."""
+
+    def __init__(self, old, new, new_module):
+        self.used, self.bound = _py_identifiers(old) | PY_BUILTINS, set()
+        self.new, self.new_module, self.pytest_module = new, new_module, _py_pytest(new)
+
+    def fresh(self, name, scope):
+        """Why binding name in scope (a set it then joins) is not a new name, or None."""
+        if name in self.used or name in scope:
+            return f"it binds {name}, which the module already binds or reads, or which is a builtin"
+        if PY_RESERVED.match(name):
+            return f"it binds {name}, a name pytest or unittest may read from a test module"
+        scope.add(name)
+        return None
+
+    def methods(self, nodes):
+        """Why nodes, statements added to a test class, are not test_ methods and docstrings, or None."""
+        scope = set()
+        for node in nodes:
+            if _py_docstring(node):
+                continue
+            if not isinstance(node, PY_DEFS):
+                return "it adds a statement to a test class that is not a test_ method or a docstring"
+            why = _py_new_test(node, self.pytest_module) or self.fresh(node.name, scope)
+            if why:
+                return why
+        return None
+
+    def extension(self, prior, node):
+        """Why node, the class prior with statements added, does more than add test_ methods to it, or None."""
+        if not _py_collected_class(prior):
+            return (f"it changes {prior.name}, a class pytest does not collect tests from (not a Test class, a "
+                    "decorator other than pytest marks, or a constructor)")
+        if any(_py_masked(v, set()) != _py_masked(getattr(node, f, None), set())
+               for f, v in ast.iter_fields(prior) if f != "body"):
+            return f"it changes the header of {prior.name}: its name, a base, a keyword or a decorator"
+        if prior.keywords or not all(_py_plain_base(b, self.new) for b in prior.bases):
+            return (f"it adds to {prior.name}, whose base or keyword may hold tests a new method overrides (only "
+                    "object and unittest.TestCase are read)")
+        added = _py_inserted(prior.body, node.body)
+        if added is None:
+            return "it changes or removes a statement that was there"
+        if not all(isinstance(n, ast.AST) for n in added):
+            return f"it changes a class inside {prior.name}"
+        return self.methods(added)
+
+    def new_class(self, node):
+        """Why node, an added class, is not a Test class of test_ methods and docstrings, or None."""
+        if (not node.name.startswith("Test") or node.bases or node.keywords or getattr(node, "type_params", None)
+                or not all(_py_mark(d, self.pytest_module) for d in node.decorator_list)):
+            return (f"it adds {node.name}, a class that is not a Test class with no base, keyword, decorator but "
+                    "pytest marks or type parameter")
+        return self.methods(node.body) or self.fresh(node.name, self.bound)
+
+    def imports(self, node):
+        """Why node, an added import, may bind a name the module's tests read, or None."""
+        if isinstance(node, ast.ImportFrom) and not self.new_module:
+            return ("it adds a from-import to a module that holds tests: a name it imports may be a fixture pytest "
+                    "applies to them (import the module instead)")
+        if any(a.name == "*" for a in node.names):
+            return "it adds a wildcard import, which may bind any name"
+        return next(filter(None, (self.fresh((a.asname or a.name).split(".")[0], self.bound) for a in node.names)),
+                    None)
+
+    def statement(self, node):
+        """Why node, a statement the edit adds, or an (old class, new class) pair, is not an addition of tests,
+        or None."""
+        if isinstance(node, tuple):
+            return self.extension(*node)
+        if _py_docstring(node):
+            return None
+        if isinstance(node, PY_DEFS):
+            return _py_new_test(node, self.pytest_module) or self.fresh(node.name, self.bound)
+        if isinstance(node, ast.ClassDef):
+            return self.new_class(node)
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            return self.imports(node)
+        if (self.new_module and isinstance(node, ast.Assign) and _py_leaves(node.value) is not None
+                and all(isinstance(t, ast.Name) for t in node.targets)):
+            return next(filter(None, (self.fresh(t.id, self.bound) for t in node.targets)), None)
+        return ("it adds a statement that is not a test, a test class, an import or a docstring (or, in a new "
+                "module, a literal assigned to a name)")
+
+
 def _py_added_change(old, new, new_module):
     """Why new, the tree of a Python test module that an edit changes by adding lines only, does more than add
     tests to old, the tree before it, or None. new_module says the edit adds the module.
@@ -969,83 +1058,27 @@ def _py_added_change(old, new, new_module):
     statement of old stays as it was, in its order, and each statement the
     edit adds is a test_ function (see _py_new_test), a Test class of such
     methods and docstrings with no base, a test_ method added to an existing
-    Test class, an import, a docstring, or a literal assigned to a name. A
-    name it binds is new to the module and not a builtin, so no existing test
-    reads it, and is not one pytest or unittest reads by its name
-    (PY_RESERVED). In a module that already holds tests, an import names a
-    module (import x), never a name from it, which may be a fixture that
-    pytest applies to them (an autouse one). What an added test does when it
-    runs is not read.
+    Test class, an import or a docstring; in a new module, a literal assigned
+    to a name too. A name it binds is new to the module and not a builtin, so
+    no existing test reads it, and is not one pytest or unittest reads by its
+    name (PY_RESERVED). In a module that already holds tests, an import names
+    a module (import x), never a name from it, which may be a fixture that
+    pytest applies to them (an autouse one), and no literal is assigned, which
+    a conftest.py hook may read from the module. A module that may define
+    names the guard does not see (a wildcard import, globals() and the like,
+    PY_DYNAMIC) is never exempt. What an added test does when it runs is not
+    read.
     """
+    dynamic = PY_DYNAMIC & _py_identifiers(old)
+    if dynamic:
+        how = "a wildcard import" if "*" in dynamic else sorted(dynamic)[0]
+        return (f"the module uses {how}, through which it may define tests the guard does not see, so a name it "
+                "adds may shadow one")
     inserted = _py_inserted(old.body, new.body)
     if inserted is None:
         return "it changes or removes a statement that was there"
-    used, bound = _py_identifiers(old) | PY_BUILTINS, set()
-    pytest_module = _py_pytest(new)
-
-    def fresh(name, scope):
-        if name in used or name in scope:
-            return f"it binds {name}, which the module already binds or reads, or which is a builtin"
-        if PY_RESERVED.match(name):
-            return f"it binds {name}, a name pytest or unittest may read from a test module"
-        scope.add(name)
-        return None
-
-    def methods(nodes, scope):
-        for node in nodes:
-            if not _py_docstring(node):
-                why = _py_new_test(node, pytest_module) if isinstance(node, PY_DEFS) else (
-                    "it adds a statement to a test class that is not a test_ method or a docstring")
-                why = why or fresh(node.name, scope)
-                if why:
-                    return why
-        return None
-
-    for node in inserted:
-        if isinstance(node, tuple):
-            prior, node = node
-            if not _py_collected_class(prior):
-                return (f"it changes {prior.name}, a class pytest does not collect tests from (not a Test class, "
-                        "a decorator other than pytest marks, or a constructor)")
-            if any(_py_masked(v, set()) != _py_masked(getattr(node, f, None), set())
-                   for f, v in ast.iter_fields(prior) if f != "body"):
-                return f"it changes the header of {prior.name}: its name, a base, a keyword or a decorator"
-            if prior.keywords or not all(_py_plain_base(b, new) for b in prior.bases):
-                return (f"it adds to {prior.name}, whose base or keyword may hold tests a new method overrides "
-                        "(only object and unittest.TestCase are read)")
-            added = _py_inserted(prior.body, node.body)
-            why = "it changes or removes a statement that was there" if added is None else (
-                methods(added, set()) if all(isinstance(n, ast.AST) for n in added) else
-                f"it changes a class inside {prior.name}")
-        elif _py_docstring(node):
-            continue
-        elif isinstance(node, PY_DEFS):
-            why = _py_new_test(node, pytest_module) or fresh(node.name, bound)
-        elif isinstance(node, ast.ClassDef):
-            why = ((f"it adds {node.name}, a class that is not a Test class with no base, keyword, decorator but "
-                    "pytest marks or type parameter")
-                   if (not node.name.startswith("Test") or node.bases or node.keywords
-                       or getattr(node, "type_params", None)
-                       or not all(_py_mark(d, pytest_module) for d in node.decorator_list))
-                   else methods(node.body, set()) or fresh(node.name, bound))
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            if isinstance(node, ast.ImportFrom) and not new_module:
-                why = ("it adds a from-import to a module that holds tests: a name it imports may be a fixture "
-                       "pytest applies to them (import the module instead)")
-            elif any(a.name == "*" for a in node.names):
-                why = "it adds a wildcard import, which may bind any name"
-            else:
-                why = next(filter(None, (fresh((a.asname or a.name).split(".")[0], bound) for a in node.names)),
-                           None)
-        elif (isinstance(node, ast.Assign) and _py_leaves(node.value) is not None
-              and all(isinstance(t, ast.Name) for t in node.targets)):
-            why = next(filter(None, (fresh(t.id, bound) for t in node.targets)), None)
-        else:
-            why = ("it adds a statement that is not a test, a test class, an import, a docstring or a literal "
-                   "assigned to a name")
-        if why:
-            return why
-    return None
+    addition = _PyAddition(old, new, new_module)
+    return next(filter(None, map(addition.statement, inserted)), None)
 
 
 def _python_unexempt(fd):
@@ -1095,7 +1128,7 @@ def _python_unexempt(fd):
         if fd.status == "added":
             return added
     why = _python_assert_change(fd, trees, texts)
-    return why and (f"{why}; and {added.replace('it ', 'it does not only add tests: it ', 1)}" if added else why)
+    return why and (f"{why}; and it does not only add tests: {added}" if added else why)
 
 
 def _python_assert_change(fd, trees, texts):

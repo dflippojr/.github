@@ -252,14 +252,20 @@ was and in its order, and each statement it adds is one of these:
   module that already holds tests, a `from` import is a hit, since the name it
   imports may be a fixture that pytest applies to those tests (an autouse
   one);
-- a docstring, or a literal assigned to a name.
+- a docstring; and in a new module, a literal assigned to a name. In a module
+  that already holds tests, such an assignment is a hit, since a
+  `conftest.py` hook may read it from the module (a flag that skips its
+  tests).
 
 Each name an added statement binds is new: the module neither binds nor reads
 it anywhere, it is not a builtin, and it does not start with `_`, `pytest_`,
 `pytestmark`, `setup`, `teardown`, `collect_ignore` or `load_tests`, which
 pytest or unittest read from a test module by name. So an added test cannot
 shadow an existing test, fixture, helper or import, and an addition cannot set
-`__test__`, `pytestmark` or a module setup. A change that does anything else is
+`__test__`, `pytestmark` or a module setup. A module that uses a wildcard
+import, `globals`, `vars`, `locals`, `exec`, `eval` or `setattr` anywhere is
+never exempt this way, since it may define tests whose names the guard does
+not see. A change that does anything else is
 judged by the assert-only rule above, so an assertion fixed beside a test added
 is a hit. New skips in an added test are hits as in any repository. The guard
 does not read what an added test does when it runs: like any code the pull
