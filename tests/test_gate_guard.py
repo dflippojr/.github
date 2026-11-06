@@ -1557,6 +1557,9 @@ class RuleDetails(unittest.TestCase):
                 u.replace("void setUp", "#if defined(ARDUINO)\n#include <Arduino.h>\n#endif\n\nvoid setUp").replace(
                     "EQUAL(0,", "EQUAL(1,")),
             "a C source": (u, u.replace("EQUAL(0,", "EQUAL(2,")),
+            "a doctest message of string arguments only": (
+                c.replace("REQUIRE(clamp(-5, 0, 10) == 0);", 'REQUIRE_MESSAGE(clamp(-5, 0, 10) == 0, "low", "end");'),
+                c.replace("REQUIRE(clamp(-5, 0, 10) == 0);", 'REQUIRE_MESSAGE(clamp(-5, 0, 10) == 1, "min", "end");')),
             "built-in integer and floating suffixes": (
                 u.replace("EQUAL(0,", "EQUAL(1u,").replace("== 5);", "== 0x1p3);"),
                 u.replace("EQUAL(0,", "EQUAL(2ULL,").replace("== 5);", "== 0x1.8p-3f);")),
@@ -1606,6 +1609,18 @@ class RuleDetails(unittest.TestCase):
             "a lazy message": (u.replace('TEST_ASSERT_EQUAL_STRING("low", label(0));', 'TEST_ASSERT_MESSAGE(f() == 1, why());'),
                                u.replace('TEST_ASSERT_EQUAL_STRING("low", label(0));', 'TEST_ASSERT_MESSAGE(f() == 2, why());'),
                                "message is not a string literal"),
+            "a doctest message call before a final string": (
+                c.replace("REQUIRE(clamp(-5, 0, 10) == 0);", 'REQUIRE_MESSAGE(clamp(-5, 0, 10) == 0, why(), "end");'),
+                c.replace("REQUIRE(clamp(-5, 0, 10) == 0);", 'REQUIRE_MESSAGE(clamp(-5, 0, 10) == 1, why(), "end");'),
+                "message is not a string literal"),
+            "a doctest message call between strings": (
+                c.replace("REQUIRE(clamp(-5, 0, 10) == 0);", 'CHECK_FALSE_MESSAGE(clamp(-5, 0, 10) == 0, "a", why(), "b");'),
+                c.replace("REQUIRE(clamp(-5, 0, 10) == 0);", 'CHECK_FALSE_MESSAGE(clamp(-5, 0, 10) != 0, "a", why(), "b");'),
+                "message is not a string literal"),
+            "a doctest message macro with a fixed argument that is no string": (
+                c.replace("REQUIRE(clamp(-5, 0, 10) == 0);", 'CHECK_THROWS_AS_MESSAGE(clamp(-5, 0, 10), Error, "a");'),
+                c.replace("REQUIRE(clamp(-5, 0, 10) == 0);", 'CHECK_THROWS_AS_MESSAGE(clamp(-5, 0, 10), Error, "b");'),
+                "message is not a string literal"),
             "EXPECT_CALL, a mock expectation": (g.replace("EXPECT_EQ(0, clamp(-5, 0, 10));", "EXPECT_CALL(mock, Read(0));"),
                                                 g.replace("EXPECT_EQ(0, clamp(-5, 0, 10));", "EXPECT_CALL(mock, Read(1));"),
                                                 "not an assertion macro call"),
@@ -2399,7 +2414,8 @@ class GitEndToEnd(unittest.TestCase):
                      "flag-cpp-assert-call-argument", "flag-cpp-new-test-exit", "flag-cpp-run-test-before-existing",
                      "flag-cpp-line-splice", "flag-cpp-if0-around-test", "flag-cpp-ctest-registration",
                      "flag-cpp-rename-disabled-dir", "flag-cpp-assert-udl-reserved-suffix",
-                     "flag-cpp-new-test-qualified-call"] + sorted(p.stem for p in FIXTURES.glob("*-floor-*.diff")):
+                     "flag-cpp-new-test-qualified-call", "flag-cpp-doctest-message-call-first",
+                     "pass-cpp-doctest-message-literals"] + sorted(p.stem for p in FIXTURES.glob("*-floor-*.diff")):
             with self.subTest(fixture=name), tempfile.TemporaryDirectory() as tmp:
                 subprocess.run(["git", "init", "-q", tmp], check=True, capture_output=True)
                 text = (FIXTURES / f"{name}.diff").read_text(encoding="utf-8")
