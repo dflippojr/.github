@@ -869,37 +869,29 @@ def _py_line_change(tree, tests, text, changed):
 # and other dunders), which an addition may not bind.
 PY_RESERVED = re.compile(r"_|pytest_|pytestmark|setup|teardown|collect_ignore|load_tests", re.IGNORECASE)
 PY_BUILTINS = frozenset(dir(builtins))
-# Review round 1, the owner's decision: what the guard cannot judge exactly
-# fails closed. An added test's body holds only these statements, none of the
-# PY_BODY_UNSAFE nodes (flow control, :=, a lambda, a suspension), and reads
-# only its own names, the PY_SAFE_BUILTINS, pytest.approx and names the module
-# binds by an import of code that is not a PY_RUNTIME_MODULES module, a helper
-# or a literal (see _PyAddition.traceable).
-PY_BODY_STATEMENTS = (ast.Expr, ast.Assert, ast.Pass, ast.Assign, ast.AnnAssign, ast.AugAssign)
+# Review rounds 1 and 2, the owner's decision: what the guard cannot judge
+# exactly fails closed, so an added test's body holds only what it can prove
+# harmless. It holds only these statements (no in-place assignment, which can
+# empty a shared list through an alias) and none of the PY_BODY_UNSAFE nodes
+# (flow control, :=, a lambda, a suspension). It calls only PY_SAFE_BUILTINS
+# by name and pytest.approx, reads an attribute only of its own names and
+# literals, and reads no module binding but an immutable literal: see
+# _PyAddition.effect.
+PY_BODY_STATEMENTS = (ast.Expr, ast.Assert, ast.Pass, ast.Assign, ast.AnnAssign)
 PY_BODY_UNSAFE = PY_UNSAFE - {"Starred"}
+# Builtins that compute a value from their arguments and call none of them
+# (no map, filter, iter, or a key= of sorted, min or max), and exception
+# classes, which only construct one.
 PY_SAFE_BUILTINS = frozenset((
     "abs", "all", "any", "ascii", "bin", "bool", "bytearray", "bytes", "callable", "chr", "complex", "dict", "divmod",
-    "enumerate", "filter", "float", "format", "frozenset", "hash", "hex", "int", "isinstance", "issubclass", "iter",
-    "len", "list", "map", "max", "min", "next", "oct", "ord", "pow", "print", "range", "repr", "reversed", "round",
-    "set", "slice", "sorted", "str", "sum", "tuple", "zip")) | frozenset(
+    "enumerate", "float", "format", "frozenset", "hash", "hex", "int", "isinstance", "issubclass", "len", "list",
+    "max", "min", "next", "oct", "ord", "pow", "print", "range", "repr", "reversed", "round", "set", "slice",
+    "sorted", "str", "sum", "tuple", "zip")) | frozenset(
     n for n in PY_BUILTINS if isinstance(getattr(builtins, n), type) and issubclass(getattr(builtins, n), Exception))
-# Modules through which code can end the process, skip a test, patch other code
-# or reach the interpreter or pytest itself; a body reads no name bound from one.
-PY_RUNTIME_MODULES = frozenset((
-    "os", "posix", "nt", "sys", "subprocess", "signal", "builtins", "importlib", "ctypes", "threading", "_thread",
-    "multiprocessing", "concurrent", "asyncio", "gc", "inspect", "atexit", "faulthandler", "types", "runpy", "code",
-    "pdb", "shutil", "pty", "resource", "unittest", "mock", "pytest", "_pytest", "pluggy"))
-# Attributes a body may not read: private and special ones (__code__,
-# __globals__, os._exit), and those that skip a test or end the run.
+# Attributes a body may not read, even of its own names: private and special
+# ones (__class__, __code__), and those that skip a test or end the run.
 PY_STOP_ATTRS = re.compile(
     r"_|skip|xfail|(?:exit|quit|abort|system)$|kill|fork|spawn|exec[lv]|popen|should(?:stop|fail)$", re.IGNORECASE)
-# Fixtures an added test may request although no existing test of the module
-# does, and fixtures it may never request: they reach pytest's session and
-# config, or patch other code.
-PY_INERT_FIXTURES = frozenset(("tmp_path", "capsys", "capfd", "caplog"))
-PY_INTERNAL_FIXTURES = frozenset(("request", "pytestconfig", "monkeypatch", "mocker", "cache", "pytester", "testdir",
-                                  "doctest_namespace", "record_property", "record_testsuite_property",
-                                  "record_xml_attribute", "tmp_path_factory", "tmpdir_factory"))
 # Names that make a module a fixture file: it defines or applies fixtures.
 PY_FIXTURE_NAMES = frozenset(("fixture", "yield_fixture", "usefixtures"))
 
@@ -945,9 +937,10 @@ def _py_parametrize(node, pytest_module):
     return set(words) if all(w.isidentifier() for w in words) else None
 
 
-def _py_annotation(node):
-    """Whether node, an annotation, is absent, a literal or a dotted name, whose value comes from a lookup only."""
-    return node is None or _py_chain(node) is not None or _py_leaves(node) is not None
+def _py_immutable(node):
+    """Whether node is a literal of no list, set or dict, so no code can change the value it gives."""
+    return _py_leaves(node) is not None and not any(isinstance(n, (ast.List, ast.Set, ast.Dict))
+                                                    for n in ast.walk(node))
 
 
 def _py_collected_class(node):
@@ -985,27 +978,24 @@ def _py_inserted(old, new):
     return inserted if i == len(old) else None
 
 
+def _py_bound(node):
+    """Every name node binds or declares, in any scope, but not the names it only reads."""
+    return {name for n in ast.walk(node) for name in _py_binds_here(n)}
+
+
 def _py_top_bindings(statement):
-    """(name, traceable) for each name a top-level statement binds. A name is traceable when it is bound by an
-    import of code that is not a PY_RUNTIME_MODULES module, by a def or class that is not a test, or to a
-    literal, and is not private; a name bound any other way, or declared global inside it, is not."""
-    if isinstance(statement, (ast.Import, ast.ImportFrom)):
-        level, module = getattr(statement, "level", 0), getattr(statement, "module", None) or ""
-        for a in statement.names:
-            root = "" if level else (module or a.name).split(".")[0]
-            bound = a.asname or (a.name if module or level else a.name.split(".")[0])
-            yield bound, root not in PY_RUNTIME_MODULES and a.name != "*" and not bound.startswith("_")
-        return
-    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        bound = [(statement.name, not statement.name.lower().startswith(("test", "_")))]
-    elif isinstance(statement, (ast.Assign, ast.AnnAssign)) and statement.value is not None:
+    """(name, readable) for each name a top-level statement binds or declares. A name is readable by an added
+    test only when the statement assigns it an immutable literal (_py_immutable) and it is not private; one an
+    import, a def or a class binds, or that is bound any other way or declared global inside the statement, is
+    not: a body that reads it could call or traverse code the guard does not follow, or change a shared value."""
+    if isinstance(statement, (ast.Assign, ast.AnnAssign)) and statement.value is not None:
         targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
-        literal = _py_leaves(statement.value) is not None and all(isinstance(t, ast.Name) for t in targets)
-        bound = [(n, literal and not n.startswith("_")) for t in targets for n in _py_identifiers(t)]
+        literal = _py_immutable(statement.value) and all(isinstance(t, ast.Name) for t in targets)
+        bound = [(n, literal and not n.startswith("_")) for t in targets for n in _py_bound(t)]
     else:
-        bound = [(n, False) for n in _py_identifiers(statement)]
-    for name, traceable in bound:
-        yield name, traceable
+        bound = [(n, False) for n in _py_bound(statement)]
+    for name, readable in bound:
+        yield name, readable
     for n in ast.walk(statement):
         if isinstance(n, (ast.Global, ast.Nonlocal)):
             for name in n.names:
@@ -1022,12 +1012,11 @@ class _PyAddition:
     def __init__(self, old, new, new_module):
         self.used, self.bound = _py_identifiers(old) | PY_BUILTINS, set()
         self.new, self.new_module, self.pytest_module = new, new_module, _py_pytest(new)
-        self.requested = {a.arg for t in _python_tests(old) for a in t.args.args} - PY_INTERNAL_FIXTURES
-        traceable, untraceable = set(), set()
+        readable, unreadable = set(), set()
         for statement in new.body:
             for name, ok in _py_top_bindings(statement):
-                (traceable if ok else untraceable).add(name)
-        self.module_names, self.traceable = traceable | untraceable, traceable - untraceable
+                (readable if ok else unreadable).add(name)
+        self.module_names, self.constants = readable | unreadable, readable - unreadable
 
     def fresh(self, name, scope):
         """Why binding name in scope (a set it then joins) is not a new name, or None."""
@@ -1039,11 +1028,23 @@ class _PyAddition:
         return None
 
     def readable(self, name):
-        """Whether an added test's body may read name, a name that is not its own: see _py_top_bindings."""
-        return name in self.traceable if name in self.module_names else name in PY_SAFE_BUILTINS
+        """Whether an added test's body may read name, a name that is not its own: an immutable literal the module
+        binds (see _py_top_bindings), or a PY_SAFE_BUILTINS name the module does not bind."""
+        return name in self.constants if name in self.module_names else name in PY_SAFE_BUILTINS
+
+    def annotation(self, node):
+        """Whether node, an annotation, is absent, a literal or a builtin's name: Python evaluates it when it imports
+        the module, so it may not look up an attribute of a module binding."""
+        return node is None or _py_leaves(node) is not None or isinstance(node, ast.Name) and self.readable(node.id)
 
     def params(self, node, method):
-        """The names of the parameters of node, an added test, or why one is a fixture the guard cannot judge."""
+        """The names of the parameters of node, an added test, its body may read, or why one is a fixture.
+
+        A parameter without a default is one a literal parametrize mark gives.
+        Any other is a fixture, whose value the guard does not follow and may
+        share with the existing tests; and a method's self, whose attributes
+        reach the class the existing tests share, is not read.
+        """
         a, given = node.args, set()
         for d in node.decorator_list:
             names = _py_parametrize(d, self.pytest_module)
@@ -1053,48 +1054,80 @@ class _PyAddition:
             given |= names
         if getattr(a, "posonlyargs", []) or a.vararg or a.kwarg or a.kwonlyargs:
             return f"it adds {node.name} with a parameter that is not a plain positional one"
-        if (any(_py_leaves(d) is None for d in a.defaults) or not all(_py_annotation(p.annotation) for p in a.args)
-                or not _py_annotation(node.returns) or getattr(node, "type_params", None)):
-            return (f"it adds {node.name} with a default that is not a literal, an annotation that is not a literal "
-                    "or a dotted name, or a type parameter, which Python evaluates when it imports the module")
-        fixtures = a.args[1:] if method else a.args
+        if (not all(_py_immutable(d) for d in a.defaults) or not all(self.annotation(p.annotation) for p in a.args)
+                or not self.annotation(node.returns) or getattr(node, "type_params", None)):
+            return (f"it adds {node.name} with a default that is not an immutable literal, an annotation that is not "
+                    "a literal or a builtin's name, or a type parameter, which Python evaluates when it imports the "
+                    "module")
+        params = a.args[1:] if method else a.args
         if method and (not a.args or a.args[0].arg != "self"):
             return f"it adds {node.name}, a method whose first parameter is not self"
-        for p in fixtures[:len(fixtures) - len(a.defaults)]:
-            if p.arg not in given | PY_INERT_FIXTURES | self.requested:
-                return (f"it adds {node.name}, which requests the fixture {p.arg}: one no existing test of the module "
-                        "requests, or one that reaches pytest's session or config or patches code (request, "
-                        "pytestconfig, monkeypatch and the like)")
-        return {p.arg for p in a.args}
+        for p in params[:len(params) - len(a.defaults)]:
+            if p.arg not in given:
+                return (f"it adds {node.name}, which requests the fixture {p.arg}: the guard does not follow a "
+                        "fixture's value, which the existing tests may share")
+        return {p.arg for p in params}
 
     def effect(self, n, own, approx, name):
         """Why n, a node of the body of name, an added test whose own names are own, does what the guard cannot
-        judge, or None. approx holds the ids of the pytest names of pytest.approx."""
+        prove harmless, or None. approx holds the ids of the pytest names of pytest.approx.
+
+        It calls only a PY_SAFE_BUILTINS name the module does not bind, or
+        pytest.approx; an attribute's object is its own name, a literal or a
+        value computed from them, never a module binding, a builtin or self,
+        so it cannot traverse to the interpreter (warnings.sys.modules); and it
+        stores into no attribute or item.
+        """
         if type(n).__name__ in PY_BODY_UNSAFE:
             return (f"{name} holds and, or, a conditional, a comprehension, a lambda, :=, await or yield, which decide "
                     "what else it runs")
         if isinstance(n, (ast.Attribute, ast.Subscript)) and not isinstance(n.ctx, ast.Load):
             return f"{name} assigns to or deletes an attribute or an item, which may change what other tests run"
+        if isinstance(n, ast.Call) and any(k.arg == "key" for k in n.keywords):
+            return f"{name} passes a key function, which the builtin then calls: the guard follows no indirect call"
+        if isinstance(n, ast.Call) and not self.callable(n.func, own, approx):
+            return (f"{name} calls {_py_chain(n.func) or 'a computed function'}: only builtins that compute a value "
+                    "and pytest.approx are calls the guard can follow; any other may end the run or change what "
+                    "other tests read")
         if isinstance(n, ast.Attribute) and PY_STOP_ATTRS.match(n.attr):
             return (f"{name} reads the attribute {n.attr}: a private or special one, or one that may skip the test or "
                     "end the run")
+        if isinstance(n, ast.Attribute) and id(n.value) not in approx and not self.local(n.value, own):
+            return (f"{name} reads the attribute {n.attr} of {_py_chain(n.value) or 'a value'} that is not its own "
+                    "name or a literal: a module binding, a builtin or self can reach code and state the guard does "
+                    "not follow")
         if isinstance(n, ast.Name) and n.id not in own and id(n) not in approx and not self.readable(n.id):
-            return (f"{name} reads {n.id}, which is not its own name, a builtin that only computes a value, "
-                    "pytest.approx, or a name the module binds by an import of other code, a helper or a literal "
-                    "(not a test, nor anything from os, sys, pytest or the like)")
+            return (f"{name} reads {n.id}, which is not its own name, a builtin that computes a value, pytest.approx "
+                    "or an immutable literal the module binds: an import, a helper, a test, a fixture, self or a "
+                    "mutable value can reach code and state the guard does not follow")
         return None
+
+    def callable(self, func, own, approx):
+        """Whether func, a call's function, is a PY_SAFE_BUILTINS name that neither the test nor the module binds,
+        or pytest.approx."""
+        if isinstance(func, ast.Name):
+            return func.id not in own and func.id not in self.module_names and func.id in PY_SAFE_BUILTINS
+        return isinstance(func, ast.Attribute) and func.attr == "approx" and id(func.value) in approx
+
+    @staticmethod
+    def local(node, own):
+        """Whether node, an attribute's object, is a value of the test's own: one of its own names, a literal, or
+        an expression of them, down through attributes and items to its root."""
+        while isinstance(node, (ast.Attribute, ast.Subscript)):
+            node = node.value
+        return not isinstance(node, ast.Name) or node.id in own
 
     def test(self, node, method=False):
         """Why node, a function an edit adds, is not a test_ function whose effects the guard can judge, or None.
 
         Python defines it without running code: its decorators are literal
-        parametrize marks, its defaults literals and its annotations literals
-        or dotted names. It requests no fixture but the parameters parametrize
-        gives, inert built-in fixtures (PY_INERT_FIXTURES) and fixtures an
-        existing test of the module requests. Its body holds only assert
-        statements, expressions and assignments to its own names, and reads
-        only names the guard can trace (readable), so it cannot end the run,
-        skip itself, or change an existing test or what its names mean.
+        parametrize marks, its defaults immutable literals and its annotations
+        literals or builtins' names. It requests no fixture: each parameter
+        without a default is one parametrize gives (params). Its body holds
+        only assert statements, expressions and plain assignments to its own
+        names, and calls, reads and traverses only what effect allows, so it
+        cannot end the run, skip itself, or change an existing test, what its
+        names mean or a value it reads.
         """
         if not isinstance(node, ast.FunctionDef) or not node.name.startswith("test_"):
             return (f"it adds {node.name}, a function that is not a test_ function, or an async one, which pytest "
@@ -1176,7 +1209,7 @@ class _PyAddition:
             return self.new_class(node)
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             return self.imports(node)
-        if (self.new_module and isinstance(node, ast.Assign) and _py_leaves(node.value) is not None
+        if (self.new_module and isinstance(node, ast.Assign) and _py_immutable(node.value)
                 and all(isinstance(t, ast.Name) for t in node.targets)):
             return next(filter(None, (self.fresh(t.id, self.bound) for t in node.targets)), None)
         return ("it adds a statement that is not a test, a test class, import pytest or a docstring (or, in a new "

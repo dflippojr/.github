@@ -1036,9 +1036,9 @@ class RuleDetails(unittest.TestCase):
         """Issue #40: desk-controller's backend/tests are Python, beside firmware Unity tests."""
         unity, api, base = DESK_UNITY, DESK_API, DESK_TREE
         edited = api.replace("120", "125")
-        # (a) An assertion fixed, or a test added (issue #54): no hit. A conftest edited is a hit (issue #40,
-        # narrowed), and so is an assertion fixed beside a test added.
-        added = "\n\ndef test_reset():\n    assert create_app()\n"
+        # (a) An assertion fixed, or a test over literals added (issue #54): no hit. A conftest edited is a hit
+        # (issue #40, narrowed), and so is an assertion fixed beside a test added.
+        added = "\n\ndef test_reset():\n    assert len('ab') == 2\n"
         for change in ({"backend/tests/test_api.py": edited},
                        {"backend/tests/test_api.py": edited, "firmware/src/logic.cpp": "int clamp(int v) { return v; }\n"},
                        {"backend/tests/test_api.py": api + added}):
@@ -1294,7 +1294,7 @@ class RuleDetails(unittest.TestCase):
                          # Issue #54: an edit that removes no line and only adds a blank line or a test.
                          ("import os\n", "import os\n\n"),
                          ("    assert create_app().ready is True\n",
-                          "    assert create_app().ready is True\n\n\ndef test_reset():\n    reset()\n")):
+                          "    assert create_app().ready is True\n\n\ndef test_reset():\n    assert len('ab') == 2\n")):
             with self.subTest(old=old, new=new):
                 self.assertEqual(judged(old, new), [])
         # A hit, with the reason in its detail.
@@ -1559,7 +1559,7 @@ class RuleDetails(unittest.TestCase):
         passing = [(base, {test_api: api + added}),
                    (base, {test_api: api.replace("\n\n\ndef test_height_limits", added + "\n\ndef test_height_limits")}),
                    (base, {test_api: "import pytest\n" + api + "\n\n@pytest.mark.parametrize('n', [1, 2])\n"
-                                                              "def test_paths(n, tmp_path) -> None:\n    assert tmp_path\n"}),
+                                                              "def test_paths(n) -> None:\n    assert n in (1, 2)\n"}),
                    (base, {test_api: api + "\n\nclass TestReset:\n    \"\"\"Reset.\"\"\"\n\n"
                                            "    def test_reset(self):\n        assert len('ab') == 2\n"}),
                    (dict(base, **{test_api: cls}), {test_api: cls + "\n    def test_width(self):\n        assert True\n"}),
@@ -1796,7 +1796,9 @@ class RuleDetails(unittest.TestCase):
                 (cases, ["assert sorted(CASES)"]), (cases, ["count = 1", "count += 1"]),
                 # Calls and reads the guard cannot follow: code the module imports, a method, a fixture.
                 (api, ["assert create_app()"]), (api, ["probe = create_app"]), (api, ["assert create_app.ready"]),
-                (api, ["text = 'a'", "assert text.upper() == 'A'"]), (api, ["assert print.__self__"])]
+                (api, ["text = 'a'", "assert text.upper() == 'A'"]), (api, ["assert print.__self__"]),
+                # Indirect calls: a builtin handed a function to call.
+                (api, ["assert list(map(len, ['ab'])) == [2]"]), (api, ["assert sorted('ba', key=str.lower)"])]
         for start, lines in hits:
             with self.subTest(lines=lines):
                 self.assertEqual(flagged(start, before_health(start, lines)), {test_api})
@@ -1814,8 +1816,8 @@ class RuleDetails(unittest.TestCase):
         start = "import pytest\n" + api.replace("\n\n\ndef test_health", "\n\nLIMITS = (60, 120)\n\n\ndef test_health")
         passing = before_health(start, ["value = abs(-n)", "assert value == pytest.approx(n), f'{value!r}'",
                                         "assert isinstance(value, int)", "assert (1).real == 1",
-                                        "assert sorted(LIMITS, key=abs) == [60, 120]", "pair = (value, limit)",
-                                        "assert pair[0] == n", "assert list(map(len, ['ab'])) == [2]"],
+                                        "assert sorted(LIMITS) == [60, 120]", "pair = (value, limit)",
+                                        "assert pair[0] == n", "assert len(pair) == 2"],
                                 "n, limit=3").replace("def test_000_added", "@pytest.mark.parametrize('n', [1, 2])\n"
                                                                            "def test_000_added")
         self.assertEqual(flagged(start, passing), set())

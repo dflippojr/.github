@@ -1,4 +1,4 @@
-# gate-guard fixture: issue #54, in a C/C++ repository, a Python test module whose edit only adds a parametrized test over what it already imports, and a new test module over literals
+# gate-guard fixture: issue #54, in a C/C++ repository, a Python test module whose edit only adds a parametrized test over literals, and a new test module over literals
 # expect: 
 # hits: 0
 
@@ -11,7 +11,7 @@ diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
 diff --git a/backend/tests/test_guard.py b/backend/tests/test_guard.py
 --- a/backend/tests/test_guard.py
 +++ b/backend/tests/test_guard.py
-@@ -1,10 +1,16 @@
+@@ -1,10 +1,15 @@
  import os
  
  import pytest
@@ -26,8 +26,7 @@ diff --git a/backend/tests/test_guard.py b/backend/tests/test_guard.py
 +
 +@pytest.mark.parametrize("height", [60, 120])
 +def test_height(height):
-+    response = create_app().test_client().get(f"/height/{height}")
-+    assert response.json["height"] == height
++    assert height == pytest.approx(round(height)), f"{height!r}"
 diff --git a/backend/tests/test_reset.py b/backend/tests/test_reset.py
 new file mode 100644
 --- /dev/null
