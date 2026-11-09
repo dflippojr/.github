@@ -7,7 +7,7 @@ code. It reads the comment and the pull request again from the API, and acts
 only when all of these hold:
 
     the comment's author is the repository owner, by login and by user id
-    the comment was never edited, and the event is `created`
+    the comment's REST updated_at equals created_at (no edit in a later second), and the event is `created`
     the body is exactly `/approve-gate <sha>`, a full 40-character lowercase SHA (trailing whitespace aside)
     the comment is on a pull request, open, whose head branch is in this repository
     the SHA is the pull request's current head
@@ -17,10 +17,11 @@ new labeled event, dated after the newest push), adds it, and posts the head
 record `ao owner-label` writes: <!-- owner-label gate-change-approved head=SHA -->.
 Label first, then record, so `ao ready` finds the record at or after the label.
 Both calls use OWNER_GATE_TOKEN, the owner's own token, so GitHub records the
-owner as the actor and `ao ready` needs no new rule. The gate guard counts a
-label this workflow may have applied only when the owner's newest head record
-since the label names the current head (.github #46). The script checks that
-the token is the owner's before it writes.
+owner as the actor and `ao ready` needs no new rule. The gate guard counts any
+owner gate-change-approved label only when the owner's newest head record since
+the label names the current head and GraphQL shows that record never edited
+(.github #46, #63); this script posts the record as a new comment and never
+edits it. The script checks that the token is the owner's before it writes.
 
 Last it reads the head again. A push that landed between the first read and
 the label would be dated before the label, which would then sit on a commit the

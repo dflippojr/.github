@@ -137,19 +137,73 @@ class Acceptance(unittest.TestCase):
         self.assertIn(f"<!-- owner-label {LABEL} head={HEAD} -->", record)
         self.assertFalse(record.lstrip().startswith("/approve-gate"), "the record must not trigger another run")
 
-    def test_record_matches_what_the_gate_guard_reads(self):
-        """gate_guard.py marks a label as this workflow's by APPROVE_RECORD, and dates the head by HEAD_RECORD.
+class GuardCountsTheRecord(unittest.TestCase):
+    """The label and record a run writes, judged by gate_guard.owner_label as .github #63 left it.
 
-        Its fixtures hard-code the record text, so only this catches head_record() drifting from the guard."""
+    Since #63 every gate-change-approved label needs the owner's newest head record posted at or after it to name
+    the head, and the record counts only when GraphQL's edit history of that comment, every field of exactly its
+    type, shows no edit. The guard's own fixtures hard-code the record text, so only this catches head_record()
+    drifting from what the guard reads."""
+
+    LABELED, POSTED, PUSHED = "2026-10-27T12:00:05Z", "2026-10-27T12:00:06Z", "2026-10-27T11:00:00Z"
+
+    def setUp(self):
         import gate_guard
-        url = "https://github.com/dflippojr/demo/pull/7#issuecomment-1"
-        record = approve_gate.head_record(HEAD, url)
-        marked = gate_guard.APPROVE_RECORD.search(record)
-        self.assertIsNotNone(marked, record)
-        self.assertEqual(marked.group(1), url)
-        self.assertEqual([m.groups() for m in gate_guard.HEAD_RECORD.finditer(record)], [(LABEL, HEAD)])
-        self.assertIsNone(gate_guard.APPROVE_COMMAND.match(record), "the guard must not read the record as a command")
-        self.assertIsNotNone(gate_guard.APPROVE_COMMAND.match(f"/approve-gate {HEAD}"))
+        self.guard = gate_guard
+        self.github = FakeGitHub()
+        code, message = run(self.github)
+        self.assertEqual(code, 0, message)
+        [record] = self.github.comments()
+        owner = {"login": OWNER, "id": OWNER_ID, "type": "User"}
+        # The run's comments as the guard's REST read returns them: the owner's command, then the record.
+        self.comments = [dict(self.github.comment, node_id="IC_55"),
+                         {"id": 900, "node_id": "IC_900", "user": owner, "body": record,
+                          "created_at": self.POSTED, "updated_at": self.POSTED}]
+        self.events = [{"id": 1, "event": "labeled", "label": {"name": LABEL}, "actor": {"login": OWNER},
+                        "created_at": self.LABELED}]
+
+    def node(self, **change):
+        node = {"__typename": "IssueComment", "id": "IC_900", "databaseId": 900, "lastEditedAt": None,
+                "editor": None, "includesCreatedEdit": False, "userContentEdits": {"totalCount": 0}}
+        node.update(change)
+        return node
+
+    def judge(self, node, sha=HEAD):
+        asked = []
+
+        class Graphql:
+            def graphql(self, query, variables):
+                asked.append(variables["ids"])
+                return {"nodes": [node]}
+
+        comments = self.guard.with_edit_history(Graphql(), self.comments, OWNER)
+        self.assertEqual(asked, [["IC_900"]], "the guard looks up the record, and only the record")
+        return self.guard.owner_label(LABEL, {LABEL}, self.events, OWNER, sha,
+                                      self.guard.parse_time(self.PUSHED), comments)
+
+    def test_the_record_counts_at_the_head(self):
+        counts, reason = self.judge(self.node())
+        self.assertTrue(counts, reason)
+        self.assertIn(f"names {HEAD[:7]}", reason)
+
+    def test_the_record_does_not_count_for_another_head(self):
+        counts, reason = self.judge(self.node(), sha=NEWER)
+        self.assertFalse(counts, reason)
+        self.assertIn(f"names {HEAD[:7]}, not the head {NEWER[:7]}", reason)
+
+    def test_an_edited_record_does_not_count(self):
+        for change in ({"lastEditedAt": self.POSTED}, {"editor": {"login": "someone"}},
+                       {"includesCreatedEdit": True}, {"userContentEdits": {"totalCount": 1}}):
+            with self.subTest(change=change):
+                counts, reason = self.judge(self.node(**change))
+                self.assertFalse(counts, reason)
+                self.assertIn("no unedited head record", reason)
+
+    def test_a_malformed_edit_history_fails_closed(self):
+        for change in ({"databaseId": True}, {"databaseId": 900.0}, {"id": "IC_55"}, {"__typename": "Issue"},
+                       {"userContentEdits": {"totalCount": False}}, {"includesCreatedEdit": 0}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.judge(self.node(**change))
 
 
 class Rejections(unittest.TestCase):

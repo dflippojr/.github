@@ -543,8 +543,12 @@ only when all of these hold:
   (`GITHUB_REPOSITORY_OWNER`, `GITHUB_REPOSITORY_OWNER_ID`), and is a user.
   Another account, a look-alike login, or a renamed account with the old login
   doesn't count, and neither does a collaborator saying "approved".
-- The comment was never edited (`updated_at` equals `created_at`). Callers
-  listen for `created` only, and the script refuses any other action.
+- The comment's REST `updated_at` equals its `created_at`, so it was not
+  edited in any later second. REST's one-second timestamps can't show an
+  edit in the second it was posted; the script doesn't read GraphQL's edit
+  history for the command, as the gate guard does for head records (see
+  "Threats it still doesn't cover"). Callers listen for `created` only, and
+  the script refuses any other action.
 - The body is exactly `/approve-gate`, one space and the full lowercase SHA;
   trailing whitespace is ignored. A short SHA or any extra text is refused,
   and the job's `if:` skips a body that does not start with `/approve-gate `.
@@ -573,13 +577,14 @@ owner also sees a failed run.
 
 A later push invalidates the approval in both checks: `ao ready` needs the
 record to name the current head, and the gate guard needs the label applied
-after the newest push and, for a label this workflow may have applied, the
-owner's newest head record since the label to name the current head ("A label
-from `/approve-gate` needs the head record" under "Gate guard on the default
-branch"). That guard rule also covers what the cleanup above can't, a run
-killed between the label and the record or a removal that failed: the guard
-counts such a label only when the owner's newest record names the current
-head, so a label left on a head the owner never named fails closed.
+after the newest push and the owner's newest unedited head record since the
+label to name the current head ("`gate-change-approved` always needs the
+owner's head record" under "Gate guard on the default branch"). The record is
+a new comment the workflow never edits, so GraphQL's edit history of it, which
+the guard reads, is empty. That guard rule also covers what the cleanup above
+can't, a run killed between the label and the record or a removal that
+failed: a label left on a head the owner never named has no record naming
+that head, so it fails closed.
 
 ### The token
 
@@ -686,6 +691,15 @@ which job declares the environment:
   `workflow_dispatch` job there passes the branch rule. Only
   `approve-gate.yml`'s `approve` job may declare it; the tests check that in
   this repository, and agent-ops checks its own workflows.
+- **An edit to the command in the second it was posted.** The script
+  trusts the command's REST timestamps, which can't show an edit within the
+  same second. Someone with write access who rewrote the owner's
+  `/approve-gate` in that second could name a head the owner never named, if
+  it is the current head when the run reads the comment. The run would then
+  label and post a fresh, unedited record for it, which the gate guard
+  counts. Reading the command's GraphQL edit history, as the guard does for
+  head records, would close this; it needs the owner's token to read GraphQL
+  and is not done yet.
 - **`gate-guard.yml` callers.** The `pull_request` gate guard checks only who
   applied the label, not when, so in a repository still on it a push does not
   void an approval there; `ao ready` still does, through the head record.
