@@ -24,6 +24,6 @@
     "conclusion": "failure",
     "exit": 1,
     "title": "2 hits, not approved",
-    "reason": "applied through `/approve-gate`, but no unedited head record from the owner"
+    "reason": "applied by the owner, but no unedited head record from the owner"
   }
 }

@@ -72,12 +72,10 @@ import warnings
 APPROVAL_LABEL = "gate-change-approved"
 FINDINGS_LABEL = "findings-accepted"
 OWNER_LABELS = (APPROVAL_LABEL, FINDINGS_LABEL)
-# The owner head record `ao owner-label apply` and approve_gate.py post, and
-# the two things that mark a gate-change-approved label as approve_gate.py's:
-# the owner's /approve-gate command, and the record approve_gate.py writes.
+# The owner head record. Both ways to approve a gate change post it right after
+# they label: `ao owner-label apply` ("Owner applied ...") and approve_gate.py,
+# the /approve-gate workflow ("Owner approved ... by [comment](...)").
 HEAD_RECORD = re.compile(r"<!-- owner-label (\S+) head=([0-9a-f]{40}) -->")
-APPROVE_COMMAND = re.compile(r"\s*/approve-gate(?!\S)")
-APPROVE_RECORD = re.compile(rf"Owner approved `{APPROVAL_LABEL}` at head [0-9a-f]{{40}} by \[comment\]\(([^)\s]*)\)")
 # The judging job's check with the caller template: the caller's job id, then
 # the reusable workflow's job name. pr_body_lint.py reads its verdict annotation.
 REQUIRED_CHECK = "gate-guard-target / gate-guard"
@@ -87,8 +85,8 @@ MAX_SUMMARY_BYTES = 1000000
 TRUNCATED = "\n\n… (truncated; the job log has the rest)\n"
 MAX_ANNOTATIONS = 50
 MAX_API_PAGES = 30
-# approve_gate.py posts its head record a moment after the label that starts
-# the guard, and no comment reruns the guard, so a fresh /approve-gate label
+# Both ways to approve post the head record a moment after the label that
+# starts the guard, and no comment reruns the guard, so a fresh owner label
 # waits up to RECORD_WAIT seconds for it, reading the comments every RECORD_POLL.
 RECORD_WAIT = 60
 RECORD_POLL = 5
@@ -2937,39 +2935,15 @@ def newest_label_event(label, events):
     return max(history, key=lambda e: (e.get("created_at") or "", e.get("id") or 0)) if history else None
 
 
-def from_approve_gate(comments, owner, applied):
-    """Whether the owner's gate-change-approved label applied at `applied` may be approve_gate.py's.
-
-    The workflow labels with the owner's token, so the event's actor can't
-    tell. It labels only after the owner's /approve-gate comment, and records
-    the head after the label, linking the command. A command from the owner no
-    newer than the label marks it, even one an earlier run's record links,
-    since a rerun of that run acts on the command again. So does a record from
-    the owner posted at or after the label. An edited command or record still
-    marks it, since the edit may postdate the run. A time that can't be read
-    marks it too.
-    """
-    for c in comments:
-        if not _by(c, owner):
-            continue
-        body, at = c.get("body") or "", parse_time(c.get("created_at"))
-        if APPROVE_COMMAND.match(body) and (at is None or at <= applied):
-            return True
-        if APPROVE_RECORD.search(body) and (at is None or at >= applied):
-            return True
-    return False
-
-
 def awaiting_record(events, owner, comments):
-    """Whether the owner's newest gate-change-approved label came through /approve-gate under RECORD_WAIT seconds
-    ago and has no head record yet, which approve_gate.py may still be posting."""
+    """Whether the owner's newest gate-change-approved label is under RECORD_WAIT seconds old and has no head
+    record yet, which `ao owner-label apply` or approve_gate.py may still be posting."""
     newest = newest_label_event(APPROVAL_LABEL, events)
     actor = ((newest or {}).get("actor") or {}).get("login") or ""
     if newest is None or newest.get("event") != "labeled" or actor.lower() != owner.lower():
         return False
     applied = parse_time(newest.get("created_at"))
     return (applied is not None and (_now() - applied).total_seconds() < RECORD_WAIT
-            and from_approve_gate(comments, owner, applied)
             and recorded_head(comments, APPROVAL_LABEL, owner, applied) is None)
 
 
@@ -2990,6 +2964,12 @@ def recorded_head(comments, label, owner, since):
     return found
 
 
+def how_to_approve(sha):
+    """The two ways the owner approves a gate change at sha; each labels, then posts the head record."""
+    return (f"the owner approves {sha[:7]} by commenting `/approve-gate {sha}` or running "
+            f"`ao owner-label apply <repo> <pr> {APPROVAL_LABEL} --head {sha}`")
+
+
 def owner_label(label, labels, events, owner, sha, pushed_at, comments=()):
     """(counts, reason) for an owner-only label on a pull request whose head is sha.
 
@@ -2997,11 +2977,13 @@ def owner_label(label, labels, events, owner, sha, pushed_at, comments=()):
     'labeled' by the owner, after sha was pushed. A label a worker re-applies
     becomes the worker's, and a new push makes the owner's label stale.
 
-    A gate-change-approved label approve_gate.py may have applied also needs
-    the owner's newest head record since the label, among the pull request's
-    comments, to name sha. The workflow re-reads the head after it labels, but
-    a run that dies, or an API that fails, before the record or the re-read
-    can leave its label on a head pushed in between.
+    gate-change-approved also needs the owner's newest unedited head record for
+    it, posted at or after the label (so after the push), to name sha. The label
+    alone never counts (#62): the /approve-gate workflow labels with the owner's
+    token, so its label reads like a hand label, and a run that dies before its
+    record or its re-read of the head can leave the label on a head pushed in
+    between. The comments that showed it was the workflow's can be deleted or
+    edited, so the guard no longer tries to tell the two apart.
     """
     if label not in labels:
         return False, f"`{label}` is not on this pull request"
@@ -3022,19 +3004,17 @@ def owner_label(label, labels, events, owner, sha, pushed_at, comments=()):
                        f"was pushed at {_stamp(pushed_at)}; the owner re-applies it after reviewing the new commits")
     reason = (f"`{label}` was applied by the owner @{actor} at {_stamp(applied)}, after {sha[:7]} "
               f"was pushed at {_stamp(pushed_at)}")
-    if label != APPROVAL_LABEL or not from_approve_gate(comments, owner, applied):
+    if label != APPROVAL_LABEL:
         return True, reason
     record = recorded_head(comments, label, owner, applied)
     if record is None:
-        return False, (f"`{label}` was applied through `/approve-gate`, but no unedited head record from the owner "
-                       f"was posted at or after it, so it may cover a head pushed while it was applied; the owner "
-                       f"approves {sha[:7]} again")
+        return False, (f"`{label}` was applied by the owner, but no unedited head record from the owner was posted "
+                       f"at or after it, and the label alone doesn't count; {how_to_approve(sha)}")
     seen, posted = record
     if seen != sha:
-        return False, (f"`{label}` was applied through `/approve-gate`, but the owner's head record names "
-                       f"{seen[:7]}, not the head {sha[:7]}; the owner approves the head after reviewing it")
-    return True, (f"{reason}, through `/approve-gate`, and the owner's head record posted at {_stamp(posted)} "
-                  f"names {sha[:7]}")
+        return False, (f"`{label}` was applied by the owner, but the owner's newest unedited head record names "
+                       f"{seen[:7]}, not the head {sha[:7]}; {how_to_approve(sha)}")
+    return True, f"{reason}, and the owner's head record posted at {_stamp(posted)} names {sha[:7]}"
 
 
 class GitHub:

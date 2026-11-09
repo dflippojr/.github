@@ -21,6 +21,10 @@ SCENARIOS = pathlib.Path(__file__).resolve().parent / "fixtures" / "gate_guard_t
 WORKFLOWS = ROOT / ".github" / "workflows"
 OWNER, REPO, NUMBER, HEAD_REF = "dflippojr", "dflippojr/demo", 7, "feature"
 HEAD_GROUP = "group: gate-guard-target-${{ github.event.pull_request.head.sha }}"
+# The head record `ao owner-label apply` posts a second after its 13:00:00 label; {head} is the scenario's head.
+AO_RECORD = {"author": OWNER, "created_at": "2026-10-16T13:00:01Z",
+             "body": "Owner applied `gate-change-approved` at head {head}. A later push invalidates it.\n\n"
+                     "<!-- owner-label gate-change-approved head={head} -->"}
 
 
 def reject(status, body):
@@ -318,7 +322,8 @@ class SharedHead(unittest.TestCase):
     TEST = "from src.billing import charge\n\n\ndef test_charge():\n    assert charge(1) == 1\n"
     NO_LABELS = {"labels": [], "events": [], "pushed_at": "2026-10-16T12:00:00Z"}
     APPROVED = {"labels": [gate_guard.APPROVAL_LABEL], "events": [
-        {"event": "labeled", "label": gate_guard.APPROVAL_LABEL, "actor": OWNER, "created_at": "2026-10-16T13:00:00Z"}]}
+        {"event": "labeled", "label": gate_guard.APPROVAL_LABEL, "actor": OWNER, "created_at": "2026-10-16T13:00:00Z"}],
+        "comments": [AO_RECORD]}
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -582,8 +587,13 @@ class OwnerLabel(unittest.TestCase):
     def event(event, actor, at, label=gate_guard.APPROVAL_LABEL, i=0):
         return {"id": i, "event": event, "label": {"name": label}, "actor": {"login": actor}, "created_at": at}
 
-    def verdict(self, events, labels=(gate_guard.APPROVAL_LABEL,), pushed=PUSHED):
-        return gate_guard.owner_label(gate_guard.APPROVAL_LABEL, set(labels), events, "Owner", "c" * 40, pushed)
+    # The owner's head record for the head, a second after the 13:00:00 labels below; the login's case differs.
+    RECORD = {"user": {"login": "owner"}, "created_at": "2026-10-16T13:00:01Z", "updated_at": "2026-10-16T13:00:01Z",
+              "body": f"<!-- owner-label {gate_guard.APPROVAL_LABEL} head={'c' * 40} -->"}
+
+    def verdict(self, events, labels=(gate_guard.APPROVAL_LABEL,), pushed=PUSHED, comments=(RECORD,)):
+        return gate_guard.owner_label(gate_guard.APPROVAL_LABEL, set(labels), events, "Owner", "c" * 40, pushed,
+                                      comments)
 
     def test_label_not_on_the_pull_request(self):
         self.assertEqual(self.verdict([], labels=()), (False, "`gate-change-approved` is not on this pull request"))
@@ -614,8 +624,9 @@ class OwnerLabel(unittest.TestCase):
 
 
 class ApproveGateLabel(unittest.TestCase):
-    """approve_gate.py (#44) applies gate-change-approved with the owner's token, then posts the head record. Its
-    label counts only with an owner head record for the exact head, posted at or after the label (#46)."""
+    """approve_gate.py (#44) applies gate-change-approved with the owner's token, then posts the head record, as
+    `ao owner-label apply` does. Any owner gate-change-approved label counts only with the owner's newest unedited
+    head record for the exact head, posted at or after the label (#46); the label alone never counts (#62)."""
     HEAD, OTHER = "c" * 40, "a" * 40
     PUSHED = gate_guard.parse_time("2026-10-16T12:00:00Z")
     LABELED = "2026-10-16T13:00:00Z"
@@ -682,7 +693,7 @@ class ApproveGateLabel(unittest.TestCase):
     def test_workflow_label_without_a_record_does_not_count(self):
         counts, why = self.verdict([self.command()])
         self.assertFalse(counts)
-        self.assertIn("applied through `/approve-gate`, but no unedited head record from the owner", why)
+        self.assertIn("applied by the owner, but no unedited head record from the owner", why)
 
     def test_workflow_label_with_a_record_for_another_sha_does_not_count(self):
         counts, why = self.verdict([self.command(), self.record(self.OTHER)])
@@ -742,10 +753,10 @@ class ApproveGateLabel(unittest.TestCase):
         still needs an unedited record for the head."""
         counts, why = self.verdict([self.record(self.OTHER)])
         self.assertFalse(counts)
-        self.assertIn(f"applied through `/approve-gate`, but the owner's head record names {self.OTHER[:7]}", why)
+        self.assertIn(f"applied by the owner, but the owner's newest unedited head record names {self.OTHER[:7]}", why)
         counts, why = self.verdict([self.record(edited_at="2026-10-16T14:00:00Z")])
         self.assertFalse(counts)
-        self.assertIn("applied through `/approve-gate`, but no unedited head record from the owner", why)
+        self.assertIn("applied by the owner, but no unedited head record from the owner", why)
         self.assertTrue(self.verdict([self.record()])[0])
 
     def test_push_race_without_its_command_refuses_the_pushed_head(self):
@@ -775,7 +786,7 @@ class ApproveGateLabel(unittest.TestCase):
         counts, why = gate_guard.owner_label(gate_guard.APPROVAL_LABEL, {gate_guard.APPROVAL_LABEL}, events,
                                              "dflippojr", self.HEAD, self.PUSHED, comments)
         self.assertFalse(counts)
-        self.assertIn("applied through `/approve-gate`, but no unedited head record from the owner", why)
+        self.assertIn("applied by the owner, but no unedited head record from the owner", why)
 
     def test_a_hand_label_after_an_earlier_workflow_label_needs_a_record(self):
         """The limit of the shared token: the owner approved A by comment at 10:00, B was pushed at 12:00, and the
@@ -846,18 +857,27 @@ class ApproveGateLabel(unittest.TestCase):
                                              "dflippojr", self.HEAD, self.PUSHED, comments + [self.ao_record()])
         self.assertTrue(counts, why)
 
-    def test_someone_elses_command_does_not_mark_the_label(self):
-        counts, why = self.verdict([self.command(author="worker[bot]")])
+    def test_someone_elses_command_neither_approves_nor_blocks(self):
+        """Only the owner's head record decides; a command from anyone else changes nothing."""
+        self.assert_refused_naming_both_ways(self.verdict([self.command(author="worker[bot]")]))
+        counts, why = self.verdict([self.command(author="worker[bot]"), self.ao_record()])
         self.assertTrue(counts, why)
 
-    def test_a_command_after_the_label_does_not_mark_it(self):
-        """The workflow always labels after the command it acts on; a later refused command leaves the hand label."""
-        self.assertTrue(self.verdict([self.command(at="2026-10-16T13:30:00Z")])[0])
+    def test_a_command_after_the_label_does_not_approve_it(self):
+        """A command posted after the label is not the label's record; the ao record after the label is."""
+        self.assert_refused_naming_both_ways(self.verdict([self.command(at="2026-10-16T13:30:00Z")]))
+        self.assertTrue(self.verdict([self.command(at="2026-10-16T13:30:00Z"), self.ao_record()])[0])
 
-    def test_hand_label_keeps_todays_rule(self):
-        self.assertTrue(self.verdict([])[0])
-        self.assertTrue(self.verdict([self.ao_record(self.OTHER)])[0], "an ao record does not mark the label")
-        self.assertFalse(self.verdict([], pushed=gate_guard.parse_time("2026-10-16T13:30:00Z"))[0])
+    def test_hand_label_needs_a_head_record(self):
+        """Owner-approved behaviour change (#62), formerly test_hand_label_keeps_todays_rule: a hand label with no
+        head record, or with one for another head, no longer counts. `ao owner-label apply`'s record for the head
+        does, until a later push."""
+        self.assert_refused_naming_both_ways(self.verdict([]))
+        counts, why = self.verdict([self.ao_record(self.OTHER)])
+        self.assertFalse(counts)
+        self.assertIn(f"names {self.OTHER[:7]}, not the head {self.HEAD[:7]}", why)
+        self.assertTrue(self.verdict([self.ao_record()])[0])
+        self.assertFalse(self.verdict([self.ao_record()], pushed=gate_guard.parse_time("2026-10-16T13:30:00Z"))[0])
 
     def test_findings_accepted_keeps_todays_rule(self):
         """No workflow applies findings-accepted."""
@@ -1223,8 +1243,8 @@ class ExtraGatePaths(unittest.TestCase):
             dict(self.CODE, **{"tests/golden/case.json": '{"total": 3}\n'}))
 
     def fake(self, head=None, labels=(), events=(), pushed_at="2026-10-16T12:00:00Z"):
-        return FakeGitHub.single(self.base, head or self.head,
-                                 {"labels": list(labels), "events": list(events), "pushed_at": pushed_at})
+        return FakeGitHub.single(self.base, head or self.head, {"labels": list(labels), "events": list(events),
+                                                                "pushed_at": pushed_at, "comments": [AO_RECORD]})
 
     def judge(self, fake, args=ARGS):
         """(exit code, the commit's check) after a run of the job on fake's head."""
