@@ -925,6 +925,42 @@ class ApproveGateLabel(unittest.TestCase):
         self.assertIn("re-applies it after reviewing the new commits", why)
 
 
+MISSING = object()
+
+
+def wrong_types(clean_id, clean_database_id):
+    """{field: [wrong value, ...]} for every field of an EDIT_QUERY node (#62 security round 3). Each field gets
+    every one of bool, float, null, string, list, object and missing that its exact type rules out, plus look-alikes
+    Python's == would accept (0.0 and False for 0, 5.0 and True for an id). userContentEdits.totalCount is the
+    nested count."""
+    common = [False, 0.0, None, "0", [], {}, MISSING, 0]
+    valid = {"__typename": ["IssueComment"], "id": [clean_id], "databaseId": [clean_database_id],
+             "lastEditedAt": [None, "0"], "editor": [None, {}],
+             "includesCreatedEdit": [False], "userContentEdits": [], "userContentEdits.totalCount": [0]}
+    extra = {"__typename": ["issuecomment", "PullRequestReviewComment"], "id": [clean_id + " ", 5],
+             "databaseId": [float(clean_database_id), str(clean_database_id), True, clean_database_id + 1],
+             "lastEditedAt": [1, True], "editor": ["dflippojr", True], "includesCreatedEdit": [1, "false"],
+             "userContentEdits": [{"totalCount": 0.0}, 0], "userContentEdits.totalCount": [-1, True, 0.5]}
+    return {field: [v for v in common if not any(type(v) is type(ok) and v == ok for ok in oks)] + extra[field]
+            for field, oks in valid.items()}
+
+
+def set_field(node, field, value):
+    """node with field (a.b for a nested one) set to value, or removed when value is MISSING."""
+    node = dict(node)
+    outer, _, inner = field.partition(".")
+    if inner:
+        node[outer] = dict(node[outer])
+        target, key = node[outer], inner
+    else:
+        target, key = node, outer
+    if value is MISSING:
+        target.pop(key, None)
+    else:
+        target[key] = value
+    return node
+
+
 class EditHistory(unittest.TestCase):
     """#62 security round 1: REST comment timestamps have one-second resolution, so updated_at == created_at doesn't
     prove a record was never edited. The guard reads each candidate record's server edit history (GraphQL
@@ -1057,6 +1093,57 @@ class EditHistory(unittest.TestCase):
                     self.assertEqual((code, check["conclusion"]), (2, "failure"), check["summary"])
                     self.assertIn("gate-change-approved=false", outputs)
 
+    @staticmethod
+    def altering(field, value):
+        """FakeGitHub.graphql with field set to value (or removed) in every node it returns."""
+        answer = FakeGitHub.graphql
+
+        def graphql(fake, query, variables):
+            data = answer(fake, query, variables)
+            return {"nodes": [set_field(node, field, value) for node in data["nodes"]]}
+        return graphql
+
+    def late_fake(self, record, reads):
+        """A fake whose comments hold record only from the second read on, while the guard waits for it."""
+        class Late(FakeGitHub):
+            def pages(self, path):
+                if path.endswith("/comments"):
+                    reads.append(path)
+                    self.prs[NUMBER]["comments"] = [record] if len(reads) > 1 else []
+                return super().pages(path)
+
+        return Late(self.head, {"main": self.base},
+                    {NUMBER: {"labels": [gate_guard.APPROVAL_LABEL], "events": [self.LABELED],
+                              "pushed_at": "2026-10-16T12:00:00Z", "comments": [], "base": "main",
+                              "head_ref": HEAD_REF}})
+
+    def test_every_wrongly_typed_field_fails_closed(self):
+        """#62 security round 3: the whole node is checked against exact types before any edit signal is read.
+        Every field x every wrong type x both record forms x the first read and a later record-wait poll exits 2
+        with no approval."""
+        for field, values in wrong_types(f"IC_{NUMBER}_0", 0).items():
+            for value in values:
+                for name, record in self.FORMS.items():
+                    for read in ("first", "poll"):
+                        shown = "missing" if value is MISSING else repr(value)
+                        with self.subTest(field=field, value=shown, form=name, read=read), \
+                                mock.patch.object(FakeGitHub, "graphql", self.altering(field, value)):
+                            if read == "first":
+                                code, check, outputs, _ = self.judge([record])
+                            else:
+                                reads = []
+                                fake = self.late_fake(record, reads)
+                                with mock.patch.object(gate_guard, "_now",
+                                                       return_value=gate_guard.parse_time("2026-10-16T13:00:01Z")), \
+                                        mock.patch("time.sleep"):
+                                    code, _, outputs = run_cli(self.tmp, self.server,
+                                                               {"pull_request": event_pr(NUMBER, self.head, "main")},
+                                                               fake)
+                                check = fake.current()
+                                self.assertEqual(len(reads), 2)
+                            self.assertEqual((code, check["conclusion"]), (2, "failure"), check["summary"])
+                            self.assertIn("gate-change-approved=false", outputs)
+
     def test_an_unedited_record_still_counts_in_either_form(self):
         for name, record in self.FORMS.items():
             with self.subTest(form=name):
@@ -1121,6 +1208,24 @@ class NeverEdited(unittest.TestCase):
         for edits in ({}, None, [], 0):
             with self.subTest(userContentEdits=edits), self.assertRaises(ValueError):
                 self.mark(dict(self.CLEAN, userContentEdits=edits))
+
+    def test_every_wrongly_typed_field_raises(self):
+        """#62 security round 3: exact types for the whole node, checked before any edit signal is read."""
+        for field, values in wrong_types(self.CLEAN["id"], self.CLEAN["databaseId"]).items():
+            for value in values:
+                with self.subTest(field=field, value="missing" if value is MISSING else repr(value)), \
+                        self.assertRaises(ValueError):
+                    self.mark(set_field(self.CLEAN, field, value))
+        with self.assertRaises(ValueError):
+            self.mark(["IssueComment"])
+
+    def test_every_valid_edit_signal_still_reads_as_edited(self):
+        """Well-typed values that show an edit deny the record rather than raise."""
+        for field, value in (("lastEditedAt", "2026-10-16T13:00:01Z"), ("editor", {"login": "someone"}),
+                             ("editor", {}), ("includesCreatedEdit", True), ("userContentEdits.totalCount", 1)):
+            with self.subTest(field=field, value=value):
+                [comment], _ = self.mark(set_field(self.CLEAN, field, value))
+                self.assertIs(comment["never_edited"], False)
 
     def test_a_record_with_no_node_id_fails_closed(self):
         comment = {k: v for k, v in self.COMMENT.items() if k != "node_id"}
