@@ -1,0 +1,24 @@
+name: Approve gate (owner comment)
+
+# This repository's own caller of approve-gate.yml, from the default branch
+# like every issue_comment run. See templates/approve-gate-caller.yml.
+on:
+  issue_comment:
+    # Only new comments: an edited comment never approves.
+    types: [created]
+
+permissions:
+  contents: read
+
+# One approval at a time per pull request, none dropped.
+concurrency:
+  group: approve-gate-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  approve-gate:
+    uses: ./.github/workflows/approve-gate.yml
+    with:
+      approve-ref: ${{ github.sha }}
+    secrets:
+      OWNER_GATE_TOKEN: ${{ secrets.OWNER_GATE_TOKEN }}
