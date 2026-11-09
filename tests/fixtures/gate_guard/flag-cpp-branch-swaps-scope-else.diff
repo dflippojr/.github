@@ -1,0 +1,33 @@
+# gate-guard fixture: an #if 0 / #else pair whose dead branch closes helper and opens test_synthetic while the live branch opens nothing
+# expect: removed-tests
+# hits: 1
+# detail: closes a bracket opened before it
+
+diff --git a/test/test_main/test_main.cpp b/test/test_main/test_main.cpp
+index 1111111..2222222 100644
+--- a/test/test_main/test_main.cpp
++++ b/test/test_main/test_main.cpp
+@@ -1,22 +1,22 @@
+ #include <unity.h>
+ #include "support.h"
+ 
+ void helper(void) {
+ #if 0
+ }
+ void test_synthetic(void) {
+ #else
+ #endif
+-    TEST_ASSERT_TRUE(value() == 1);
++    TEST_ASSERT_TRUE(value() == 2);
+ }
+ 
+ void test_existing(void) {
+     TEST_ASSERT_TRUE(ready());
+ }
+ 
+ int main(void) {
+     UNITY_BEGIN();
+     RUN_TEST(test_existing);
+     helper();
+     return UNITY_END();
+ }

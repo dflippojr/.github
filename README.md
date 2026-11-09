@@ -34,7 +34,70 @@ merging the pull request would change and reports each hit in the job summary:
 | `removed-tests` | A deleted test file, or fewer test functions in a file (`def test_`, `test(`/`it(`, `@Test`, `#[test]`, `func Test`, and in a C/C++ source or header under a test directory, Unity `RUN_TEST(name)` and `void test_name(void)`, counted over the whole file); in a C/C++ or PlatformIO repository, any change that could change which tests run or what they include (see below). |
 | `skip-marker` | A new `pytest.mark.skip`/`skipif`/`xfail`, `unittest.skip`, `.skip(`/`.only(`/`test.fixme`/`xit(`/`xdescribe(`, `@Disabled`, `#[ignore]`, any change to a PlatformIO `platformio.ini` (see below), or pytest `--deselect`/`-k "not …"` in config. `pytest.skip()` and Go `t.Skip()` count when unconditional or when the condition checks `CI`. |
 | `retry` | New or raised Playwright `retries`, `--reruns`, `pytest-rerunfailures`, `flaky`, `jest.retryTimes`, Surefire `rerunFailingTestsCount`. |
-| `gate-config` | Any edit to `.github/workflows/**`, `sonar-project.properties`, `CODEOWNERS` or coverage config (`.coveragerc`, `[tool.coverage]`, `fail_under`, JaCoCo rules, c8/nyc/Jest thresholds); a lint rule disabled; a size or performance budget raised. |
+| `gate-config` | Any edit to `.github/workflows/**`, `sonar-project.properties`, `CODEOWNERS` or coverage config (`.coveragerc`, `[tool.coverage]`, `fail_under`, JaCoCo rules, a `jacoco.minimum.*` property in a `pom.xml` or `.properties` file, c8/nyc/Jest thresholds), except a coverage-config edit outside workflows that only changes floors the guard reads (see `floor-lowered`); a lint rule disabled; a size or performance budget raised or removed. In a budget file, one whose name has `budget` or `budgets` as a word split on `-`, `_` or `.` (`size-budget.json`, `perf_budgets.yaml`), every numeric key counts as a budget, and so does a value alone on the line after its key; a changed number there that the guard can't pair with a key (a list item, or a value whose key the diff doesn't show) is a hit whatever its direction. A budget number is read whole, exponent included (`9e2` to `1e3` is raised); one whose unit the guard doesn't know (`b`, `kb`, `kib`, `mb`, `mib`, `gb`, `gib`, `ms`, `s`) is a hit whenever it changes. Any change to a file the repository names as an extra gate path (see "Extra gate paths"). |
+| `floor-lowered` | A coverage floor lowered or removed. A raised floor, or a new line that holds only a floor, needs no approval. |
+
+Floors only ratchet up, so raising one is not a hit. The guard reads both sides
+of each changed file whole and compares these floors by what they gate:
+
+- pytest-cov: `fail_under` in `[report]` or `[coverage:report]` of
+  `.coveragerc`, `[coverage:report]` of `setup.cfg` or `tox.ini`, and
+  `[tool.coverage.report]` of `pyproject.toml`; and `--cov-fail-under=N` in any
+  file;
+- JaCoCo: each `<limit>`'s numeric `<minimum>` (`0.80` or `80%`) in a
+  `pom.xml`, per rule scope (the profile, `pluginManagement` and execution
+  `<id>` around it, its `<element>`, and its `<includes>` and `<excludes>`,
+  in any order), counter and `COVEREDRATIO` or `COVEREDCOUNT` value, so rules
+  that swap places or scopes keep their own floors; and a numeric
+  `<properties>` entry that a `<minimum>` names as
+  `${name}` in the same file, or whose name says jacoco or coverage and min,
+  floor or threshold (not version), as a child module's
+  `<jacoco.minimum.line>`;
+- c8/nyc: `lines`, `branches`, `functions` and `statements` in the `c8` or
+  `nyc` block of `package.json` and at the top of `.c8rc`, `.c8rc.json`,
+  `.nycrc` or `.nycrc.json`, and the same flags of a `package.json` script
+  that runs `c8` or `nyc` with `--check-coverage`;
+- `COVERAGE_FLOOR` set to a number (`COVERAGE_FLOOR=N`, `COVERAGE_FLOOR: N`,
+  `${COVERAGE_FLOOR:-N}`) in any file;
+- `--fail-under-line`, `--fail-under-branch` and the other
+  `--fail-under-*` flags of gcovr and cargo-llvm-cov, in any file.
+
+A floor in a comment (`#`, `//`, `/* */`, `<!-- -->`, or `;` in an ini file)
+is no floor, so commenting one out removes it. A quoted floor counts only as a
+whole TOML or YAML value or list item (`addopts = "--cov-fail-under=85"`) or
+as `${COVERAGE_FLOOR:-N}` in double quotes; any other (`echo
+"COVERAGE_FLOOR=95"`) is not a floor, and no line that sets that floor in the
+file is exempt. A file where a string or comment spans lines (a docstring,
+a heredoc, an unclosed quote) and that holds a `COVERAGE_FLOOR` or flag floor
+on either side is a `gate-config` hit whatever its change, since wrapping a
+floor in one makes it inactive without changing its line.
+
+A changed line that only changes a floor's number, or adds or removes a line
+that holds only a floor, is then not a `gate-config` hit; any other change to
+coverage config still is, beside a raise or not: an `omit`, a `check-coverage`
+switch, any other changed line in the `nyc` or `c8` block of `package.json`
+(an `exclude`), in a JaCoCo plugin (a `<goal>`, `<skip>`, `<excludes>` or
+`<include>`; its `<version>` line aside) or in a `<properties>` entry such a
+plugin names, a changed line that names `COVERAGE_FLOOR` outside a test file,
+a floor the guard can't read (`9.2e1`, `${prop}`, `"$FLOOR"`, a Jest
+threshold, YAML or JavaScript config, JSON with comments or a repeated key, a
+JaCoCo `<limit>` with two `<minimum>`s, a JaCoCo rule whose scope names a
+property or that shares its scope with another rule),
+and every edit to a workflow, whose floors are compared only to report a
+lowering. A coverage config file added, deleted or renamed stays a hit, and so
+does a `pyproject.toml`, `setup.cfg`, `tox.ini`, `package.json`, `pom.xml`,
+`build.gradle` or Jest, Vitest or Karma config that is moved or renamed while
+it holds coverage settings, even unchanged: its tool finds it by name and
+place, so the move can drop its floors. With `--diff-file` a rename the diff
+shows no content of is a hit. A floor set more or fewer times in a file than
+before is a hit when one is gone or any is below the old highest. A
+`jacoco.minimum.*` property the guard can't read as a floor (in a `.properties` file, or in a `pom.xml`
+that a `--diff-file` diff doesn't show whole) is a `gate-config` hit whatever its change. That covers a
+value on a continuation line of a `.properties` key, every line from a `pom.xml` property's opening tag
+to its closing tag, a line that folds a property into another key's value, and, where a partial hunk
+may start inside a property's value (a continued line, or lines above its closing tag), those lines too. Docs and
+test files are not read for floors, and with `--diff-file` only files the diff
+shows whole are.
 
 C/C++ and PlatformIO repositories fail closed instead. Ten review rounds each
 found another way a model of the preprocessor or of PlatformIO's config missed
@@ -48,7 +111,41 @@ whatever the change:
   `test_*` or `extends` option it changes, when the guard can read both sides);
 - any change to a file in or under a test directory (`test`, `tests`,
   `__tests__`, `e2e`, `spec`, `specs`), in either tree, whatever its extension
-  (`removed-tests`);
+  (`removed-tests`), except a Python file in a test directory whose outermost
+  test directory holds no C/C++ source or header in either tree (a file with no
+  extension counts, except `.gitignore`, `.gitattributes`, `.gitkeep` and
+  `.keep`), as in a Python backend's `backend/tests`. Such a file is exempt
+  only when its change edits a `test_*.py` or `*_test.py` module in place and
+  does nothing but replace `assert` statements of its existing tests' own
+  bodies (top-level `test_` functions, and `test_` methods of top-level `Test`
+  classes with no constructor, with no decorator but pytest marks), each new
+  `assert` the one it replaces with only these changed: a comparison's literal
+  operands (a constant, an int or float constant with a minus sign, such as
+  `-1` or `-0.5`, or a list, tuple, set or dict of literals of the same
+  shape; any other unary operator or operand, such as `-None`, `+1`, `~1` or
+  `not 1`, is a changed shape), its operators (`==`, `!=`, `<`, `<=`, `>`,
+  `>=`, `is`, `is not`, `in`, `not in`), a plain-string message, and a
+  `pytest.approx` operand's expected value, `rel` and `abs`, where one
+  top-level `import pytest` is all that binds `pytest`. So that a change can
+  alter only what is compared, never what runs, a changed `assert` may hold no
+  `and`, `or`, conditional expression, comprehension, lambda, `:=`, `await`,
+  `yield` or starred item, no message but a plain string, and no chained
+  comparison with an operand other than a name or a literal. Any other change
+  is a hit: an `assert` added, removed or moved, a name, attribute, call or
+  argument changed, any statement that is not an `assert` of the test's own
+  body (a plain statement, a docstring, or an `if`, `for`, `while`, `with` or
+  `try`, even around an `assert`), an `assert` that shares its line with other
+  code, code outside a test body, a comment or blank line outside a test body,
+  a `conftest.py` or helper, a rename, addition or deletion, a tab, a form feed
+  or a non-ASCII character in a changed line, and any change to a file that
+  declares a source encoding other than UTF-8 or holds a carriage return inside
+  a line. The guard does not follow the code a comparison reaches (an
+  object's `__eq__`, a `conftest.py` hook), so an exempt change can still give
+  code already in the file or its imports other values to compare. Removed
+  tests and new skips are hits as in any repository. A C/C++ source (`.c`,
+  `.cc`, `.cpp`, `.cxx`) in a test directory is judged by the rule below;
+- any change to a CMake file (`CMakeLists.txt` or `*.cmake`) anywhere, which
+  can register or drop CTest tests (`removed-tests`);
 - an added, deleted or renamed C/C++ source or header anywhere, including
   `.c++`, `.cp`, `.h++`, `.tpp`, `.tcc`, `.inl`, `.ino`, `.pde`, `.s` and files
   with no extension, which can shadow or drop an include; and any changed
@@ -58,6 +155,74 @@ whatever the change:
   config it loads or a test it runs), or cannot be read (`skip-marker`); and
   when either tree has a symbolic link or submodule at or in a test directory
   (`removed-tests`).
+
+A C/C++ source in a test directory, edited in place, is exempt only when the
+guard can read it as the compiler does, it has the same tests as before, and
+its change does nothing but replace assertions of an existing test's own body
+(issue #43). Each new assertion is the one it replaces with only these
+changed: a literal argument (a number, a number with a minus sign, `true` or
+`false`, a string literal with the same prefix, or a character literal), or,
+where an argument is one comparison (`==`, `!=`, `<`, `<=`, `>`, `>=`), its
+operator and a literal operand. A number counts as a literal only with a
+built-in suffix (`u`, `l`, `ll` and their mixes for an integer, `f` or `l` for
+a floating literal): any other suffix, even one with no leading underscore
+such as `0f` or `1.0ff`, and C++23's `z`, makes a user-defined literal, which
+calls a literal operator a header may define. Assertions are the frameworks'
+own macros, each a statement of its own, `MACRO(...);`: Unity's `TEST_ASSERT`
+and the `TEST_ASSERT_*` names built from its words
+(`TEST_ASSERT_EQUAL_UINT32`, `TEST_ASSERT_FLOAT_WITHIN`), GoogleTest's
+`EXPECT_*` and `ASSERT_*` (`EQ`, `NE`, `LT`, `LE`, `GT`, `GE`, `TRUE`, `FALSE`,
+the string, float and exception checks, `NEAR`, `THAT`, `PRED*`, `DEATH`,
+`EXIT`; not `EXPECT_CALL`), and Catch2's and doctest's `REQUIRE`, `CHECK` and
+their `_FALSE`, `_THAT`, `_THROWS*`, `_NOTHROW`, comparison and `_UNARY` forms,
+any of them ending in `_MESSAGE`. A project macro named like one
+(`EXPECT_SKIP_IF`) is not an assertion. A test is Unity's `void
+test_name(void)`, GoogleTest's `TEST` or `TEST_F`, or a Catch2 or doctest
+`TEST_CASE` of plain strings. A changed assertion may hold no `&&`, `||`,
+`?:`, assignment, `++`, `--`, `throw` or `return`, and, for a `*_MESSAGE` macro, no message but string literals, which
+may run only when the assertion fails: Unity's message is its last argument,
+and doctest's (`CHECK_MESSAGE(cond, ...)`, variadic and logged lazily), like
+any other framework's, is every argument after the first.
+
+A new test is not exempt, as in Python test files (the owner's decision of
+2026-11-06): a new Unity, GoogleTest, Catch2 or doctest test, and its
+`RUN_TEST` registration, need approval whatever they hold. A new test can call
+code the file or its headers already reach, such as a function that ends the
+process, or write memory the framework reads, and no check of its names rules
+that out.
+
+Comments, blank lines and how a statement is split across lines do not count:
+the guard compares tokens. Anything else is a hit: a new test, a test removed
+or renamed, an assertion added, removed or moved, a call's argument, a name or
+a macro changed (`x` to `::x` too), any statement that is not an assertion of
+the test's own body (an `if`, `for`, block, declaration or `return`, even
+around an assertion), a test's header, a fixture, a helper, `setUp`, a runner
+or its registrations, a directive line changed, a rename, addition, deletion
+or mode change, and a header or any other file in a test directory. The guard
+fails closed on a file it cannot read as the compiler does: a line splice (a
+backslash at a line's end), a trigraph, a digraph, a carriage return inside a
+line, a form feed or other control character, a character that is not ASCII
+outside comments and literals, a changed line holding anything but printable
+ASCII and tabs, a literal it cannot read, a stray `#`, unbalanced brackets, a
+preprocessor branch that opens a bracket it does not close or closes one
+opened before it (even when it opens another, so a dead `#if 0` branch cannot
+close a helper and open a test at the same depth), a conditional directive
+inside a statement or declaration (anywhere but the start of the file or after
+`;`, `{` or `}`), an `#include`, `#embed` or other directive that brings in
+text inside a function or any other bracket but a namespace or `extern "C"`
+scope (it could close the test and open a helper), any `#define` or `#undef`
+in the file, and any use of `__LINE__` or `__COUNTER__`, whose values move with
+the lines around them. The guard reads code as written, not expanded, and a
+macro can give it any meaning: close a test and open a helper (`#define SPLIT
+} void helper(void) {`, or the same braces pasted from `%` and `>` with `##`),
+rename a test, or make `namespace` mean `struct`. So a test source with macros
+of its own is never exempt, whatever they hold. The guard does not read included files, expand macros from
+headers or follow the code a test reaches, so an exempt change can still give
+that code other values. For the same reason, a header's macro (`#define
+test_name helper`, or one whose replacement closes a test and opens a helper),
+or an included file whose own brackets do not pair, included at file, namespace
+or `extern "C"` scope, can rename a test or change its scope unseen: the guard
+reads only the test source.
 
 Unity `RUN_TEST(name)` registrations and `void test_name(void)` definitions are
 still counted, so a hit names the tests a change removed. Editing a source or
@@ -104,14 +269,39 @@ jobs:
 | `runs-on` | `'"ubuntu-latest"'` | Runner as JSON: a label string or a list of labels. |
 | `require-owner-label-actor` | `false` | Accept the label only when the repository owner applied it, checked through the issue-events API. Turn it on once workers act under their own identity (dflippojr/agent-ops#44). |
 | `guard-ref` | `main` | Ref of this repository to load `scripts/gate_guard.py` from. If you pin `uses:` to a SHA or tag, set `guard-ref` to the same value. |
+| `extra-gate-paths` | `''` | Repository-specific gate paths, one glob per line, passed as `--extra-gate-path` (see "Extra gate paths"). Under `pull_request` the caller is the pull request's own copy, but editing it is itself a `gate-config` hit. |
 
 The check appears as `gate-guard / gate-guard`; make it a required status check
 to enforce it. On events other than `pull_request` the job only prints a notice.
+
+### Extra gate paths
+
+Some repositories treat more paths as part of the gate: an `UPDATE_GOLDEN=1`
+refresh of `tests/golden/**` rewrites what the tests expect. Pass such globs
+with `--extra-gate-path`, once per glob or several in one value, one per line;
+blank lines name nothing, so an empty value adds no path. Any change to a file
+whose old or new path matches one (an edit, an addition, a deletion, a rename
+in or out, a mode change or a binary change) is a `gate-config` hit, one per
+file, reported as ``matches extra gate path `tests/golden/**` ``. Like any
+other hit, it needs the owner's `gate-change-approved` label, which on the
+default-branch guard counts only when applied after the newest push, with the
+owner's head record for that head (see "Gate guard on the default branch").
+
+A glob names paths from the repository root. `*` and `?` match within one path
+segment, dotfiles included, and `**` standing alone between slashes matches
+any number of segments, none included: `tests/golden/**` matches
+`tests/golden/a/b.json` but not `tests/goldenx/a.json`, and `tests/golden/*`
+doesn't match `tests/golden/a/b.json`. Every other character is literal. The
+guard refuses `[`, `]`, `{`, `}`, `\`, `!`, an empty, `.` or `..` segment
+(so a leading or trailing `/` too) and `**` inside a segment, and exits 2
+before reading anything, so a glob it can't read fails the check instead of
+quietly matching nothing.
 
 Run it locally against a branch or a saved diff:
 
 ```sh
 python3 scripts/gate_guard.py --repo-dir ../some-repo --base origin/main --head HEAD
+python3 scripts/gate_guard.py --repo-dir ../some-repo --base origin/main --head HEAD --extra-gate-path 'tests/golden/**'
 gh pr diff 80 -R dflippojr/disc-golf-league > pr.diff && python3 scripts/gate_guard.py --diff-file pr.diff
 ```
 
@@ -164,8 +354,64 @@ base: the same head against a new base can bring hits the old base hid.
      GitHub's repository activity record, not from commit dates, which whoever
      makes the commit sets. A push makes the owner's label stale. If GitHub has
      no record of the push, the label doesn't count.
-   - the whole label history was read. A list longer than 30 pages of 100
-     fails the job rather than judge from its oldest part.
+   - for `gate-change-approved`, the owner's head record names the current
+     head (below). The label alone, even the owner's, doesn't count.
+   - the whole label history, and the whole comment list, was read. A list
+     longer than 30 pages of 100 fails the job rather than judge from its
+     oldest part.
+
+   **`gate-change-approved` always needs the owner's head record.** The
+   owner approves a gate change one of two ways, and each applies the label,
+   then posts the head record `<!-- owner-label gate-change-approved
+   head=SHA -->` from the owner's login:
+
+   - comment `/approve-gate <head sha>` on the pull request, in a repository
+     with the approve-gate workflow (`scripts/approve_gate.py`, dflippojr/.github#44).
+     Its record reads `Owner approved … by [comment](…)`.
+   - run `ao owner-label apply <owner/repo> <pr> gate-change-approved --head
+     <head sha>` in the owner's own terminal (agent-ops). Its record reads
+     `Owner applied …`.
+
+   The label counts only when the owner's newest unedited head record for
+   `gate-change-approved`, posted at or after the label (so after the push),
+   names the exact current head. No record, a record for another SHA, an
+   edited record or someone else's record fails closed, and the reason names
+   both ways to approve.
+
+   Unedited means the server says so. REST's `created_at` and `updated_at`
+   have one-second resolution, so an edit in the second the record was posted
+   can leave them equal. For each of the owner's head records the guard also
+   reads GraphQL's `IssueComment` edit history, 100 comments per query, and
+   counts the record only when `lastEditedAt` and `editor` are null,
+   `includesCreatedEdit` is false and `userContentEdits` is empty. An edit
+   later restored to the original text still counts as an edit. If that
+   history can't be read, or GitHub's answer leaves out any of those
+   fields or gives one a type other than its own (a string or null time,
+   an object or null editor, a boolean flag, a non-negative integer count),
+   the job fails.
+
+   The rule has no exceptions because the guard can't tell how a label got
+   there. The approve-gate workflow labels with the owner's own token, so
+   GitHub records the owner as the actor, exactly as for a label applied by
+   hand. A run that dies between its label and its record, or its re-read of
+   the head, can leave the label on a head the owner never named: the owner
+   approves A, B is pushed, the label lands after B's push and dates as B's.
+   The comments that would show it was the workflow's, the owner's command
+   and the workflow's record, can be deleted or edited by anyone with write
+   access, so the guard no longer reads them for that (dflippojr/.github#62).
+   A label applied from GitHub's UI with no record is refused the same way;
+   the owner re-approves with one of the two ways above.
+
+   Both ways post the record a moment after the label, and the label starts
+   the guard. No comment reruns the guard, so while the owner's newest
+   `gate-change-approved` label is under a minute old and has no record, the
+   guard reads the comments again every 5 seconds for up to a minute, then
+   fails closed. A record that lands after that needs a rerun of the job or
+   another pull request event.
+
+   `findings-accepted` has no record rule in the guard: it counts on the
+   owner's label after the newest push. `ao ready` is stricter and also wants
+   its head record.
 5. Ends the job with the verdict: the job fails when any of them has
    unapproved hits, as `gate-guard.yml` does. It also fails while
    `findings-accepted` is on a pull request but doesn't count, so nothing can
@@ -207,10 +453,12 @@ default branch's newest commit.
 | `guard-ref` | required | Full commit SHA of this repository to load the script from; the SHA in the caller's `uses:` line. |
 | `runs-on` | `'"ubuntu-latest"'` | Runner as JSON. Private repositories pass the tower's labels. |
 | `owner` | repository owner | Login whose labels count. |
+| `extra-gate-paths` | `''` | Repository-specific gate paths, one glob per line, such as `tests/golden/**`, passed as `--extra-gate-path` (see "Extra gate paths"). The caller on the default branch sets them, so a pull request can't drop its own. |
 
 Every edit to `.github/workflows/**` is a `gate-config` hit, so a pull request
 that edits its caller or `gate-guard-target.yml` itself needs the owner's
-`gate-change-approved` label, applied after its newest push.
+`gate-change-approved` label, applied after its newest push with the owner's
+head record for that head.
 
 ### Why `pull_request_target` is safe here
 
@@ -251,13 +499,24 @@ anything from the pull request:
 - **The owner's identity.** A label applied by the owner login counts, whoever
   was driving it. Owner-identity launches (`AO_WORKER_IDENTITY=owner`) and a
   leaked owner token are outside what this check can see.
+- **A deleted head record.** Anyone with write access can delete comments,
+  the owner's included. Deleting the owner's head record makes the label stop
+  counting, which fails closed; editing it does the same, even within the
+  second it was posted, since the guard reads the server's edit history rather
+  than comparing timestamps. Neither can make an unapproved head pass. Before dflippojr/.github#62 the guard told a workflow
+  label from a hand label by the owner's `/approve-gate` command, so deleting
+  or rewriting that command turned a failed run's label into a hand label
+  judged by its time alone. The head record is now required for every
+  `gate-change-approved` label, so that hole is closed.
 - **What a diff can't show.** A test made vacuous (`assert True`), a slower
   test, or a weaker assertion is not a hit. The guard looks for removals,
   skips, retries and config edits, not for meaning.
 - **Direct pushes to the default branch.** They never trigger this workflow. The
   default-branch ruleset (agent-ops `config/rulesets.yaml`) blocks them.
 - **`gate-guard.yml` callers.** Repositories still on the `pull_request`
-  version keep the old hole until they move.
+  version keep the old hole until they move. That version checks only the
+  label (and, with `require-owner-label-actor`, who applied it), never a head
+  record.
 
 ## Approve a gate change by comment
 
@@ -284,8 +543,16 @@ only when all of these hold:
   (`GITHUB_REPOSITORY_OWNER`, `GITHUB_REPOSITORY_OWNER_ID`), and is a user.
   Another account, a look-alike login, or a renamed account with the old login
   doesn't count, and neither does a collaborator saying "approved".
-- The comment was never edited (`updated_at` equals `created_at`). Callers
-  listen for `created` only, and the script refuses any other action.
+- The comment was never edited. Its REST `updated_at` equals its
+  `created_at`, and, since REST's one-second timestamps can't show an edit
+  in the second it was posted, GraphQL's `IssueComment` edit history shows
+  none: `lastEditedAt` and `editor` null, `includesCreatedEdit` false,
+  `userContentEdits` empty. The check is the gate guard's, field for field
+  and of exactly its type; `approve_gate.py` carries a copy, since the
+  workflow checks out only that file, and a test pins it to the guard's. An
+  edit, a malformed answer or a history that can't be read applies nothing:
+  the run replies why and exits 2. Callers listen for `created` only, and
+  the script refuses any other action.
 - The body is exactly `/approve-gate`, one space and the full lowercase SHA;
   trailing whitespace is ignored. A short SHA or any extra text is refused,
   and the job's `if:` skips a body that does not start with `/approve-gate `.
@@ -301,8 +568,9 @@ adds it again. Adding a label that is already on records no event, and the
 gate guard dates the label by its newest event: a re-approval after a push
 would still look older than the push. Then it posts the head record. Last, it
 reads the head again. If a push landed meanwhile, it removes the label again,
-because the gate guard would date the label after that push and count it for
-a commit the owner never named. For the same reason it removes the label
+because the label would date after that push and sit on a commit the owner
+never named; the gate guard refuses such a label, since the record names the
+old head, but it must not stay. For the same reason it removes the label
 again when anything fails once the label request is sent: the label write
 itself (GitHub may have applied it), the record, or the final read. If that
 removal fails too, the run fails with an error line saying the label is still
@@ -313,7 +581,14 @@ owner also sees a failed run.
 
 A later push invalidates the approval in both checks: `ao ready` needs the
 record to name the current head, and the gate guard needs the label applied
-after the newest push.
+after the newest push and the owner's newest unedited head record since the
+label to name the current head ("`gate-change-approved` always needs the
+owner's head record" under "Gate guard on the default branch"). The record is
+a new comment the workflow never edits, so GraphQL's edit history of it, which
+the guard reads, is empty. That guard rule also covers what the cleanup above
+can't, a run killed between the label and the record or a removal that
+failed: a label left on a head the owner never named has no record naming
+that head, so it fails closed.
 
 ### The token
 
@@ -339,9 +614,12 @@ The owner sets up, once per repository with a caller (repository Settings):
    in agent-ops). No tag rules. Leave required reviewers and wait timers off.
 3. A fine-grained personal access token. Resource owner `dflippojr`.
    Repository access: only this repository. Permissions:
-   **Pull requests: Read and write** (labels and comments on pull requests),
-   plus the mandatory Metadata: Read. If GitHub refuses the label call with
-   403, add **Issues: Read and write**. Set an expiry and renew it.
+   **Pull requests: Read and write** (labels and comments on pull requests,
+   and the GraphQL read of the command's edit history), plus the mandatory
+   Metadata: Read. If GitHub refuses the label call with 403, or the run
+   replies "its edit history could not be read" naming a 403, `FORBIDDEN` or
+   "not accessible" error (a GraphQL denial can come back as HTTP 200 with
+   an error), add **Issues: Read and write**. Set an expiry and renew it.
 4. In the `approve-gate` environment, **Environment secrets → Add secret**,
    named `OWNER_GATE_TOKEN`, holding the token.
 5. If a repository secret named `OWNER_GATE_TOKEN` exists (Settings → Secrets
@@ -420,6 +698,11 @@ which job declares the environment:
   `workflow_dispatch` job there passes the branch rule. Only
   `approve-gate.yml`'s `approve` job may declare it; the tests check that in
   this repository, and agent-ops checks its own workflows.
+- **GraphQL's edit history is the last word.** An edit to the command
+  in the second it was posted is caught only because GitHub's GraphQL API
+  reports it. If that history ever under-reported an edit, the run would
+  act on the rewritten command, if it names the current head. The gate
+  guard trusts the same history for head records.
 - **`gate-guard.yml` callers.** The `pull_request` gate guard checks only who
   applied the label, not when, so in a repository still on it a push does not
   void an approval there; `ao ready` still does, through the head record.

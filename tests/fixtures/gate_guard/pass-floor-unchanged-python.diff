@@ -1,0 +1,29 @@
+# gate-guard fixture: floors unchanged beside edits to the same files
+# expect: 
+# hits: 0
+
+diff --git a/pyproject.toml b/pyproject.toml
+index 614912b..0efb2a5 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,8 +1,8 @@
+ [project]
+-name = "calc"
++name = "calculator"
+ 
+ [tool.pytest.ini_options]
+ addopts = "--cov=calc --cov-fail-under=85"
+ 
+ [tool.coverage.report]
+ fail_under = 90.5
+diff --git a/setup.cfg b/setup.cfg
+index d147418..d0843dd 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -1,5 +1,5 @@
+ [metadata]
+-name = calc
++name = calculator
+ 
+ [coverage:report]
+ fail_under = 80

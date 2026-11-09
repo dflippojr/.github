@@ -24,6 +24,7 @@ HEAD, NEWER = "a" * 40, "b" * 40
 CREATED = "2026-10-27T12:00:00Z"
 LABEL = "gate-change-approved"
 RECORD = re.compile(r"<!-- owner-label (\S+) head=([0-9a-f]{40}) -->")
+DROP = object()  # in FakeGitHub(history=...): leave this key out of the GraphQL node
 
 
 class FakeGitHub:
@@ -33,12 +34,16 @@ class FakeGitHub:
     between the check and the label can be simulated. faults: (method, path) -> {n: when}, the nth such call
     raises URLError; a write with when "after" takes effect first (GitHub did it, the response was lost), one with
     "before" does not. Removing a label the issue does not have is a 404, as on GitHub.
+
+    history: what GraphQL answers for the command's edit history. None is a never-edited node; a dict changes
+    the node's keys (DROP leaves one out); an exception is raised; a callable gets the variables and returns
+    the whole data.
     """
 
     def __init__(self, body=None, login=OWNER, uid=OWNER_ID, updated=CREATED, is_pr=True, head_repo=REPO,
                  state="open", labels=(), heads=(HEAD,), token_login=OWNER, token_id=OWNER_ID, kind="User",
-                 faults=None):
-        self.comment = {"id": 55, "user": {"login": login, "id": uid, "type": kind},
+                 faults=None, history=None, node_id="IC_55"):
+        self.comment = {"id": 55, "node_id": node_id, "user": {"login": login, "id": uid, "type": kind},
                         "body": f"/approve-gate {HEAD}" if body is None else body,
                         "created_at": CREATED, "updated_at": updated,
                         "issue_url": f"https://api.github.com/repos/{REPO}/issues/{NUMBER}",
@@ -48,6 +53,7 @@ class FakeGitHub:
         self.me = {"login": token_login, "id": token_id}
         self.writes = []
         self.faults, self.calls = faults or {}, {}
+        self.history, self.graphql_calls = history, []
 
     def call(self, method, path):
         """Counts the call; the time this call fails ("before", "after" or None)."""
@@ -94,6 +100,17 @@ class FakeGitHub:
         self.fail("DELETE", path, when, "after")
         return {}
 
+    def graphql(self, query, variables):
+        self.graphql_calls.append((query, variables))
+        if isinstance(self.history, Exception):
+            raise self.history
+        if callable(self.history):
+            return self.history(variables)
+        node = {"__typename": "IssueComment", "id": "IC_55", "databaseId": 55, "lastEditedAt": None,
+                "editor": None, "includesCreatedEdit": False, "userContentEdits": {"totalCount": 0}}
+        node.update(self.history or {})
+        return {"nodes": [{k: v for k, v in node.items() if v is not DROP}]}
+
     def comments(self):
         return [body["body"] for method, path, body in self.writes if path.endswith("/comments")]
 
@@ -137,6 +154,74 @@ class Acceptance(unittest.TestCase):
         record = approve_gate.head_record(HEAD, "https://example.invalid/c")
         self.assertIn(f"<!-- owner-label {LABEL} head={HEAD} -->", record)
         self.assertFalse(record.lstrip().startswith("/approve-gate"), "the record must not trigger another run")
+
+class GuardCountsTheRecord(unittest.TestCase):
+    """The label and record a run writes, judged by gate_guard.owner_label as .github #63 left it.
+
+    Since #63 every gate-change-approved label needs the owner's newest head record posted at or after it to name
+    the head, and the record counts only when GraphQL's edit history of that comment, every field of exactly its
+    type, shows no edit. The guard's own fixtures hard-code the record text, so only this catches head_record()
+    drifting from what the guard reads."""
+
+    LABELED, POSTED, PUSHED = "2026-10-27T12:00:05Z", "2026-10-27T12:00:06Z", "2026-10-27T11:00:00Z"
+
+    def setUp(self):
+        import gate_guard
+        self.guard = gate_guard
+        self.github = FakeGitHub()
+        code, message = run(self.github)
+        self.assertEqual(code, 0, message)
+        [record] = self.github.comments()
+        owner = {"login": OWNER, "id": OWNER_ID, "type": "User"}
+        # The run's comments as the guard's REST read returns them: the owner's command, then the record.
+        self.comments = [dict(self.github.comment, node_id="IC_55"),
+                         {"id": 900, "node_id": "IC_900", "user": owner, "body": record,
+                          "created_at": self.POSTED, "updated_at": self.POSTED}]
+        self.events = [{"id": 1, "event": "labeled", "label": {"name": LABEL}, "actor": {"login": OWNER},
+                        "created_at": self.LABELED}]
+
+    def node(self, **change):
+        node = {"__typename": "IssueComment", "id": "IC_900", "databaseId": 900, "lastEditedAt": None,
+                "editor": None, "includesCreatedEdit": False, "userContentEdits": {"totalCount": 0}}
+        node.update(change)
+        return node
+
+    def judge(self, node, sha=HEAD):
+        asked = []
+
+        class Graphql:
+            def graphql(self, query, variables):
+                asked.append(variables["ids"])
+                return {"nodes": [node]}
+
+        comments = self.guard.with_edit_history(Graphql(), self.comments, OWNER)
+        self.assertEqual(asked, [["IC_900"]], "the guard looks up the record, and only the record")
+        return self.guard.owner_label(LABEL, {LABEL}, self.events, OWNER, sha,
+                                      self.guard.parse_time(self.PUSHED), comments)
+
+    def test_the_record_counts_at_the_head(self):
+        counts, reason = self.judge(self.node())
+        self.assertTrue(counts, reason)
+        self.assertIn(f"names {HEAD[:7]}", reason)
+
+    def test_the_record_does_not_count_for_another_head(self):
+        counts, reason = self.judge(self.node(), sha=NEWER)
+        self.assertFalse(counts, reason)
+        self.assertIn(f"names {HEAD[:7]}, not the head {NEWER[:7]}", reason)
+
+    def test_an_edited_record_does_not_count(self):
+        for change in ({"lastEditedAt": self.POSTED}, {"editor": {"login": "someone"}},
+                       {"includesCreatedEdit": True}, {"userContentEdits": {"totalCount": 1}}):
+            with self.subTest(change=change):
+                counts, reason = self.judge(self.node(**change))
+                self.assertFalse(counts, reason)
+                self.assertIn("no unedited head record", reason)
+
+    def test_a_malformed_edit_history_fails_closed(self):
+        for change in ({"databaseId": True}, {"databaseId": 900.0}, {"id": "IC_55"}, {"__typename": "Issue"},
+                       {"userContentEdits": {"totalCount": False}}, {"includesCreatedEdit": 0}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.judge(self.node(**change))
 
 
 class Rejections(unittest.TestCase):
@@ -350,6 +435,146 @@ def main_with(test, github):
         return approve_gate.main(), out.getvalue()
 
 
+class CommandEditHistory(unittest.TestCase):
+    """REST's one-second timestamps can't show an edit in the second the command was posted (.github #63), so the
+    command counts only when GraphQL's edit history, every field of exactly its type, shows it never edited. Any
+    edit, malformed answer or unreadable history applies nothing: exit 2 and a reply naming why."""
+
+    NODE = {"__typename": "IssueComment", "id": "IC_55", "databaseId": 55, "lastEditedAt": None,
+            "editor": None, "includesCreatedEdit": False, "userContentEdits": {"totalCount": 0}}
+
+    def assert_not_applied(self, github, why):
+        code, message = run(github)
+        self.assertEqual(code, 2, message)
+        self.assertIn(why, message)
+        self.assertNotIn(LABEL, github.labels)
+        self.assertEqual([(m, p) for m, p, _ in github.writes], [("POST", f"/repos/{REPO}/issues/{NUMBER}/comments")],
+                         "only the reply is written")
+        [reply] = github.comments()
+        self.assertTrue(reply.startswith(f"`{LABEL}` was not applied: "), reply)
+        self.assertIn(why, reply)
+        self.assertIsNone(RECORD.search(reply))
+
+    def test_queries_the_command_by_its_node_id(self):
+        github = FakeGitHub()
+        self.assertEqual(run(github)[0], 0)
+        self.assertEqual(github.graphql_calls, [(approve_gate.EDIT_QUERY, {"ids": ["IC_55"]})])
+
+    def test_edited_in_the_second_it_was_posted(self):
+        """The REST timestamps are equal (FakeGitHub's default); only GraphQL shows the edit."""
+        for change in ({"lastEditedAt": CREATED}, {"editor": {"login": "someone"}}, {"includesCreatedEdit": True},
+                       {"userContentEdits": {"totalCount": 1}}):
+            with self.subTest(change=change):
+                self.assert_not_applied(FakeGitHub(history=change), "edit history shows the comment was edited")
+
+    def test_a_missing_key(self):
+        for key in self.NODE:
+            with self.subTest(key=key):
+                self.assert_not_applied(FakeGitHub(history={key: DROP}), "is malformed")
+
+    def test_a_key_of_the_wrong_type_or_value(self):
+        for change in ({"databaseId": True}, {"databaseId": 55.0}, {"databaseId": "55"}, {"databaseId": 56},
+                       {"id": "IC_56"}, {"id": None}, {"__typename": "PullRequestReviewComment"},
+                       {"lastEditedAt": 0}, {"editor": "someone"}, {"includesCreatedEdit": 0},
+                       {"includesCreatedEdit": None}, {"userContentEdits": None}, {"userContentEdits": {}},
+                       {"userContentEdits": {"totalCount": -1}}, {"userContentEdits": {"totalCount": True}},
+                       {"userContentEdits": {"totalCount": 0.0}}):
+            with self.subTest(change=change):
+                self.assert_not_applied(FakeGitHub(history=change), "is malformed")
+
+    def test_a_node_that_is_not_an_object(self):
+        for node in (None, [], "IC_55"):
+            with self.subTest(node=node):
+                self.assert_not_applied(FakeGitHub(history=lambda v, node=node: {"nodes": [node]}), "is malformed")
+
+    def test_an_unreadable_history(self):
+        for history in (approve_gate.urllib.error.URLError("down"),
+                        approve_gate.urllib.error.HTTPError("x", 403, "Resource not accessible", {}, None),
+                        ValueError("the GraphQL API answered with errors"),
+                        lambda v: None, lambda v: {}, lambda v: {"nodes": None}, lambda v: {"nodes": []},
+                        lambda v: {"nodes": [dict(self.NODE), dict(self.NODE)]}):
+            with self.subTest(history=history):
+                self.assert_not_applied(FakeGitHub(history=history), "edit history could not be read")
+
+    def test_a_comment_without_a_node_id(self):
+        for node_id in (None, "", 55):
+            with self.subTest(node_id=node_id):
+                github = FakeGitHub(node_id=node_id)
+                self.assert_not_applied(github, "edit history could not be read")
+                self.assertEqual(github.graphql_calls, [])
+
+    def test_other_refusals_come_first_and_read_no_history(self):
+        """Someone else's comment, a REST-visible edit or another body is refused (exit 1) before any query."""
+        for github in (FakeGitHub(login="someone-else", uid=1), FakeGitHub(updated="2026-10-27T12:00:05Z"),
+                       FakeGitHub(body="/approve-gate abc")):
+            with self.subTest(comment=github.comment):
+                self.assertEqual(run(github)[0], 1)
+                self.assertEqual(github.graphql_calls, [])
+
+    def test_a_token_of_someone_else_writes_nothing(self):
+        github = FakeGitHub(history={"editor": {"login": "someone"}}, token_login="x", token_id=9)
+        code, message = run(github)
+        self.assertEqual(code, 2)
+        self.assertIn("OWNER_GATE_TOKEN belongs to @x", message)
+        self.assertEqual(github.writes, [])
+
+
+class EditCheckIsTheGuards(unittest.TestCase):
+    """The workflow's sparse checkout carries only approve_gate.py, so it holds a copy of the gate guard's
+    edit-history check (.github #63). The copy must stay the guard's, byte for byte."""
+
+    def test_same_source(self):
+        import inspect
+        import gate_guard
+        for name in ("_check_edit_node", "_never_edited"):
+            with self.subTest(name=name):
+                self.assertEqual(inspect.getsource(getattr(approve_gate, name)),
+                                 inspect.getsource(getattr(gate_guard, name)))
+        self.assertEqual(approve_gate.EDIT_QUERY, gate_guard.EDIT_QUERY)
+        self.assertEqual(approve_gate.EDIT_KEYS, gate_guard.EDIT_KEYS)
+
+
+class GraphqlCall(unittest.TestCase):
+    """GitHub.graphql: one POST to the GraphQL endpoint; errors, even beside data, raise."""
+
+    def call(self, answer, **env):
+        seen = []
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def urlopen(request, timeout):
+            seen.append(request)
+            return Response(json.dumps(answer).encode("utf-8"))
+
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(approve_gate.urllib.request, "urlopen", urlopen):
+            try:
+                return approve_gate.GitHub("https://api.example", "t").graphql("query", {"ids": ["IC_1"]}), seen
+            except ValueError as e:
+                return e, seen
+
+    def test_posts_the_query_and_returns_the_data(self):
+        data, [request] = self.call({"data": {"nodes": []}})
+        self.assertEqual(data, {"nodes": []})
+        self.assertEqual((request.get_method(), request.full_url), ("POST", "https://api.example/graphql"))
+        self.assertEqual(json.loads(request.data), {"query": "query", "variables": {"ids": ["IC_1"]}})
+        self.assertEqual(request.get_header("Authorization"), "Bearer t")
+
+    def test_uses_the_runner_graphql_url(self):
+        _, [request] = self.call({"data": {}}, GITHUB_GRAPHQL_URL="https://ghe.example/api/graphql")
+        self.assertEqual(request.full_url, "https://ghe.example/api/graphql")
+
+    def test_errors_raise(self):
+        for answer in ({"errors": [{"message": "no"}], "data": {"nodes": []}}, {"data": None}, [], None):
+            with self.subTest(answer=answer):
+                self.assertIsInstance(self.call(answer)[0], ValueError)
+
+
 class Main(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -386,6 +611,13 @@ class Main(unittest.TestCase):
         code, out = self.main(github)
         self.assertEqual(code, 2)
         self.assertIn("::error::could not read or write", out)
+
+    def test_an_edited_command_exits_2(self):
+        github = FakeGitHub(history={"userContentEdits": {"totalCount": 1}})
+        code, out = self.main(github)
+        self.assertEqual(code, 2)
+        self.assertIn("::error::", out)
+        self.assertNotIn(LABEL, github.labels)
 
     def test_refusal_cannot_issue_workflow_commands(self):
         github = FakeGitHub(login="x\n::notice::forged", uid=1)

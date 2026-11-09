@@ -1,0 +1,89 @@
+# gate-guard fixture: coverage configs moved to other directories as their floors rise: pyproject.toml, package.json and pom.xml are no longer found where the tools look
+# expect: gate-config
+# hits: 3
+# detail: coverage config renamed
+
+diff --git a/pyproject.toml b/retired/pyproject.toml
+similarity index 93%
+rename from pyproject.toml
+rename to retired/pyproject.toml
+index 673a5a0..9aaaf4b 100644
+--- a/pyproject.toml
++++ b/retired/pyproject.toml
+@@ -1,15 +1,15 @@
+ [project]
+ name = "calc"
+ version = "1.0"
+ description = "A calculator"
+ requires-python = ">=3.10"
+ 
+ [tool.pytest.ini_options]
+ testpaths = ["tests"]
+ 
+ [tool.coverage.run]
+ source = ["calc"]
+ 
+ [tool.coverage.report]
+-fail_under = 90
++fail_under = 95
+ show_missing = true
+diff --git a/service/pom.xml b/service/legacy/pom.xml
+similarity index 94%
+rename from service/pom.xml
+rename to service/legacy/pom.xml
+index e957125..86a67d0 100644
+--- a/service/pom.xml
++++ b/service/legacy/pom.xml
+@@ -1,29 +1,29 @@
+ <project>
+   <modelVersion>4.0.0</modelVersion>
+   <groupId>com.shop</groupId>
+   <artifactId>shop</artifactId>
+   <version>1.0</version>
+   <build>
+     <plugins>
+       <plugin>
+         <groupId>org.jacoco</groupId>
+         <artifactId>jacoco-maven-plugin</artifactId>
+         <version>0.8.12</version>
+         <configuration>
+           <rules>
+             <rule>
+               <element>BUNDLE</element>
+               <limits>
+                 <limit>
+                   <counter>LINE</counter>
+                   <value>COVEREDRATIO</value>
+-                  <minimum>0.80</minimum>
++                  <minimum>0.81</minimum>
+                 </limit>
+               </limits>
+             </rule>
+           </rules>
+         </configuration>
+       </plugin>
+     </plugins>
+   </build>
+ </project>
+diff --git a/web/package.json b/web-old/package.json
+similarity index 91%
+rename from web/package.json
+rename to web-old/package.json
+index a4110ec..6c1017a 100644
+--- a/web/package.json
++++ b/web-old/package.json
+@@ -1,13 +1,13 @@
+ {
+   "name": "shop",
+   "version": "1.0.0",
+   "private": true,
+   "scripts": {
+     "test": "nyc node --test",
+     "lint": "eslint ."
+   },
+   "nyc": {
+     "check-coverage": true,
+-    "lines": 85
++    "lines": 86
+   }
+ }

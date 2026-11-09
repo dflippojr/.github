@@ -1,12 +1,15 @@
+import json
 import pathlib
 import sys
 
 import pytest
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))
 import sync_labels  # noqa: E402
 
 SLUG = f"{sync_labels.OWNER}/r"
+REAL_CONFIG = json.loads((ROOT / "labels.json").read_text(encoding="utf-8"))
 
 
 def label(name, color="aaaaaa", description="d"):
@@ -69,3 +72,17 @@ def test_remove_entry_deletes_only_when_present(monkeypatch):
     steps = run_plan(monkeypatch, [label("gone"), label("keep")], cfg)
     assert steps == [("delete gone", ["label", "delete", "gone", "-R", SLUG, "--yes"])]
     assert run_plan(monkeypatch, [label("keep")], cfg) == []
+
+
+USER_ACTION = label("user-action", "d93f0b", "Needs the owner to do something (purchase, credential, decision)")
+USER_PRESENT = label("user-present", "f9d0c4", "The owner or a physical device is needed for the next step")
+
+
+def test_real_config_never_renames_user_action(monkeypatch):
+    steps = run_plan(monkeypatch, [USER_ACTION], REAL_CONFIG)
+    assert not [desc for desc, _ in steps if desc.startswith("rename")]
+
+
+def test_real_config_user_action_beside_user_present_has_no_warning(monkeypatch, capsys):
+    run_plan(monkeypatch, [USER_ACTION, USER_PRESENT], REAL_CONFIG)
+    assert "both" not in capsys.readouterr().out

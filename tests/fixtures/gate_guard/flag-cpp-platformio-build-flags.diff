@@ -1,0 +1,16 @@
+# gate-guard fixture: a PlatformIO build flag added that a test can read to skip itself
+# expect: skip-marker
+# hits: 1
+# detail: PlatformIO firmware/platformio.ini modified
+
+diff --git a/firmware/platformio.ini b/firmware/platformio.ini
+index 117464f..6fe3d45 100644
+--- a/firmware/platformio.ini
++++ b/firmware/platformio.ini
+@@ -1,5 +1,5 @@
+ [env:native]
+ platform = native
+ test_framework = unity
+-build_flags = -DCLAMP_LIMIT=10
++build_flags = -DCLAMP_LIMIT=10 -DSKIP_SLOW_TESTS
+ build_src_filter = +<*> -<main.cpp>

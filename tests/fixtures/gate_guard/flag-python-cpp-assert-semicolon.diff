@@ -1,0 +1,29 @@
+# gate-guard fixture: an assertion's value changed on a line that also holds other code
+# expect: removed-tests
+# hits: 1
+# detail: shares its line
+
+diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
+--- a/firmware/src/logic.cpp
++++ b/firmware/src/logic.cpp
+@@ -1 +1 @@
+-int limit = 120;
++int limit = 125;
+diff --git a/backend/tests/test_guard.py b/backend/tests/test_guard.py
+--- a/backend/tests/test_guard.py
++++ b/backend/tests/test_guard.py
+@@ -1,13 +1,13 @@
+ import os
+ 
+ import pytest
+ 
+ from backend.app import create_app
+ 
+ 
+ def test_guard():
+-    assert os.sep == "/"; create_app()
++    assert os.sep == "\\"; create_app()
+ 
+ 
+ def test_later():
+     assert False

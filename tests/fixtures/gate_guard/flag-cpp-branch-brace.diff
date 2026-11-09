@@ -1,0 +1,38 @@
+# gate-guard fixture: a literal fixed in a file whose preprocessor branches each open a brace
+# expect: removed-tests
+# hits: 1
+# detail: a preprocessor branch opens or closes a bracket
+
+diff --git a/firmware/test/test_logic/test_main.cpp b/firmware/test/test_logic/test_main.cpp
+index 2822e57..154ada2 100644
+--- a/firmware/test/test_logic/test_main.cpp
++++ b/firmware/test/test_logic/test_main.cpp
+@@ -1,27 +1,27 @@
+ #include <unity.h>
+ #include "logic.h"
+ 
+ void setUp(void) {}
+ #ifdef ARDUINO
+ void tearDown(void) {
+ #else
+ void tearDown(void) { delay(1);
+ #endif
+ }
+ 
+ void test_clamp_low(void) {
+     // boundary
+-    TEST_ASSERT_EQUAL(0, clamp(-5, 0, 10));
++    TEST_ASSERT_EQUAL(1, clamp(-5, 0, 10));
+     TEST_ASSERT_TRUE(clamp(5, 0, 10) == 5);
+ }
+ 
+ void test_clamp_high(void) {
+     TEST_ASSERT_EQUAL(10, clamp(50, 0, 10));
+ }
+ 
+ int main(int argc, char **argv) {
+     UNITY_BEGIN();
+     RUN_TEST(test_clamp_low);
+     RUN_TEST(test_clamp_high);
+     return UNITY_END();
+ }

@@ -1,0 +1,26 @@
+# gate-guard fixture: budget file values lowered in scientific notation and across lines
+# expect: 
+# hits: 0
+
+diff --git a/checks/size-budget.json b/checks/size-budget.json
+index 9a1c2e4..2a3b4c5 100644
+--- a/checks/size-budget.json
++++ b/checks/size-budget.json
+@@ -1,6 +1,6 @@
+ {
+-  "maxGzipBytes": 1e3,
++  "maxGzipBytes": 9e2,
+   "maxBytes":
+-    30000,
++    20000,
+   "maxRequests": 40
+ }
+diff --git a/checks/perf_budgets.yaml b/checks/perf_budgets.yaml
+index 2b3c4d5..3c4d5e6 100644
+--- a/checks/perf_budgets.yaml
++++ b/checks/perf_budgets.yaml
+@@ -1,3 +1,3 @@
+ maxScriptKb:
+-  300
++  2.5e2
+ maxFonts: 4

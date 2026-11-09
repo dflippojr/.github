@@ -1,0 +1,31 @@
+# gate-guard fixture: in a C/C++ repository, an existing unicode_escape encoding turns a \u000a in a comment inside a test into a return
+# expect: removed-tests
+# hits: 1
+# detail: unicode_escape
+
+diff --git a/backend/tests/test_api.py b/backend/tests/test_api.py
+index 087045b..cf96160 100644
+--- a/backend/tests/test_api.py
++++ b/backend/tests/test_api.py
+@@ -1,11 +1,11 @@
+ # coding: unicode_escape
+ from backend.app import create_app
+ 
+ 
+ def test_health():
+     assert create_app()
+ 
+ 
+ def test_height_limits():
+-    limit = 120
++    limit = 120  # \u000a    return
+     assert create_app().max_height == limit
+diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
+index b384dce..3925a03 100644
+--- a/firmware/src/logic.cpp
++++ b/firmware/src/logic.cpp
+@@ -1,3 +1,3 @@
+ int clamp(int v, int lo, int hi) {
+-  return v < lo ? lo : v;
++  return v < lo ? lo : (v > hi ? hi : v);
+ }

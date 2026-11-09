@@ -7,7 +7,15 @@ Reads the pull request's unified diff and reports each hit:
     skip-marker    a new skip, focus or expected-failure marker
     retry          a new or raised retry or rerun setting
     gate-config    an edit to workflows, Sonar or coverage config, a lint
-                   rule disabled, or a size or performance budget raised
+                   rule disabled, or a size or performance budget raised;
+                   outside workflows, a coverage-config edit that only raises
+                   floors, or adds a floor line, is not a hit, but
+                   moving or renaming a coverage config is
+    floor-lowered  a coverage floor lowered or removed (see _floor_review)
+
+A repository can name more gate paths with --extra-gate-path (goldens that a
+refresh rewrites, say): any change to a file whose old or new path matches one
+of those globs is a gate-config hit too (see parse_extra_paths).
 
 Moved lines are not hits: a test renamed or moved to another file, or a skip
 marker that moves with its test, cancels out. A repository with a
@@ -36,11 +44,15 @@ one notice annotation states the verdict for pr_body_lint.py.
     python3 gate_guard.py --pull-request-target --guard-sha "$GUARD_SHA"
 """
 import argparse
+import ast
 import base64
 import bisect
 import collections
 import configparser
 import datetime
+import decimal
+import difflib
+import io
 import json
 import os
 import posixpath
@@ -50,13 +62,29 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import tokenize
 import urllib.error
 import urllib.parse
 import urllib.request
+import warnings
 
 APPROVAL_LABEL = "gate-change-approved"
 FINDINGS_LABEL = "findings-accepted"
 OWNER_LABELS = (APPROVAL_LABEL, FINDINGS_LABEL)
+# The owner head record. Both ways to approve a gate change post it right after
+# they label: `ao owner-label apply` ("Owner applied ...") and approve_gate.py,
+# the /approve-gate workflow ("Owner approved ... by [comment](...)").
+HEAD_RECORD = re.compile(r"<!-- owner-label (\S+) head=([0-9a-f]{40}) -->")
+# REST comment timestamps have one-second resolution, so updated_at ==
+# created_at can't show that a record was never edited. GraphQL's IssueComment
+# keeps the server's edit history; the guard reads it for each candidate record,
+# up to EDIT_BATCH comments per query.
+EDIT_QUERY = ("query($ids: [ID!]!) { nodes(ids: $ids) { __typename ... on IssueComment { id databaseId "
+              "lastEditedAt editor { login } includesCreatedEdit userContentEdits(first: 1) { totalCount } } } }")
+EDIT_BATCH = 100
+# The keys of each EDIT_QUERY node; userContentEdits must also hold totalCount.
+EDIT_KEYS = ("__typename", "id", "databaseId", "lastEditedAt", "editor", "includesCreatedEdit", "userContentEdits")
 # The judging job's check with the caller template: the caller's job id, then
 # the reusable workflow's job name. pr_body_lint.py reads its verdict annotation.
 REQUIRED_CHECK = "gate-guard-target / gate-guard"
@@ -66,6 +94,11 @@ MAX_SUMMARY_BYTES = 1000000
 TRUNCATED = "\n\n… (truncated; the job log has the rest)\n"
 MAX_ANNOTATIONS = 50
 MAX_API_PAGES = 30
+# Both ways to approve post the head record a moment after the label that
+# starts the guard, and no comment reruns the guard, so a fresh owner label
+# waits up to RECORD_WAIT seconds for it, reading the comments every RECORD_POLL.
+RECORD_WAIT = 60
+RECORD_POLL = 5
 
 Hit = collections.namedtuple("Hit", "rule path line detail")
 # kind is " " (context), "-" (removed) or "+" (added); old/new are line numbers.
@@ -545,7 +578,16 @@ def removed_test_hits(files):
 # what they include. Anything else is a hit, whatever its content:
 #
 #   - a change to any platformio.ini (skip-marker, see platformio_hits);
-#   - a change to any file in or under a test directory, in either tree;
+#   - a change to any file in or under a test directory, in either tree,
+#     except a Python file in a test directory that holds no C/C++ source or
+#     header in either tree (a Python backend's tests/), when its change only
+#     replaces compared literals and comparison operators in assert statements
+#     of its existing tests (issue #40, see _python_unexempt). The guard does
+#     not model what pytest collects or skips, so any other change to such a
+#     file is a hit; and except a C/C++ source edited in place whose change
+#     only replaces literals and comparison operators in assertions of its
+#     existing tests; a new test is a hit (issue #43, see _c_cpp_unexempt);
+#   - a change to a CMake file anywhere, which can register or drop tests;
 #   - an added, deleted or renamed C/C++ source or header anywhere, or a
 #     changed submodule;
 #   - every pull request, when a platformio.ini names extra_configs or test_dir
@@ -562,6 +604,835 @@ def _at_test_dir(path):
     return any(d in TEST_DIRS for d in path.lower().split("/"))
 
 
+def _test_root(path):
+    """The outermost test directory path is in, lower-cased, or None."""
+    parts = path.lower().split("/")[:-1]
+    return next(("/".join(parts[:i + 1]) for i, d in enumerate(parts) if d in TEST_DIRS), None)
+
+
+def _python_test(path, facts):
+    """Whether path is a Python file outside test directories, or in one that holds no C/C++ source or header."""
+    return _ext(path) in PY_EXTS and _test_root(path) not in facts.c_test_roots
+
+
+# A source encoding declaration (PEP 263). The guard reads a file as UTF-8, so a
+# file that may declare another, on any line, is not exempt.
+PY_CODING = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
+# What a changed line may hold: printable ASCII. Python reads some other letters
+# as ASCII ones, and tabs and form feeds as indentation.
+PY_PRINTABLE = re.compile(r"[ -~]*")
+PY_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
+# The nodes ast.parse gives a literal, by name: Constant from Python 3.8; Num,
+# Str, Bytes, NameConstant and Ellipsis on 3.7, which 3.14 no longer has.
+PY_LITERALS = frozenset(("Constant", "Num", "Str", "Bytes", "NameConstant", "Ellipsis"))
+# Nodes a changed assertion may not hold, by name: they decide whether or how
+# often its other code runs (and, or, a conditional, a comprehension, a
+# lambda), bind a name (:=), suspend the test, or unpack an iterable.
+PY_UNSAFE = frozenset(("BoolOp", "IfExp", "ListComp", "SetComp", "DictComp", "GeneratorExp", "Lambda", "NamedExpr",
+                       "Await", "Yield", "YieldFrom", "Starred"))
+# pytest.approx(expected, rel, abs): the arguments an exempt change may give another literal.
+PY_TOLERANCES = ("rel", "abs")
+
+
+def _py_chain(node):
+    """node as a dotted name, such as os.path.join, or None when it is not one."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    return ".".join([node.id] + parts[::-1]) if isinstance(node, ast.Name) else None
+
+
+def _py_marks_only(node):
+    """Whether every decorator of node is a pytest mark, which leaves it collected."""
+    return all((_py_chain(d.func if isinstance(d, ast.Call) else d) or "").startswith(("pytest.mark.", "mark."))
+               for d in node.decorator_list)
+
+
+def _python_tests(tree):
+    """The tests pytest collects from a module, by name: top-level test_ functions, and test_ methods of
+    top-level Test classes that have no constructor, with no decorator but pytest marks."""
+    tests = []
+    for node in tree.body:
+        if isinstance(node, PY_DEFS) and node.name.startswith("test_") and _py_marks_only(node):
+            tests.append(node)
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test") and _py_marks_only(node):
+            methods = [n for n in node.body if isinstance(n, PY_DEFS) and n.name.startswith("test_")
+                       and _py_marks_only(n)]
+            rest = [n for n in node.body if n not in methods]
+            if not any(getattr(n, "name", getattr(n, "id", None)) in ("__init__", "__new__")
+                       for statement in rest for n in ast.walk(statement)):
+                tests += methods
+    return tests
+
+
+def _py_coding(lines):
+    """The encoding a line of lines declares that is not UTF-8, or None."""
+    names = (m.group(1) for m in map(PY_CODING.match, lines) if m)
+    return next((n for n in names if n.lower().replace("_", "-") not in ("utf-8", "utf8")), None)
+
+
+def _py_start(node):
+    """A statement's first line: its first decorator's, if it has any (Python 3.7 gives that line, later
+    versions the def or class line)."""
+    return min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+
+
+def _py_body_lines(tree, tests, lines):
+    """The numbers of the lines of lines, the text of tree, inside the body of one of tests.
+
+    A test reaches from its first line to the line before the next statement
+    outside it. Its body's lines are those indented deeper than its def, and
+    blank lines between two of them: indentation, not the line numbers of the
+    body's statements, which Python 3.7 gives as a multi-line string's last.
+    """
+    statements = [n for n in ast.walk(tree) if isinstance(n, ast.stmt)]
+    inside = set()
+    for test in tests:
+        own, start = set(ast.walk(test)), _py_start(test)
+        end = min((_py_start(n) for n in statements if n not in own and _py_start(n) > start),
+                  default=len(lines) + 1)
+        deeper = [i for i in range(start, end) if lines[i - 1].strip(" \t\f")
+                  and len(lines[i - 1]) - len(lines[i - 1].lstrip(" \t\f")) > test.col_offset]
+        if deeper:
+            inside.update(i for i in range(deeper[0], deeper[-1] + 1)
+                          if i in deeper or not lines[i - 1].strip(" \t\f"))
+    return inside
+
+
+def _py_binds_here(node):
+    """The names node itself binds or declares, not those of the nodes inside it, with '*' for a wildcard import."""
+    if isinstance(node, ast.Name):
+        return set() if isinstance(node.ctx, ast.Load) else {node.id}
+    if isinstance(node, ast.arg):
+        return {node.arg}
+    if isinstance(node, ast.alias):
+        return {(node.asname or node.name).split(".")[0]}
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return set(node.names)
+    return {v for f, v in ast.iter_fields(node) if f in ("name", "rest") and isinstance(v, str)}
+
+
+def _py_pytest(tree):
+    """Whether pytest in tree is the pytest module: one top-level import pytest is all that binds or declares
+    the name, nothing assigns or deletes an attribute of it, and no wildcard import may rebind it."""
+    imports = [a for n in tree.body if isinstance(n, ast.Import)
+               for a in n.names if a.name == "pytest" and not a.asname]
+    for n in ast.walk(tree):
+        if n not in imports and {"pytest", "*"} & _py_binds_here(n):
+            return False
+        if (isinstance(n, ast.Attribute) and not isinstance(n.ctx, ast.Load)
+                and (_py_chain(n) or "").startswith("pytest.")):
+            return False
+    return len(imports) == 1
+
+
+def _py_text(node):
+    """Whether node is a string literal."""
+    return type(node).__name__ == "Str" or (type(node).__name__ == "Constant" and isinstance(node.value, str))
+
+
+def _py_number(node):
+    """Whether node is an int or float literal, not a bool or a complex number (Num on Python 3.7)."""
+    if type(node).__name__ not in ("Constant", "Num"):
+        return False
+    return type(node.value if hasattr(node, "value") else node.n) in (int, float)
+
+
+def _py_leaves(node):
+    """The ids of the literals in node, a literal (see _py_masks), or None when it is not one.
+
+    A container's own node is not one of them, so its kind and length stay
+    compared; a minus on an int or float counts as part of the literal, so 5
+    may become -5, but no other unary operator or operand does.
+    """
+    if type(node).__name__ in PY_LITERALS:
+        return {id(node)}
+    if isinstance(node, ast.UnaryOp):
+        return {id(node)} if isinstance(node.op, ast.USub) and _py_number(node.operand) else None
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        parts = node.elts
+    elif isinstance(node, ast.Dict):
+        parts = node.keys + node.values
+    else:
+        return None
+    leaves = [_py_leaves(p) if p is not None else None for p in parts]
+    return None if None in leaves else set().union(*leaves)
+
+
+def _py_masks(node, approx):
+    """The ids of the nodes of the assert statement node an exempt change may give other literals.
+
+    They are its message if that is a string, and, where its test is a
+    comparison, the literals of each literal operand (a constant, a negated
+    number, or a list, tuple, set or dict of literals) and, when approx says
+    pytest is the pytest module, those of a pytest.approx operand's expected
+    value and its rel and abs.
+    """
+    masked = {id(node.msg)} if node.msg is not None and _py_text(node.msg) else set()
+    if not isinstance(node.test, ast.Compare):
+        return masked
+    for operand in [node.test.left] + node.test.comparators:
+        literal = [operand]
+        if approx and isinstance(operand, ast.Call) and _py_chain(operand.func) == "pytest.approx":
+            literal = operand.args[:3] + [k.value for k in operand.keywords if k.arg in PY_TOLERANCES]
+        for part in literal:
+            masked |= _py_leaves(part) or set()
+    return masked
+
+
+def _py_masked(node, masked):
+    """node as text without line numbers, with each node whose id is in masked, and each comparison
+    operator, as a placeholder."""
+    if isinstance(node, list):
+        return "[" + ", ".join(_py_masked(n, masked) for n in node) + "]"
+    if id(node) in masked:
+        return "<literal>"
+    if isinstance(node, ast.cmpop):
+        return "<comparison>"
+    if not isinstance(node, ast.AST):
+        return repr(node)
+    return f"{type(node).__name__}({', '.join(f'{f}={_py_masked(v, masked)}' for f, v in ast.iter_fields(node))})"
+
+
+def _py_assert_change(old, new, name, approx):
+    """Why changing the assert statement old of the test name to new is more than replacing its compared
+    literals, comparison operators and pytest.approx tolerances, or None."""
+    for node in (old, new):
+        if any(type(n).__name__ in PY_UNSAFE for n in ast.walk(node)):
+            return (f"it changes an assertion in {name} that holds an and, or, a conditional expression, a "
+                    "comprehension, a lambda, :=, await, yield or a starred item, which decide what else it runs")
+        if node.msg is not None and not _py_text(node.msg):
+            return (f"it changes an assertion in {name} whose message is not a plain string; the message runs only "
+                    "when the assertion fails")
+        test = node.test
+        if isinstance(test, ast.Compare) and len(test.ops) > 1 and not all(
+                isinstance(o, ast.Name) or _py_leaves(o) for o in [test.left] + test.comparators):
+            return (f"it changes a chained comparison in {name} with an operand that is not a name or a literal, "
+                    "which runs only while the links before it hold")
+    if _py_masked(old, _py_masks(old, approx)) != _py_masked(new, _py_masks(new, approx)):
+        rebound = "" if approx or "pytest.approx" not in {_py_chain(n) for n in ast.walk(new)} else (
+            "; pytest.approx counts only where a top-level import pytest is all that binds pytest")
+        return (f"it changes an assertion in {name} outside a comparison's literal operands, its operators and a "
+                f"pytest.approx tolerance: a name, an attribute, a call or its argument, or the expression's "
+                f"shape{rebound}")
+    return None
+
+
+def _python_test_change(old, new, approx):
+    """Why changing the test old to new is more than replacing assert statements of its own body, each by one
+    that differs only in compared literals, comparison operators and pytest.approx tolerances, or None."""
+    dumps = [[ast.dump(s) for s in test.body] for test in (old, new)]
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, *dumps, autojunk=False).get_opcodes():
+        if op == "equal":
+            continue
+        if i2 - i1 != j2 - j1:
+            return f"it adds, removes or moves a statement in {new.name}"
+        for a, b in zip(old.body[i1:i2], new.body[j1:j2]):
+            if not (isinstance(a, ast.Assert) and isinstance(b, ast.Assert)):
+                return (f"it changes a statement of {new.name} that is not an assert statement of a test's own "
+                        "body: a plain statement, a docstring, or an if, for, while, with or try, even around an "
+                        "assert")
+            why = _py_assert_change(a, b, new.name, approx)
+            if why:
+                return why
+    return None
+
+
+def _py_logical_lines(text):
+    """{line number: (first, last)} of each line of text in a logical line, which blank and comment lines
+    are not."""
+    found, first = {}, None
+    for token in tokenize.generate_tokens(io.StringIO(text).readline):
+        if token.type in (tokenize.COMMENT, tokenize.NL, tokenize.INDENT, tokenize.DEDENT, tokenize.ENDMARKER):
+            continue
+        first = token.start[0] if first is None else first
+        if token.type == tokenize.NEWLINE:
+            found.update((i, (first, token.end[0])) for i in range(first, token.end[0] + 1))
+            first = None
+    return found
+
+
+def _py_line_change(tree, tests, text, changed):
+    """Why changed, the numbers of the changed lines of text, parsed as tree with its tests, are more than the
+    lines of assert statements of the tests' own bodies and comments and blank lines inside them, or None."""
+    lines, logical = text.split("\n")[:-1], _py_logical_lines(text)
+    asserts = {s.lineno for test in tests for s in test.body if isinstance(s, ast.Assert)}
+    starts = collections.Counter(n.lineno for n in ast.walk(tree) if isinstance(n, ast.stmt))
+    bodies = _py_body_lines(tree, tests, lines)
+    for i in sorted(changed):
+        if i not in logical:
+            if i not in bodies:
+                return "it changes a comment or a blank line outside a test body"
+            continue
+        first, last = logical[i]
+        if first not in asserts:
+            return "it changes a line outside an assert statement of a test's own body"
+        if sum(starts[j] for j in range(first, last + 1)) != 1:
+            return "an assert statement it changes shares its line with other code"
+    return None
+
+
+def _python_unexempt(fd):
+    """Why fd, a Python file in a Python test directory of a C/C++ repository, is not exempt, or None.
+
+    Issue #40, the owner's assert-only rule: only an edit in place of a
+    test_*.py or *_test.py module that replaces assert statements of its
+    existing tests' own bodies is exempt, each new assert the removed one
+    with only its compared literals, comparison operators and pytest.approx
+    tolerances changed (_python_test_change). Every other line of the file
+    stays as it was, but for comments and blank lines inside a test body.
+    Every changed line holds only printable ASCII, and the file must be
+    UTF-8 as Python reads it, so the text the guard compares is the code
+    Python runs.
+    """
+    if not is_test_module(fd.path):
+        return "it is not a test_*.py or *_test.py module (a conftest.py or a helper can change any test)"
+    if fd.status != "modified" or fd.mode_changed:
+        return "only an edit in place can be exempt, not a rename, an addition, a deletion or a mode change"
+    sides = _whole_sides(fd)
+    if sides is None:
+        return "the diff does not show the whole file"
+    if any("\r" in text for text in sides):
+        return ("it holds a carriage return inside a line, which Python reads as a line break and git does not, "
+                "so the guard cannot tell which lines are inside a test")
+    coding = _py_coding(sides[0].split("\n") + sides[1].split("\n"))
+    if coding:
+        return f"it declares the source encoding {coding}; the guard reads only UTF-8"
+    if not all(PY_PRINTABLE.fullmatch(l.text) for l in fd.lines if l.kind != " "):
+        return ("a changed line holds a character that is not printable ASCII, such as a tab, a form feed or a "
+                "letter Python reads as an ASCII one")
+    texts = [text.lstrip("﻿") for text in sides]
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            trees = [ast.parse(text) for text in texts]
+            for text in texts:
+                _py_logical_lines(text)
+    except (SyntaxError, ValueError, tokenize.TokenError):
+        return "the guard cannot parse it"
+    tests, skeletons = [_python_tests(tree) for tree in trees], []
+    for tree, side in zip(trees, tests):
+        bodies = [t.body for t in side]
+        for t in side:
+            t.body = []
+        skeletons.append(ast.dump(tree))
+        for t, body in zip(side, bodies):
+            t.body = body
+    if skeletons[0] != skeletons[1]:
+        return ("it changes code outside a test body: a def or class line, a decorator, an import, or module- or "
+                "class-level code")
+    approx = all(_py_pytest(tree) for tree in trees)
+    why = next(filter(None, (_python_test_change(old, new, approx) for old, new in zip(*tests))), None)
+    changed = [{l.old for l in fd.lines if l.kind == "-"}, {l.new for l in fd.lines if l.kind == "+"}]
+    return why or next(filter(None, map(_py_line_change, trees, tests, texts, changed)), None)
+
+
+
+# A C/C++ test source in a test directory of a C/C++ repository (issue #43):
+# what the guard reads, and the narrow change it exempts (see _c_cpp_unexempt).
+#
+# The guard reads the file as tokens, not by line, so a reflowed assertion or
+# a changed comment changes nothing. It fails closed on what could make its
+# tokens differ from the compiler's: a line splice, a trigraph, a digraph, a
+# form feed, a carriage return or other control character, a character
+# outside comments and literals that is not ASCII, an unterminated comment or
+# literal, a stray # or ##, unbalanced brackets, a preprocessor branch that
+# opens or closes a bracket it does not close or open, and __LINE__ or
+# __COUNTER__, whose values move with the lines around them. A comment or raw
+# string runs to its end or to the end of the text, so an unclosed one is read
+# once, not once for each opening after it.
+C_TOKEN = re.compile(r"""
+    (?P<space>[ \t]+)
+  | (?P<newline>\n)
+  | (?P<comment>//[^\n]*|/\*.*?(?:\*/|\Z))
+  | (?P<raw>(?:u8|[uUL])?R"(?P<delim>[^()\\\s]{0,16})\(.*?(?:\)(?P=delim)"|\Z))
+  | (?P<string>(?:u8|[uUL])?"(?:\\[ -~]|[^"\\\n])*")
+  | (?P<char>(?:u8|[uUL])?'(?:\\[ -~]|[^'\\\n])+')
+  | (?P<number>\.?\d(?:[eEpP][-+]|'(?=\w)|[\w.])*)
+  | (?P<name>[A-Za-z_]\w*)
+  | (?P<punct>\.\.\.|<<=|>>=|<=>|->\*|::|->|\+\+|--|<<|>>|<=|>=|==|!=|&&|\|\||[-+*/%&|^]=|\#\#|\.\*
+               |<:|:>|<%|%>|%:|[\]\[{}()\#;:?.,+\-*/%^&|~!=<>])
+""", re.S | re.X | re.A)
+C_DIGRAPHS = {"<:", ":>", "<%", "%>", "%:"}
+# The encoding prefixes of a string or character literal: one the tokenizer reads as a name is one it cannot read.
+C_PREFIXES = {"u8", "u", "U", "L", "R", "u8R", "uR", "UR", "LR"}
+C_SPLICE = re.compile(r"\\[ \t]*$", re.M)
+C_TRIGRAPH = re.compile(r"\?\?[-=/'()!<>]")
+C_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+# What a changed line may hold: printable ASCII and tabs, which C reads as spaces outside literals.
+C_PRINTABLE = re.compile(r"[ -~\t]*")
+C_MOVING = re.compile(r"\b__(?:LINE|COUNTER)__\b")
+C_CONDITIONAL = re.compile(r"#\s*(if|ifdef|ifndef|elif|elifdef|elifndef|else|endif)\b")
+C_DEFINE = re.compile(r"#\s*(?:define|undef)\s+([A-Za-z_]\w*)")
+# The directives that bring in no text, allowed inside a function or other bracket (see _c_branches): the null
+# directive and a GNU line marker (# 7 "x.c") too.
+C_INERT = re.compile(r"#\s*(?:(?:pragma|line|error|warning)\b|\d|$)")
+# What comes before the { of a namespace or extern "C" scope, read backwards: no function body opens there.
+C_SCOPE_HEAD = re.compile(r'^(?:"C(?:\+\+)?" extern|(?:\w+(?: :: \w+)* )?namespace(?: inline)?)(?: |$)')
+C_BRACKETS = {"(": ")", "[": "]", "{": "}"}
+# An int or float literal with a built-in suffix only: an integer's u, l or ll (in either order), a floating
+# literal's f or l. Any other suffix, such as 0f, 1.0ff or 0_wipe, makes a user-defined literal, which calls a
+# literal operator, even one whose name has no leading underscore (compilers only warn). C++23's z is left out:
+# a compiler older than it reads 1z as a user-defined literal.
+C_DIGITS = r"\d(?:'?\d)*"
+C_HEX_DIGITS = r"[\da-fA-F](?:'?[\da-fA-F])*"
+C_NUMBER = re.compile(
+    rf"(?:(?:0[xX]{C_HEX_DIGITS}|0[bB][01](?:'?[01])*|{C_DIGITS})(?:[uU](?:ll|LL|[lL])?|(?:ll|LL|[lL])[uU]?)?"
+    rf"|(?:(?:{C_DIGITS}\.(?:{C_DIGITS})?|\.{C_DIGITS})(?:[eE][-+]?{C_DIGITS})?|{C_DIGITS}[eE][-+]?{C_DIGITS}"
+    rf"|0[xX](?:{C_HEX_DIGITS}(?:\.(?:{C_HEX_DIGITS})?)?|\.{C_HEX_DIGITS})[pP][-+]?{C_DIGITS})[fFlL]?)")
+# The frameworks' own assertion macros, by name, so a project macro such as
+# EXPECT_SKIP_IF or CHECK_OR_IGNORE is not one: Unity's TEST_ASSERT and the
+# TEST_ASSERT_* names built from its words, GoogleTest's EXPECT_* and ASSERT_*
+# (not the mock expectation EXPECT_CALL), and Catch2's and doctest's REQUIRE*
+# and CHECK*. Any may end in _MESSAGE.
+C_UNITY_WORDS = ("TRUE|FALSE|UNLESS|NULL|NOT|EMPTY|EQUAL|BITS|BIT|HIGH|LOW|GREATER|LESS|THAN|OR|EACH|WITHIN|ARRAY|"
+                 "INT|INT8|INT16|INT32|INT64|UINT|UINT8|UINT16|UINT32|UINT64|HEX|HEX8|HEX16|HEX32|HEX64|CHAR|size_t|"
+                 "PTR|STRING|LEN|MEMORY|FLOAT|DOUBLE|IS|INF|NEG|NAN|DETERMINATE")
+C_ASSERT = re.compile(
+    rf"(?:TEST_ASSERT(?:_(?:{C_UNITY_WORDS}))*"
+    r"|(?:EXPECT|ASSERT)_(?:TRUE|FALSE|EQ|NE|LT|LE|GT|GE|STREQ|STRNE|STRCASEEQ|STRCASENE|FLOAT_EQ|DOUBLE_EQ|NEAR"
+    r"|THROW|ANY_THROW|NO_THROW|DEATH|DEBUG_DEATH|EXIT|NO_FATAL_FAILURE|THAT|PRED[1-5]|PRED_FORMAT[1-5])"
+    r"|(?:REQUIRE|CHECK)(?:_(?:FALSE|THAT|THROWS|THROWS_AS|THROWS_WITH|THROWS_MATCHES|NOTHROW|EQ|NE|GT|LT|GE|LE"
+    r"|UNARY|UNARY_FALSE))?)(?:_MESSAGE)?$")
+C_COMPARE = {"==", "!=", "<", "<=", ">", ">="}
+# Tokens that may be a comparison or a template's angle bracket: an argument with more than one is not read
+# as a comparison.
+C_ANGLES = C_COMPARE | {"<<", ">>", "<=>"}
+# Tokens a changed assertion may not hold: they decide whether or how often its other code runs (&&, ||, ?:),
+# assign or step a value, or leave the test.
+C_UNSAFE = {"&&", "||", "?", "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", "++", "--",
+            "and", "or", "not", "and_eq", "or_eq", "xor_eq", "not_eq", "bitand", "bitor", "xor", "compl", "throw",
+            "new", "delete", "co_await", "co_yield", "co_return", "return", "goto", "asm"}
+# Operators that bind looser than a comparison: an operand of a comparison read as one holds none of them at its
+# own level.
+C_LOOSER = {"&", "^", "|", ":"} | C_UNSAFE
+
+# line and end: the lines a token starts and ends on; spaced: whether a space or comment comes before it.
+CToken = collections.namedtuple("CToken", "kind text line spaced end")
+
+
+class CItem:
+    """A top-level item of a C/C++ file: a directive, a namespace or extern "C" scope and the items in it, a
+    function (or a test, a function-like macro with a body), or anything else up to its semicolon."""
+
+    def __init__(self, kind, tokens, header=(), body=(), children=()):
+        self.kind, self.tokens, self.header, self.body, self.children = kind, tokens, header, body, children
+        self.key = (kind, tuple(t.text for t in tokens))
+        self.head = tuple(t.text for t in header)
+        self.test = _c_test_id(self.head) if kind == "function" else None
+
+
+def _c_texts(tokens):
+    return " ".join(t.text for t in tokens)
+
+
+def _c_tokens(text):
+    """The tokens of one side of a C/C++ file, comments dropped and each directive one token, or ValueError
+    saying why the guard cannot read it as the compiler does.
+
+    A directive keeps the spaces between its tokens, as #define F(x) and
+    #define F (x) differ. A name right after a string or character literal
+    is part of it, a user-defined literal.
+    """
+    tokens, directive, pos, line, start, spaced = [], None, 0, 1, True, True
+    while pos < len(text):
+        m = C_TOKEN.match(text, pos)
+        if not m:
+            raise ValueError(f"line {line} holds {text[pos]!r}, which the guard does not read as C/C++ outside a "
+                             "comment or literal, or opens a literal it does not close")
+        kind, value, pos = m.lastgroup, m.group(), m.end()
+        if (kind == "comment" and value.startswith("/*") and (len(value) < 4 or not value.endswith("*/"))) or (
+                kind == "raw" and not value.endswith(")" + m.group("delim") + '"')):
+            raise ValueError(f"line {line} opens a comment or raw string it does not close")
+        if kind == "newline":
+            if directive:
+                tokens.append(CToken("directive", "#" + "".join(directive[1]), directive[0], True, line))
+                directive = None
+            line, start, spaced = line + 1, True, True
+            continue
+        if kind in ("space", "comment"):
+            line, spaced = line + value.count("\n"), True
+            continue
+        kind = "string" if kind == "raw" else kind
+        if value in C_DIGRAPHS:
+            raise ValueError(f"line {line} holds the digraph {value}, which the guard does not read")
+        if kind == "name" and value in C_PREFIXES and text[pos:pos + 1] in ("'", '"'):
+            raise ValueError(f"line {line} holds a literal the guard cannot read")
+        if directive is not None:
+            directive[1].append((" " if spaced and directive[1] else "") + value)
+        elif value == "#" and start:
+            directive = (line, [])
+        elif value in ("#", "##"):
+            raise ValueError(f"line {line} holds a {value} outside a directive")
+        elif kind == "name" and not spaced and tokens and tokens[-1].kind in ("string", "char", "udl"):
+            tokens[-1] = tokens[-1]._replace(kind="udl", text=tokens[-1].text + value)
+        else:
+            tokens.append(CToken(kind, value, line, spaced, line + value.count("\n")))
+        line, start, spaced = line + value.count("\n"), False, False
+    if directive:
+        tokens.append(CToken("directive", "#" + "".join(directive[1]), directive[0], True, line))
+    return tokens
+
+
+def _c_match(tokens, i):
+    """The index of the bracket that closes tokens[i]."""
+    want = []
+    for j in range(i, len(tokens)):
+        text = tokens[j].text
+        if text in C_BRACKETS:
+            want.append(C_BRACKETS[text])
+        elif text in (")", "]", "}"):
+            if not want or want.pop() != text:
+                break
+            if not want:
+                return j
+    raise ValueError("its brackets do not balance")
+
+
+def _c_branches(tokens):
+    """ValueError unless where each bracket, statement and function starts and ends, as the guard reads the file
+    with every preprocessor branch in and no included text, is where the compiler finds it, whichever branches
+    it takes and whatever a directive brings in:
+
+    - each branch of a conditional closes every bracket it opens, and no bracket opened before it, so a branch
+      cannot close one function and open another at the same depth;
+    - each conditional directive comes where a statement or declaration may start, at the text's start or
+      after ;, { or }, so a branch cannot end a statement that the code after it continues (if (x) then a
+      dead ;);
+    - inside a bracket other than a namespace or extern "C" scope (a function body, say), a directive is only
+      a conditional, #pragma, #line, #error, #warning or the null directive: not #include or #embed, whose
+      text may close the function and open another;
+    - the file defines and undefines no macro. The guard reads code as written, not expanded, and a macro can
+      give its code any meaning: close a test and open a helper, paste brace digraphs with ##, or make
+      namespace mean struct. A file of its own macros is not exempt, rather than one trick at a time.
+    """
+    brackets, arms, seen, unopened = [], [], [], 0
+    for t in tokens:
+        if t.kind == "directive":
+            _c_directive(t, brackets, arms, seen[-1] if seen else None)
+            continue
+        if t.text in C_BRACKETS:
+            # Whether the bracket is a namespace or extern "C" scope, read from the tokens before it.
+            brackets.append(t.text == "{" and bool(C_SCOPE_HEAD.match(" ".join(reversed(seen[-12:])))))
+        elif t.text in (")", "]", "}"):
+            if arms and len(brackets) == arms[-1]:
+                raise ValueError("a preprocessor branch closes a bracket opened before it")
+            if brackets:
+                brackets.pop()
+            else:
+                unopened += 1
+        seen.append(t.text)
+    if arms or len(brackets) != unopened:
+        raise ValueError("its brackets or preprocessor conditionals do not pair")
+
+
+def _c_directive(t, brackets, arms, last):
+    """ValueError when the directive t, after the token last, with brackets open (True for a namespace or extern
+    "C" scope) and arms, the bracket count at each open conditional, may move where code starts or ends
+    (_c_branches). Updates arms."""
+    m = C_CONDITIONAL.match(t.text)
+    if not m:
+        defined = C_DEFINE.match(t.text)
+        if defined:
+            raise ValueError(f"line {t.line} defines or undefines the macro {defined.group(1)}; the guard does not "
+                             "expand macros, so it cannot tell where a test starts and ends in a file that has its "
+                             "own")
+        if not all(brackets) and not C_INERT.match(t.text):
+            raise ValueError(f"line {t.line} holds {t.text.split()[0]} inside a bracket, where the text it brings "
+                             "in may end a function and begin another")
+        return
+    if last not in (None, ";", "{", "}"):
+        raise ValueError(f"a preprocessor conditional on line {t.line} comes inside a statement or declaration, "
+                         "where a branch may end or begin it")
+    if m.group(1).startswith("if"):
+        arms.append(len(brackets))
+    elif not arms or arms[-1] != len(brackets):
+        raise ValueError("a preprocessor branch opens or closes a bracket it does not close or open, or its "
+                         "conditionals do not pair")
+    elif m.group(1) == "endif":
+        arms.pop()
+
+
+def _c_items(tokens, lo, hi):
+    """The items of tokens[lo:hi] (see CItem)."""
+    items, i = [], lo
+    while i < hi:
+        if tokens[i].kind == "directive":
+            items.append(CItem("directive", tokens[i:i + 1]))
+            i += 1
+            continue
+        j = i
+        while True:
+            if j >= hi:
+                items.append(CItem("other", tokens[i:hi]))
+                return items
+            text = tokens[j].text
+            if text == ";":
+                items.append(CItem("other", tokens[i:j + 1]))
+                i = j + 1
+                break
+            if text in ("(", "["):
+                j = _c_match(tokens, j) + 1
+                continue
+            if text in (")", "]", "}"):
+                raise ValueError("its brackets do not balance")
+            if text != "{":
+                j += 1
+                continue
+            end = _c_match(tokens, j)
+            head = tokens[i:j]
+            words = [t.text for t in head]
+            if any(t.kind == "directive" for t in head):
+                j = end + 1
+                continue
+            if (words[:1] == ["namespace"] or words[:2] == ["inline", "namespace"]
+                    or words in (["extern", '"C"'], ["extern", '"C++"'])):
+                items.append(CItem("scope", tokens[i:end + 1], head, (), _c_items(tokens, j + 1, end)))
+            elif words and words[-1] == ")":
+                items.append(CItem("function", tokens[i:end + 1], head, tokens[j + 1:end]))
+            else:
+                j = end + 1
+                continue
+            i = end + 1
+            break
+    return items
+
+
+def _c_test_id(head):
+    """The identity of the test a function item's header declares, or None: ("unity", name) for void
+    test_name(void), ("gtest", suite, name) for TEST or TEST_F, and ("case", name) for a Catch2 or doctest
+    TEST_CASE whose arguments are plain strings."""
+    words = list(head[1:] if head[:1] == ("static",) else head)
+    if len(words) in (4, 5) and words[0] == "void" and re.match(r"test_\w*$", words[1]) and words[2] == "(" \
+            and words[3:] in (["void", ")"], [")"]):
+        return ("unity", words[1])
+    if len(words) == 6 and words[0] in ("TEST", "TEST_F") and words[1::2] == ["(", ",", ")"] \
+            and all(re.match(r"[A-Za-z]\w*$", w) for w in words[2::2]):
+        return ("gtest", words[2], words[4])
+    plain = [re.match(r'"(?:\\.|[^"\\])*"$', w) for w in words[2:-1:2]]
+    if words[:2] == ["TEST_CASE", "("] and words[-1] == ")" and len(words) in (4, 6) and all(plain) \
+            and words[3:-1:2] in ([], [","]):
+        return ("case", words[2])
+    return None
+
+
+def _c_flat(items):
+    for item in items:
+        yield item
+        yield from _c_flat(item.children)
+
+
+def _c_statements(body):
+    """The statements of a function body: up to a semicolon or a closing brace at its own level, and each
+    directive at that level."""
+    out, current, depth = [], [], 0
+    for t in body:
+        if t.kind == "directive" and not depth and not current:
+            out.append([t])
+            continue
+        current.append(t)
+        if t.text in C_BRACKETS:
+            depth += 1
+        elif t.text in (")", "]", "}"):
+            depth -= 1
+        if not depth and t.text in (";", "}"):
+            out.append(current)
+            current = []
+    return out + ([current] if current else [])
+
+
+def _c_top(tokens):
+    """The indexes of tokens at their own bracket level."""
+    out, depth = [], 0
+    for i, t in enumerate(tokens):
+        if t.text in (")", "]", "}"):
+            depth -= 1
+        if not depth:
+            out.append(i)
+        if t.text in C_BRACKETS:
+            depth += 1
+    return out
+
+
+def _c_assertion(statement):
+    """(macro, [argument tokens]) when statement is an assertion macro call on its own, NAME(...);, or None."""
+    if len(statement) < 4 or statement[0].kind != "name" or not C_ASSERT.match(statement[0].text) \
+            or statement[1].text != "(" or statement[-1].text != ";" or any(t.kind == "directive" for t in statement) \
+            or _c_match(statement, 1) != len(statement) - 2:
+        return None
+    inner = statement[2:-2]
+    args, last = [], 0
+    for i in _c_top(inner):
+        if inner[i].text == ",":
+            args.append(inner[last:i])
+            last = i + 1
+    return statement[0].text, (args + [inner[last:]]) if inner else []
+
+
+def _c_literal(arg):
+    """The kind of literal arg is, or None: a number (a minus on one counts as part of it), true or false, one
+    or more string literals with the same prefix, or a character literal; a user-defined suffix is not one."""
+    words = [t.text for t in arg]
+    if len(arg) in (1, 2) and arg[-1].kind == "number" and words[:-1] in ([], ["-"]) and C_NUMBER.fullmatch(words[-1]):
+        return "number"
+    if words in (["true"], ["false"]):
+        return "bool"
+    prefixes = {t.text.split(t.text[-1])[0] for t in arg if t.kind in ("string", "char")}
+    if arg and len(prefixes) == 1 and (all(t.kind == "string" for t in arg) or (len(arg) == 1 and arg[0].kind == "char")):
+        return arg[0].kind + ":" + prefixes.pop()
+    return None
+
+
+def _c_operand(tokens):
+    kind = _c_literal(tokens)
+    return (f"<{kind}>",) if kind else tuple(t.text for t in tokens)
+
+
+def _c_masked(arg):
+    """An assertion's argument as text, with a literal argument, and a literal operand and the operator of a
+    comparison that is the whole argument, as placeholders."""
+    top = _c_top(arg)
+    angles = [i for i in top if arg[i].text in C_ANGLES]
+    if len(angles) == 1 and arg[angles[0]].text in C_COMPARE and not any(arg[i].text in C_LOOSER for i in top):
+        left, right = arg[:angles[0]], arg[angles[0] + 1:]
+        if left and right:
+            return _c_operand(left) + ("<comparison>",) + _c_operand(right)
+    return _c_operand(arg)
+
+
+def _c_assert_change(old, new, name):
+    """Why replacing the statement old of the test name with new is more than changing an assertion's literal
+    arguments and the literal operands and operator of a comparison that is a whole argument, or None."""
+    calls = [_c_assertion(s) for s in (old, new)]
+    if None in calls:
+        return (f"it changes a statement of {name} that is not an assertion macro call of the test's own body, "
+                "such as a declaration, a call, or an if, for, while or block, even around an assertion")
+    for statement, (macro, args) in zip((old, new), calls):
+        unsafe = next((t.text for t in statement if t.text in C_UNSAFE), None)
+        if unsafe:
+            return (f"it changes an assertion in {name} that holds {unsafe}, which decides what else it runs, "
+                    "assigns or steps a value, or leaves the test")
+        if re.search(r"MESSAGE|_MSG$", macro):
+            # Unity's message is its macro's last argument. doctest's message is every argument after the first
+            # (CHECK_MESSAGE(cond, ...) logs them all lazily), and so is any other framework's, read as variadic.
+            unity = macro.startswith("TEST_ASSERT")
+            message = args[-1:] if unity else args[1:]
+            if not message or not all((_c_literal(a) or "").startswith("string") for a in message):
+                return (f"it changes an assertion in {name} whose message is not a string literal"
+                        f"{'' if unity else ' in every argument after the first'}; a message may run only when the "
+                        "assertion fails")
+    (old_macro, old_args), (new_macro, new_args) = calls
+    if old_macro != new_macro or len(old_args) != len(new_args) or any(
+            _c_masked(a) != _c_masked(b) for a, b in zip(old_args, new_args)):
+        return (f"it changes an assertion in {name} outside its literal arguments and the literal operands and "
+                "operator of a comparison that is a whole argument: the macro, a name, a call or its argument, or "
+                "the expression's shape")
+    return None
+
+
+def _c_test_change(old, new):
+    """Why changing the existing test old to new is more than replacing assertions of its own body, each by one
+    that differs only in literals and comparison operators (_c_assert_change), or None."""
+    name = _c_test_name(new.test)
+    statements = [_c_statements(old.body), _c_statements(new.body)]
+    keys = [[_c_texts(s) for s in side] for side in statements]
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, *keys, autojunk=False).get_opcodes():
+        if op == "equal":
+            continue
+        if i2 - i1 != j2 - j1:
+            return f"it adds, removes or moves a statement in {name}"
+        for a, b in zip(statements[0][i1:i2], statements[1][j1:j2]):
+            why = _c_assert_change(a, b, name)
+            if why:
+                return why
+    return None
+
+
+def _c_test_name(test):
+    return test[1] if test[0] != "gtest" else f"{test[1]}.{test[2]}"
+
+
+def _c_unreadable(text):
+    """Why the guard cannot read one side of a C/C++ file as the compiler does, or None."""
+    if C_CONTROL.search(text) or "\r" in text:
+        return "it holds a carriage return, form feed or other control character"
+    if C_SPLICE.search(text):
+        return "it splices a line with a backslash at its end"
+    if C_TRIGRAPH.search(text):
+        return "it holds a trigraph"
+    return None
+
+
+def _c_cpp_unexempt(fd):
+    """Why fd, a C/C++ source in a test directory of a C/C++ repository, is not exempt, or None.
+
+    Issue #43: only an edit in place is exempt, and only when, read as
+    tokens, it has the same tests, every item outside their bodies is
+    unchanged, and its change does nothing but replace assertions of an
+    existing test's own body (_c_test_change), each new assertion the old one
+    with only literal arguments and the literal operands and operator of a
+    comparison that is a whole argument changed (_c_assert_change). A new
+    test is not exempt (the owner's decision of 2026-11-06): even of names the
+    file already uses, it can call code that ends the process or write memory
+    the framework reads.
+    """
+    if fd.status != "modified" or fd.mode_changed or fd.modes & LINK_MODES:
+        return "only an edit in place can be exempt, not a rename, an addition, a deletion or a mode change"
+    sides = _whole_sides(fd)
+    if sides is None:
+        return "the diff does not show the whole file"
+    why = next(filter(None, map(_c_unreadable, sides)), None)
+    if why:
+        return why
+    if not all(C_PRINTABLE.fullmatch(l.text) for l in fd.changed()):
+        return "a changed line holds a character that is not printable ASCII or a tab"
+    try:
+        tokens = [_c_tokens(text) for text in sides]
+        for side in tokens:
+            _c_branches(side)
+        items = [_c_items(side, 0, len(side)) for side in tokens]
+    except ValueError as e:
+        return str(e)
+    changed = [{l.old for l in fd.changed("-")}, {l.new for l in fd.changed("+")}]
+    if any(t.kind == "directive" and changed[i] & set(range(t.line, t.end + 1))
+           for i, side in enumerate(tokens) for t in side):
+        return "it changes a directive line, which the guard does not read"
+    if any(t.kind in ("name", "directive") and C_MOVING.search(t.text) for side in tokens for t in side):
+        return "it names __LINE__ or __COUNTER__, whose values move with the lines around them"
+    tests = [[i for i in _c_flat(side) if i.test] for side in items]
+    old = {i.test for i in tests[0]}
+    if len(old) != len(tests[0]) or len({i.test for i in tests[1]}) != len(tests[1]):
+        return "it defines a test twice"
+    removed = next((i for i in tests[0] if i.test not in {i.test for i in tests[1]}), None)
+    if removed:
+        return f"it removes a test or renames it: {_c_test_name(removed.test)}"
+    added = next((i for i in tests[1] if i.test not in old), None)
+    if added:
+        return (f"it adds the test {_c_test_name(added.test)}; a new test can run any code the file reaches, so "
+                "it is not exempt")
+    return _c_pair(items[0], items[1])
+
+
+def _c_pair(old, new):
+    """Why the items new are more than the items old with assertions replaced in existing tests, or None."""
+    if len(new) != len(old):
+        return "it adds, removes or moves code outside a test body, or removes a test"
+    for a, b in zip(old, new):
+        if a.key == b.key:
+            continue
+        if a.kind == b.kind == "scope" and a.head == b.head:
+            why = _c_pair(a.children, b.children)
+        elif a.kind == b.kind == "function" and a.head == b.head and a.test:
+            why = _c_test_change(a, b)
+        else:
+            why = ("it changes code outside a test body: a test's header, a helper, a fixture, a declaration, a "
+                   "directive or a runner")
+        if why:
+            return why
+    return None
+
+
 def c_cpp_hits(files, facts, flagged):
     """removed-tests hits for a C/C++ repository's changes that may change which tests run or what they include.
 
@@ -576,7 +1447,26 @@ def c_cpp_hits(files, facts, flagged):
         if not _touched(fd) or fd.path in flagged or fd.path in facts.blind:
             continue
         if any(_at_test_dir(p) for p in fd.paths):
+            if all(_python_test(p, facts) for p in fd.paths):
+                why = _python_unexempt(fd)
+                if why:
+                    hits.append(Hit("removed-tests", fd.path, None, f"{fd.status} a Python test file of a C/C++ "
+                                    f"repository: {why}; only replacing compared literals or comparison operators in "
+                                    "assert statements of existing tests is exempt, so this needs approval"))
+                continue
+            if fd.status == "modified" and all(_ext(p) in C_EXTS for p in fd.paths):
+                why = _c_cpp_unexempt(fd)
+                if why:
+                    hits.append(Hit("removed-tests", fd.path, None, f"modified a C/C++ test source of a C/C++ "
+                                    f"repository: {why}; only replacing literals or comparison operators in "
+                                    "assertions of existing tests is exempt, so this needs approval"))
+                continue
             detail = f"{fd.status} a file in a test directory of a C/C++ repository"
+        elif any(_name(p) == "cmakelists.txt" or _ext(p) == ".cmake" for p in fd.paths):
+            hits.append(Hit("removed-tests", fd.path, None, f"{fd.status} a CMake file of a C/C++ repository, which "
+                            "can register or drop CTest tests; the guard does not read CMake, so this needs approval "
+                            "whatever the change"))
+            continue
         elif fd.modes & {"160000"}:
             detail = f"{fd.status} a submodule of a C/C++ repository, which may hold sources or headers"
         elif fd.status != "modified" and any(_ext(p) in C_FILE_EXTS for p in fd.paths):
@@ -789,6 +1679,12 @@ LINT_SECTIONS = ("tool.ruff", "tool.pylint", "tool.flake8", "flake8", "pylint", 
 COVERAGE_LINE = re.compile(
     r"fail[_-]under|coverageThreshold|check-coverage|checkCoverage|jacocoTestCoverageVerification"
     r"|<minimum>|\bCOVEREDRATIO\b|\bMISSEDRATIO\b|\bMISSEDCOUNT\b|<haltOnFailure>", re.I)
+COVERAGE_FLOOR_NAME = re.compile(r"\bCOVERAGE_FLOOR\b")
+# Configs a tool finds by name and place; one that moves is a coverage edit when it holds coverage settings.
+COVERAGE_CONFIG_NAMES = re.compile(
+    r"^(pyproject\.toml|setup\.cfg|tox\.ini|package\.json|pom\.xml|build\.gradle(\.kts)?"
+    r"|(jest|vitest|vite|karma)\.conf(ig)?\.[cm]?[jt]s(on)?)$")
+COVERAGE_TEXT = re.compile(r"coverage|covered|jacoco|fail[_-]under|\bc8\b|\bnyc\b|--cov\b", re.I)
 JS_THRESHOLD = re.compile(r"^\s*[\"']?(?:lines|branches|functions|statements)[\"']?\s*:\s*-?\d|\bthresholds\s*:")
 GRADLE_MINIMUM = re.compile(r"\bminimum\s*=")
 LINT_DISABLE = re.compile(
@@ -799,19 +1695,80 @@ BUDGET_KEYS = "maxAssetSize|maxEntrypointSize|maximumWarning|maximumError|maxNum
 BUDGET_FILE_KEYS = "limit|budget|maxSize|maxBytes|max_bytes"
 BUDGET_FILES = re.compile(
     r"^(\.size-limit.*|package\.json|\.?bundlewatch.*|\.bundlesizerc.*|budgets?\..*|\.?lighthouserc.*)$")
+# A file named for budgets ("size-budget.json", "perf_budgets.yaml") holds nothing else, so any numeric key in it is one.
+BUDGET_WORD_FILES = re.compile(r"(?:^|[-_.])budgets?(?:[-_.]|$)", re.I)
+# A JaCoCo floor set as a property, in a pom.xml's <properties> or a .properties file. Where the floor
+# parser reads a pom.xml whole, a change to one is judged by its value instead (see _jacoco_floors).
+JACOCO_PROPERTY_LINE = re.compile(r"\bjacoco\.minimum\.\w")
+# A jacoco.minimum.* property's opening or closing tag in a pom.xml, which may carry whitespace or attributes,
+# or run on past the end of its line.
+JACOCO_PROPERTY_TAG = re.compile(r"<(/?)jacoco\.minimum\.[\w.\-]+(?:\b[^>]*?(/?)>|[^>]*$)")
+# In a .properties file, a line that continues onto the next (an odd run of trailing backslashes), and one
+# that starts a key or a comment rather than continuing a value.
+PROPERTIES_CONTINUED = re.compile(r"(?<!\\)(?:\\\\)*\\$")
+PROPERTIES_KEY = re.compile(r"^\s*(?:[A-Za-z_][\w.\-]*(?:\s*[:=]|\s+\S|\s*$)|[#!])")
 JS_CONFIG_JSON = re.compile(r"^(package\.json|.*(config|rc)\.jsonc?)$")
 KEY_LINE = re.compile(r"^\s*[\"']?([\w.\-/@]+)[\"']?\s*[:=]")
-SIZE_UNITS = {"": 1, "b": 1, "kb": 1e3, "kib": 1024, "mb": 1e6, "mib": 2 ** 20, "gb": 1e9,
+SIZE_UNITS = {"": 1, "b": 1, "kb": 10 ** 3, "kib": 1024, "mb": 10 ** 6, "mib": 2 ** 20, "gb": 10 ** 9,
               "gib": 2 ** 30, "ms": 1, "s": 1000}
+# Budget values are compared as exact decimals, never floats, which would read 1e-400 and 2e-400 both as 0.0
+# and 1e400 and 2e400 both as infinity. A number longer than BUDGET_DIGITS, or one this context can't hold
+# exactly once scaled by its unit, can't be compared.
+BUDGET_DIGITS = 100
+BUDGET_CONTEXT = decimal.Context(prec=BUDGET_DIGITS + 20, Emax=10_000, Emin=-10_000, traps=[])
+BUDGET_LOSSY = (decimal.Inexact, decimal.Rounded, decimal.Overflow, decimal.Underflow, decimal.Subnormal,
+                decimal.Clamped, decimal.InvalidOperation)
+
+
+# A number read whole, exponent and all, then its unit and anything else that runs on from it; a number
+# followed by more than a unit the guard knows ("12 tiles", "1.2.3", "0x1F") can't be compared.
+BUDGET_NUMBER = r"(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
+BUDGET_UNIT = r"(\s*[\w.%]*)"
+# A value alone on its line, which belongs to an empty-valued key on the line before it (JSON or YAML),
+# matched once _bare_budget has removed its comment, trailing comma, quotes and whitespace. Its unit can't
+# start with a digit unless whitespace parts it from the number, so no two parts can take the same
+# characters and a failed match backtracks in linear time.
+BUDGET_BARE = re.compile(BUDGET_NUMBER + r"((?:\s*[^\W\d.%]|\s*[.%]|\s+\d)[\w.%]*)?")
+# A number standing as a value, not part of a name or a longer token ("v2", "es2020").
+BUDGET_ANY_NUMBER = re.compile(r"(?<![\w.\-])-?(?:\d+(?:\.\d*)?|\.\d+)")
+BUDGET_COMMENT = re.compile(r"(?:^|\s)(?:#|//).*$")
 
 
 def _budget_re(path):
-    keys = BUDGET_KEYS + ("|" + BUDGET_FILE_KEYS if BUDGET_FILES.match(_name(path)) else "")
-    return re.compile(r"[\"']?\b(" + keys + r")[\"']?\s*[:=]\s*[\"']?(-?\d+(?:\.\d+)?)\s*([A-Za-z]*)")
+    """(a key and its value on one line, a key whose value is on the next) for the budget keys path holds."""
+    if BUDGET_WORD_FILES.search(_name(path)):
+        # Any key, as KEY_LINE spells one, where a key may start: a line, a flow mapping or a list.
+        start, key = r"(?:^|(?<=[\s{,\[]))[\"']?", r"([\w.\-/@]+)"
+    else:
+        keys = BUDGET_KEYS + ("|" + BUDGET_FILE_KEYS if BUDGET_FILES.match(_name(path)) else "")
+        start, key = r"[\"']?\b", r"(" + keys + r")"
+    sep = r"[\"']?\s*[:=]\s*"
+    return (re.compile(start + key + sep + r"[\"']?" + BUDGET_NUMBER + BUDGET_UNIT),
+            re.compile(r"^\s*(?:-\s+)?" + start + key + sep + "$"))
 
 
 def _budget_value(number, unit):
-    return float(number) * SIZE_UNITS.get(unit.lower(), 1)
+    """The number in bytes or milliseconds as an exact decimal, or None when its unit is one the guard
+    doesn't know or the number can't be held exactly (see BUDGET_CONTEXT)."""
+    unit = (unit or "").strip().lower()
+    if unit not in SIZE_UNITS or len(number) > BUDGET_DIGITS:
+        return None
+    context = BUDGET_CONTEXT.copy()
+    value = context.multiply(context.create_decimal(number), SIZE_UNITS[unit])
+    return None if any(context.flags[f] for f in BUDGET_LOSSY) else value
+
+
+def _bare_budget(text):
+    """(number, unit, the number's span in text) for a budget value alone on its line, or None."""
+    body = BUDGET_COMMENT.sub("", text).rstrip()
+    body = body[:-1].rstrip() if body.endswith(",") else body
+    body = body[:-1].rstrip() if body.endswith(("'", '"')) else body
+    offset = len(body) - len(body.lstrip())
+    if body.startswith(("'", '"'), offset):
+        offset += 1
+    offset += len(body[offset:]) - len(body[offset:].lstrip())
+    m = BUDGET_BARE.fullmatch(body, offset)
+    return (m.group(1), m.group(2), m.span(1)) if m else None
 
 
 def _lint_hits(fd, lines):
@@ -847,29 +1804,671 @@ def _lint_hits(fd, lines):
     return hits
 
 
+def _side_runs(fd, side):
+    """The lines of one side of fd ("-" or "+"), as (index, line) runs the diff shows unbroken,
+    each with whether it starts at the file's first line."""
+    runs, last = [], None
+    for i, l in enumerate(fd.lines):
+        if l.kind not in (" ", side):
+            continue
+        n = l.old if side == "-" else l.new
+        if last is None or n != last + 1:
+            runs.append((n == 1, []))
+        runs[-1][1].append((i, l))
+        last = n
+    return runs
+
+
+def _budget_entries(fd, regex, key_only):
+    """Each changed side's budget values, as (key, value line text, value, index, number's span) by side.
+
+    A value is a key's with it on the line, or alone on the line right after a key with none; the
+    second counts when either of its two lines changed.
+    """
+    out = {"-": [], "+": []}
+    for side in out:
+        for _, run in _side_runs(fd, side):
+            key = None
+            for i, l in run:
+                bare = _bare_budget(l.text) if key else None
+                if bare and (l.kind != " " or key[1].kind != " "):
+                    out[side].append((key[0], l.text.strip(), _budget_value(bare[0], bare[1]), i, bare[2]))
+                if l.kind != " ":
+                    out[side] += [(m.group(1), l.text.strip(), _budget_value(m.group(2), m.group(3)), i, m.span(2))
+                                  for m in regex.finditer(l.text)]
+                m = key_only.match(l.text)
+                key = (m.group(1), l) if m else None
+    return out
+
+
 def _budget_hits(fd):
-    regex = _budget_re(fd.path)
-    removed, added = _cancel_pairs(fd.changed("-"), fd.changed("+"), key=lambda l: l.text.strip())
+    regex, key_only = _budget_re(fd.path)
+    entries = _budget_entries(fd, regex, key_only)
+    removed, added = _cancel_pairs(entries["-"], entries["+"], key=lambda e: e[:2])
     old, new = collections.defaultdict(list), collections.defaultdict(list)
-    for lines, out in ((removed, old), (added, new)):
-        for l in lines:
-            for m in regex.finditer(l.text):
-                out[m.group(1)].append((_budget_value(m.group(2), m.group(3)), l))
+    for items, out in ((removed, old), (added, new)):
+        for e in items:
+            out[e[0]].append(e)
     hits = []
     for key in sorted(set(old) | set(new)):
-        for (before, _), (after, l) in zip(old[key], new[key]):
-            if after > before:
+        for before, after in zip(old[key], new[key]):
+            l = fd.lines[after[3]]
+            if before[2] is None or after[2] is None:
+                if before[1] != after[1]:
+                    hits.append(Hit("gate-config", fd.path, l.new, f"budget changed: {_snippet(l.text)}"))
+            elif after[2] > before[2]:
                 hits.append(Hit("gate-config", fd.path, l.new, f"budget raised: {_snippet(l.text)}"))
         if len(old[key]) > len(new[key]):
             hits.append(Hit("gate-config", fd.path, None, f"budget removed: {key}"))
+    if BUDGET_WORD_FILES.search(_name(fd.path)):
+        hits += _unread_budget_hits(fd, entries)
     return hits
 
 
-def gate_config_hits(files):
+def _unread_budget_hits(fd, entries):
+    """In a budget file every number is a budget: a changed number the guard can't pair with a key (a list
+    item, a value whose key the diff doesn't show) is a hit whatever its direction, once per change block."""
+    read = collections.defaultdict(list)
+    for side in entries.values():
+        for e in side:
+            read[e[3]].append(e[4])
+    removed, added = _cancel_pairs(fd.changed("-"), fd.changed("+"), key=lambda l: l.text.strip())
+    kept = set(map(id, removed + added))
+
+    def unread(i, l):
+        text = BUDGET_COMMENT.sub("", l.text)
+        return id(l) in kept and any(not any(a <= m.start() < b for a, b in read[i])
+                                     for m in BUDGET_ANY_NUMBER.finditer(text))
+    hits, block = [], []
+    for i, l in enumerate(fd.lines + [Line(" ", None, None, "")]):
+        if l.kind != " ":
+            block.append((i, l))
+            continue
+        flagged = [b for b in block if unread(*b)]
+        if flagged:
+            first = next((b for _, b in flagged if b.kind == "+"), flagged[0][1])
+            hits.append(Hit("gate-config", fd.path, first.new, f"budget changed: {_snippet(first.text)}"))
+        block = []
+    return hits
+
+
+# ------------------------------------------------------------- coverage floors
+#
+# A floor is a number a coverage tool fails below. Each side of a file is read
+# whole, and its floors are compared by key: an ini section and key, a JSON
+# path, a JaCoCo rule's scope, counter and value, or a flag or variable name.
+# A floor lowered or removed is a floor-lowered hit. A changed line that does
+# nothing but change floors, or add or remove a line that holds only a floor,
+# is not a gate-config hit; any other coverage-config edit still is, and so is
+# any other changed line in an nyc or c8 block or a JaCoCo plugin. Where the
+# guard can't tell a floor is active (a quoted example, a docstring, a
+# heredoc) or which JaCoCo rule it gates, nothing about it is exempt.
+
+# key: what the floor gates; label: the key as a hit names it; raw: the number as
+# written; line: 0-based line on its side; start/end: the number's columns; pure:
+# the line holds nothing but this floor, so adding or removing it changes only the floor.
+Floor = collections.namedtuple("Floor", "key label raw value line start end pure")
+FLOOR_NUMBER = r"(\d+(?:\.\d+)?)"
+# A number that runs on into more of a value ("90${X}", "9.2e1", "80%" outside JaCoCo) is not a floor.
+FLOOR_END = r"(?![\w.%$])"
+INI_FLOOR_SECTIONS = {".coveragerc": ("report", "coverage:report"), "setup.cfg": ("coverage:report",),
+                      "tox.ini": ("coverage:report",), "pyproject.toml": ("tool.coverage.report",)}
+# An ini key starts its line (an indented line continues the value above); a TOML key may be indented.
+INI_FAIL_UNDER = re.compile(r"^fail_under\s*[=:]\s*" + FLOOR_NUMBER + r"\s*(?:[#;].*)?$", re.I)
+TOML_FAIL_UNDER = re.compile(r"^\s*fail_under\s*=\s*" + FLOOR_NUMBER + r"\s*(?:#.*)?$")
+# (label, pattern, pure line): floors written the same way in any file.
+FLAG_FLOORS = [
+    ("--cov-fail-under", re.compile(r"--cov-fail-under(?:=|\s+)[\"']?" + FLOOR_NUMBER + FLOOR_END), None),
+    (None, re.compile(r"(--fail-under-(?:lines?|branch(?:es)?|functions?|regions|decisions?))(?:=|\s+)[\"']?"
+                      + FLOOR_NUMBER + FLOOR_END), None),
+    ("COVERAGE_FLOOR", re.compile(r"\bCOVERAGE_FLOOR[\"']?\s*[:=]\s*[\"']?" + FLOOR_NUMBER + FLOOR_END
+                                  + r"|\$\{COVERAGE_FLOOR:-" + FLOOR_NUMBER + r"\}"),
+     re.compile(r"^\s*(?:export\s+)?COVERAGE_FLOOR\s*[:=]\s*([\"']?)\d+(?:\.\d+)?\1\s*(?:#.*)?$")),
+]
+COVERAGE_JSON = re.compile(r"^(\.c8rc|\.nycrc)(\.json)?$")
+THRESHOLD_KEYS = ("lines", "branches", "functions", "statements")
+JSON_TOKEN = re.compile(r'\s*(?:("(?:[^"\\]|\\.)*")|(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)|([{}\[\]:,])|(true|false|null))')
+JSON_FLOOR_LINE = re.compile(r'^\s*"\w+"\s*:\s*\d+(?:\.\d+)?\s*,?\s*$')
+CLI_COVERAGE = re.compile(r"\b(c8|nyc)\b.*--check-coverage\b|--check-coverage\b.*\b(c8|nyc)\b")
+CLI_FLOOR = re.compile(r"--(lines|branches|functions|statements)(?:=|\s+)" + FLOOR_NUMBER + FLOOR_END)
+XML_COMMENT = re.compile(r"<!--.*?-->", re.S)
+JACOCO_RULE = re.compile(r"<rule\b[^>]*>(.*?)</rule>", re.S)
+JACOCO_LIMIT = re.compile(r"<limit\b[^>]*>(.*?)</limit>", re.S)
+JACOCO_TAG = "<{0}>\\s*([\\w.]+)\\s*</{0}>"
+JACOCO_MINIMUM = re.compile(r"<minimum>\s*(?:" + FLOOR_NUMBER + r"(%?)|\$\{([\w.\-]+)\})\s*</minimum>")
+POM_PROPERTIES = re.compile(r"<properties>(.*?)</properties>", re.S)
+POM_PROPERTY = re.compile(r"<([\w.\-]+)>\s*" + FLOOR_NUMBER + r"(%?)\s*</\1>")
+# A child module sets the property its parent's <minimum> names, so a floor property is also known by its name.
+FLOOR_PROPERTY = re.compile(r"^(?!.*version)(?=.*(?:jacoco|coverage))(?=.*(?:min|floor|threshold))", re.I)
+XML_FLOOR_LINE = re.compile(r"^\s*<([\w.\-]+)>\s*\d+(?:\.\d+)?%?\s*</\1>\s*$")
+JACOCO_PLUGIN = re.compile(r"<plugin\b[^>]*>((?:(?!</plugin>).)*?jacoco(?:(?!</plugin>).)*)</plugin>", re.S | re.I)
+JACOCO_VERSION_LINE = re.compile(r"^\s*<version>[^<]*</version>\s*$")
+POM_REFERENCE = re.compile(r"\$\{([\w.\-]+)\}")
+# Where a JaCoCo rule sits: the profile, pluginManagement and execution around it, each found by its <id>.
+POM_SCOPES = (("profile", re.compile(r"<profile\b[^>]*>(.*?)</profile>", re.S)),
+              ("pluginManagement", re.compile(r"<pluginManagement\b[^>]*>(.*?)</pluginManagement>", re.S)),
+              ("execution", re.compile(r"<execution\b[^>]*>(.*?)</execution>", re.S)))
+# What a scope's own <id> is not: the children that hold <id>s of their own.
+POM_NESTED_IDS = re.compile(r"<(build|configuration|repositories|pluginRepositories|distributionManagement"
+                            r"|reporting|dependencyManagement|dependencies)\b[^>]*>.*?</\1>", re.S)
+POM_ID = re.compile(r"<id>\s*([^<]*?)\s*</id>")
+# Formats whose comments the guard strips before it reads COVERAGE_FLOOR and the flag floors.
+C_STYLE_EXTS = JS_EXTS | JVM_EXTS | {".gradle", ".kts", ".go", ".rs", ".cs", ".swift", ".c", ".cc", ".cpp", ".h",
+                                     ".hpp", ".php"}
+STRUCTURED_EXTS = {".toml", ".yml", ".yaml"}
+HEREDOC = re.compile(r"<<-?\s*[\"']?[A-Za-z_]\w*")
+# A quoted string that is a whole value of a TOML or YAML key, or an item of a list, is data the tool reads.
+QUOTED_VALUE = re.compile(r"^\s*(?:-\s+)?(?:(?:[\w.\-]+|\"[^\"]*\"|'[^']*')\s*[=:]\s*)?"
+                          r"(?:\[(?:\s*(?:\"[^\"]*\"|'[^']*')\s*,)*\s*)?$")
+
+
+def _floor(key, label, i, m, group):
+    return Floor(key, label, m.group(group), float(m.group(group)), i, m.start(group), m.end(group), False)
+
+
+def _ini_floors(path, lines):
+    name = _name(path)
+    sections = INI_FLOOR_SECTIONS.get(name)
+    if sections is None:
+        return []
+    regex = TOML_FAIL_UNDER if name == "pyproject.toml" else INI_FAIL_UNDER
+    out, section = [], ""
+    for i, text in enumerate(lines):
+        m = SECTION_RE.match(text)
+        if m:
+            section = m.group(1)
+            continue
+        m = regex.match(text)
+        if m and section in sections:
+            out.append(_floor(("fail_under", section), f"fail_under in [{section}]", i, m, 1)._replace(
+                pure=True))
+    return out
+
+
+# floors: the Floors of one side of a file; blocks: its lines in an nyc or c8 block or a JaCoCo plugin, or
+# that set a property a JaCoCo plugin names, where any change but a floor's is a coverage edit; tainted: keys of
+# floors the guard saw but can't tell are active, so no line that sets one is exempt.
+Side = collections.namedtuple("Side", "floors blocks tainted")
+
+
+def _line_starts(lines):
+    starts = [0]
+    for text_line in lines:
+        starts.append(starts[-1] + len(text_line) + 1)
+    return starts
+
+
+def _floor_format(path):
+    name, ext = _name(path), _ext(path)
+    if ext == ".json" or name == "package.json" or COVERAGE_JSON.match(name):
+        return "json"
+    if ext == ".xml":
+        return "xml"
+    if ext in C_STYLE_EXTS:
+        return "c"
+    if is_ini(path) and ext != ".toml":
+        return "ini"
+    return "script"
+
+
+def _contexts(text, fmt):
+    """Each character of text as code (" "), comment ("#") or quoted (its quote character); None when a
+    string or block comment runs on past its line, which the guard can't follow."""
+    out = [" "] * len(text)
+    if fmt == "xml":
+        for m in XML_COMMENT.finditer(text):
+            out[m.start():m.end()] = "#" * (m.end() - m.start())
+    if fmt in ("json", "xml"):
+        return "".join(out)
+    quotes = "" if fmt == "ini" else "\"'`" if fmt == "c" else "\"'"
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        at_word = i == 0 or text[i - 1] in " \t\n"
+        if c == "\\" and fmt != "ini":
+            i += 2
+        elif c in quotes:
+            j = i + 1
+            while j < n and text[j] not in (c, "\n"):
+                j += 2 if text[j] == "\\" else 1
+            if j >= n or text[j] != c:
+                return None
+            out[i:j + 1] = c * (j + 1 - i)
+            i = j + 1
+        elif ((fmt in ("script", "ini") and c == "#" and at_word) or (fmt == "ini" and c == ";" and at_word)
+              or (fmt == "c" and text.startswith("//", i))):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            out[i:j] = "#" * (j - i)
+            i = j
+        elif fmt == "c" and text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            if j < 0:
+                return None
+            out[i:j + 2] = "#" * (j + 2 - i)
+            i = j + 2
+        else:
+            i += 1
+    return "".join(out[:n])
+
+
+def _flag_floors(path, lines):
+    """The Side of COVERAGE_FLOOR and the flag floors of a file, or None when one may sit in a string or
+    comment that spans lines (a docstring, a heredoc), where the guard can't tell whether it is active.
+
+    A floor in a comment is no floor. A quoted one is active only as a whole TOML or YAML value or a list
+    item, or as ${COVERAGE_FLOOR:-N} in double quotes, which a shell expands; any other is tainted.
+    """
+    found = [(i, label, regex, pure, m) for i, text in enumerate(lines)
+             for label, regex, pure in FLAG_FLOORS for m in regex.finditer(text)]
+    if not found:
+        return Side([], set(), set())
+    fmt = _floor_format(path)
+    text = "\n".join(lines)
+    context = None if fmt == "script" and HEREDOC.search(text) else _contexts(text, fmt)
+    if context is None:
+        return None
+    starts = _line_starts(lines)
+    out, tainted = [], set()
+    for i, label, regex, pure, m in found:
+        group = 2 if label is None or m.group(1) is None else 1
+        name = label or m.group(1)
+        at = starts[i] + m.start()
+        where = context[at]
+        if where == "#":
+            continue
+        if where != " ":
+            opening = at
+            while opening > starts[i] and context[opening - 1] == where:
+                opening -= 1
+            expanded = where == '"' and m.group(0).startswith("${")
+            value = _ext(path) in STRUCTURED_EXTS and QUOTED_VALUE.match(lines[i][:opening - starts[i]])
+            if not (expanded or value):
+                tainted.add((name,))
+                continue
+        out.append(_floor((name,), name, i, m, group)._replace(pure=bool(pure and pure.match(lines[i]))))
+    return Side(out, set(), tainted)
+
+
+def _json_scalars(text, tokens=None):
+    """(path, token, offset) of each scalar of a JSON document that json.loads accepts; tokens, when given,
+    gets the (path, offset) of every token."""
+    out, stack, pos, expect_key = [], [], 0, False
+    m = JSON_TOKEN.match(text, pos)
+    while m and m.end() > pos:
+        pos = m.end()
+        string, number, punct, literal = m.groups()
+        if punct in ("{", "["):
+            stack.append([punct, None if punct == "{" else 0])
+            expect_key = punct == "{"
+        elif punct in ("}", "]"):
+            stack.pop()
+            expect_key = False
+        elif punct == ":":
+            expect_key = False
+        elif punct == ",":
+            if stack[-1][0] == "[":
+                stack[-1][1] += 1
+            else:
+                expect_key = True
+        elif expect_key:
+            stack[-1][1] = json.loads(string)
+        else:
+            out.append((tuple(e[1] for e in stack), string or number or literal, m.start(m.lastindex)))
+        if tokens is not None:
+            tokens.append((tuple(e[1] for e in stack), m.start(m.lastindex)))
+        m = JSON_TOKEN.match(text, pos)
+    return out
+
+
+def _no_duplicate_keys(pairs):
+    keys = [k for k, _ in pairs]
+    if len(set(keys)) != len(keys):
+        raise ValueError("duplicate key")
+    return dict(pairs)
+
+
+def _json_floors(path, lines):
+    """The Side of the c8/nyc floors of package.json, .c8rc or .nycrc; None when one of those is not plain JSON."""
+    name = _name(path)
+    if name != "package.json" and not COVERAGE_JSON.match(name):
+        return Side([], set(), set())
+    text = "\n".join(lines)
+    try:
+        json.loads(text, object_pairs_hook=_no_duplicate_keys)
+    except ValueError:
+        return None
+    starts = _line_starts(lines)
+    out, tokens = [], []
+    for path_keys, token, offset in _json_scalars(text, tokens):
+        i = bisect.bisect_right(starts, offset) - 1
+        col = offset - starts[i]
+        if name == "package.json" and len(path_keys) == 2 and path_keys[0] == "scripts" and token.startswith('"'):
+            tool = CLI_COVERAGE.search(token)
+            for m in CLI_FLOOR.finditer(token) if tool else ():
+                label = f"scripts.{path_keys[1]} {tool.group(1) or tool.group(2)} --{m.group(1)}"
+                out.append(Floor((label,), label, m.group(2), float(m.group(2)), i, col + m.start(2),
+                                 col + m.end(2), False))
+            continue
+        if not re.fullmatch(r"\d+(?:\.\d+)?", token):
+            continue
+        if name == "package.json":
+            if len(path_keys) != 2 or path_keys[0] not in ("c8", "nyc") or path_keys[1] not in THRESHOLD_KEYS:
+                continue
+            label = f"{path_keys[0]}.{path_keys[1]}"
+        elif len(path_keys) == 1 and path_keys[0] in THRESHOLD_KEYS:
+            label = f"{path_keys[0]} in {name}"
+        else:
+            continue
+        out.append(Floor((label,), label, token, float(token), i, col, col + len(token),
+                         bool(JSON_FLOOR_LINE.match(lines[i]))))
+    blocks = set()
+    if name == "package.json":
+        blocks = {bisect.bisect_right(starts, offset) - 1 for path_keys, offset in tokens
+                  if path_keys and path_keys[0] in ("c8", "nyc")}
+    return Side(out, blocks, set())
+
+
+def _xml_value(body, tag, default):
+    """The one <tag> value of body, default when it has none, or None when the guard can't read it."""
+    count = body.count(f"<{tag}>")
+    if not count:
+        return default
+    m = re.search(JACOCO_TAG.format(tag), body)
+    return m.group(1) if m and count == 1 else None
+
+
+def _pom_scope_id(kind, body):
+    """The <id> of a profile or execution, "default" for an execution with none, or None when it can't be told."""
+    if kind == "pluginManagement":
+        return ""
+    ids = POM_ID.findall(POM_NESTED_IDS.sub("", body))
+    if kind == "execution" and not ids:
+        return "default"
+    return ids[0] if len(ids) == 1 and "$" not in ids[0] else None
+
+
+def _jacoco_scope(body, around):
+    """(key, element, label suffix) of the classes a JaCoCo rule gates, or None when the guard can't tell them apart."""
+    outside = JACOCO_LIMIT.sub("", body)
+    element = _xml_value(outside, "element", "BUNDLE")
+    patterns = {tag: re.findall(f"<{tag}>\\s*([^<]*?)\\s*</{tag}>", outside) for tag in ("include", "exclude")}
+    if (element is None or any(scope_id is None for _, scope_id in around)
+            or any(outside.count(f"<{tag}>") != len(found) or any(re.search(r"[$@]\{", p) for p in found)
+                   for tag, found in patterns.items())):
+        return None
+    where = "".join(f" in {kind}" + (f" {scope_id}" if scope_id else "") for kind, scope_id in around)
+    includes, excludes = (tuple(sorted(patterns[tag])) for tag in ("include", "exclude"))
+    where += f" for includes {', '.join(includes)}" if includes else ""
+    where += f" excluding {', '.join(excludes)}" if excludes else ""
+    return (tuple(around), element, includes, excludes), element, where
+
+
+def _jacoco_floors(path, lines):
+    """The Side of a pom.xml: its JaCoCo <minimum> floors, by rule scope, counter and value, its floor
+    properties, and the lines of its JaCoCo plugins and of the properties they name."""
+    if _name(path) != "pom.xml":
+        return Side([], set(), set())
+    # Comments become spaces, so a commented-out limit is no floor and offsets still match the lines.
+    text = XML_COMMENT.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), "\n".join(lines))
+    starts = _line_starts(lines)
+    text_lines = text.split("\n")
+
+    def line_of(offset):
+        return bisect.bisect_right(starts, offset) - 1
+
+    def floor(key, label, raw, percent, offset, end):
+        i = line_of(offset)
+        return Floor(key, label, raw + percent, float(raw) / (100 if percent else 1), i, offset - starts[i],
+                     end - starts[i], bool(XML_FLOOR_LINE.match(lines[i])))
+
+    blocks, referenced = set(), set()
+    for plugin in JACOCO_PLUGIN.finditer(text):
+        for i in range(line_of(plugin.start()), line_of(plugin.end() - 1) + 1):
+            if not JACOCO_VERSION_LINE.match(text_lines[i]):
+                blocks.add(i)
+                referenced.update(POM_REFERENCE.findall(text_lines[i]))
+    scopes = [(kind, m.start(1), m.end(1), _pom_scope_id(kind, m.group(1)))
+              for kind, regex in POM_SCOPES for m in regex.finditer(text)]
+
+    out, named = [], set()
+    for rule in JACOCO_RULE.finditer(text):
+        body = rule.group(1)
+        scope = _jacoco_scope(body, [(kind, scope_id) for kind, start, end, scope_id in scopes
+                                     if start <= rule.start() < end])
+        for lim in JACOCO_LIMIT.finditer(body):
+            counter = _xml_value(lim.group(1), "counter", "INSTRUCTION")
+            value = _xml_value(lim.group(1), "value", "COVEREDRATIO")
+            m = JACOCO_MINIMUM.search(lim.group(1))
+            # A minimum on a missed count or ratio is a ceiling in disguise, and of two minimums in one
+            # limit either may be the one Maven keeps; the guard reads neither.
+            if not m or value not in ("COVEREDRATIO", "COVEREDCOUNT") or lim.group(1).count("<minimum>") > 1:
+                continue
+            if m.group(3):
+                named.add(m.group(3))
+                continue
+            # Nor a floor whose rule or counter it can't tell apart from another's.
+            if scope is None or counter is None:
+                continue
+            key, element, where = scope
+            base = rule.start(1) + lim.start(1)
+            label = f"JaCoCo {element} {counter} {value} minimum{where}"
+            out.append(floor(("jacoco", key, counter, value), label, m.group(1), m.group(2),
+                             base + m.start(1), base + m.end(2)))
+    # Two rules with one scope can't be paired across the change; neither is read.
+    shared = {k for k, n in collections.Counter(f.key for f in out).items() if n > 1}
+    out = [f for f in out if f.key not in shared]
+    for block in POM_PROPERTIES.finditer(text):
+        for m in POM_PROPERTY.finditer(block.group(1)):
+            name = m.group(1)
+            if name in named or FLOOR_PROPERTY.search(name):
+                base = block.start(1)
+                out.append(floor(("property", name), f"JaCoCo floor property {name}", m.group(2), m.group(3),
+                                 base + m.start(2), base + m.end(3)))
+        for m in re.finditer(r"<([\w.\-]+)\b[^>]*>[^<]*</\1>", block.group(1)):
+            if m.group(1) in referenced:
+                blocks.add(line_of(block.start(1) + m.start()))
+    return Side(out, blocks, set())
+
+
+def _side_floors(path, lines):
+    """The Side of one side of a file, or None when it is coverage config the guard cannot read."""
+    if not path:
+        return Side([], set(), set())
+    parts = [_json_floors(path, lines), _flag_floors(path, lines), _jacoco_floors(path, lines),
+             Side(_ini_floors(path, lines), set(), set())]
+    if None in parts:
+        return None
+    return Side([f for p in parts for f in p.floors], set().union(*(p.blocks for p in parts)),
+                set().union(*(p.tainted for p in parts)))
+
+
+# hits: floor-lowered hits; floor_only: indexes into fd.lines of the changed lines that only change floors;
+# blocks: indexes of the changed lines in a Side's blocks.
+FloorReview = collections.namedtuple("FloorReview", "hits floor_only blocks")
+
+
+def _side_line(l):
+    return (l.old if l.kind == "-" else l.new) - 1
+
+
+def _floor_only_lines(fd, old, new):
+    """Indexes into fd.lines of the changed lines that only change floors."""
+    tainted = old.tainted | new.tainted
+    by_line = {"-": collections.defaultdict(list), "+": collections.defaultdict(list)}
+    for side, floors in (("-", old.floors), ("+", new.floors)):
+        for f in floors:
+            by_line[side][f.line].append(f)
+
+    def side_floors(l):
+        return by_line[l.kind][_side_line(l)]
+
+    def masked(l):
+        text = l.text
+        for f in sorted(side_floors(l), key=lambda f: -f.start):
+            text = text[:f.start] + "\0" + text[f.end:]
+        return text
+
+    only = set()
+    i = 0
+    while i < len(fd.lines):
+        if fd.lines[i].kind == " ":
+            i += 1
+            continue
+        block = []
+        while i < len(fd.lines) and fd.lines[i].kind != " ":
+            block.append(i)
+            i += 1
+        removed = [j for j in block if fd.lines[j].kind == "-" and side_floors(fd.lines[j])]
+        added = [j for j in block if fd.lines[j].kind == "+" and side_floors(fd.lines[j])]
+        # A floor's number changed in place: the lines match once each floor's number is masked.
+        k = 0
+        for r in removed:
+            for n in range(k, len(added)):
+                if masked(fd.lines[added[n]]) == masked(fd.lines[r]):
+                    only.update((r, added[n]))
+                    k = n + 1
+                    break
+        only.update(j for j in removed + added if any(f.pure for f in side_floors(fd.lines[j])))
+    return {j for j in only if not any(f.key in tainted for f in side_floors(fd.lines[j]))}
+
+
+def _values(floors):
+    return ", ".join(f.raw for f in floors)
+
+
+def _floor_review(fd):
+    """The FloorReview of fd, or None when the diff doesn't show the file whole or a side can't be read."""
+    if any(is_doc(p) or is_test_file(p) for p in fd.paths):
+        return None
+    sides = _whole_sides(fd)
+    if sides is None:
+        return None
+    old = _side_floors(fd.old_path, [l.text for l in fd.lines if l.kind != "+"])
+    new = _side_floors(fd.new_path, [l.text for l in fd.lines if l.kind != "-"])
+    if old is None or new is None:
+        return None
+    before, after = collections.OrderedDict(), collections.defaultdict(list)
+    for f in old.floors:
+        before.setdefault(f.key, []).append(f)
+    for f in new.floors:
+        after[f.key].append(f)
+    hits = []
+    for key, olds in before.items():
+        news = after.get(key, [])
+        label = olds[0].label
+        if not news:
+            hits.append(Hit("floor-lowered", fd.path, None, f"coverage floor {label} removed (was {_values(olds)})"))
+        elif len(news) == len(olds):
+            hits += [Hit("floor-lowered", fd.path, n.line + 1,
+                         f"coverage floor {label} lowered from {o.raw} to {n.raw}")
+                     for o, n in zip(olds, news) if n.value < o.value]
+        elif len(news) < len(olds) or min(n.value for n in news) < max(o.value for o in olds):
+            # Set more or fewer times than before, the floors can't be paired; any floor below the old
+            # highest, or one fewer, may be the one the tool reads.
+            low = min(news, key=lambda n: n.value)
+            hits.append(Hit("floor-lowered", fd.path, low.line + 1,
+                            f"coverage floor {label} lowered: was {_values(olds)}, now {_values(news)}"))
+    blocks = {j for j, l in enumerate(fd.lines)
+              if l.kind != " " and _side_line(l) in (old if l.kind == "-" else new).blocks}
+    # A moved config may no longer be where its tool looks, so none of its lines is exempt.
+    floor_only = set() if fd.status == "renamed" else _floor_only_lines(fd, old, new)
+    return FloorReview(hits, floor_only, blocks)
+
+
+def _unfollowed_floors(fd):
+    """Whether a side of fd holds a floor in a string or heredoc the guard can't follow (see _flag_floors):
+    wrapping a floor in one may change no line that names it."""
+    if any(is_doc(p) or is_test_file(p) for p in fd.paths) or _whole_sides(fd) is None:
+        return False
+    return any(path and _flag_floors(path, [l.text for l in fd.lines if l.kind != other]) is None
+               for path, other in ((fd.old_path, "+"), (fd.new_path, "-")))
+
+
+def floor_lowered_hits(files):
+    return [h for fd in files for h in (_floor_review(fd) or FloorReview([], set(), set())).hits]
+
+
+def _change_blocks(fd):
+    """Indexes into fd.lines of each run of changed lines."""
+    blocks, block = [], []
+    for i, l in enumerate(fd.lines):
+        if l.kind != " ":
+            block.append(i)
+        elif block:
+            blocks.append(block)
+            block = []
+    return blocks + [block] if block else blocks
+
+
+def _xml_uncommented(text, comment):
+    """(text with its XML comments blanked, whether a comment runs on past it), given whether one runs into it."""
+    out = ""
+    while text:
+        if comment:
+            end = text.find("-->")
+            if end < 0:
+                return out, True
+            text, comment = text[end + 3:], False
+        else:
+            start = text.find("<!--")
+            if start < 0:
+                return out + text, False
+            out, text, comment = out + text[:start], text[start + 4:], True
+    return out, comment
+
+
+def _jacoco_property_lines(fd):
+    """Indexes into fd.lines of the lines, on their side, that are part of a jacoco.minimum.* property.
+
+    In a .properties file that is a logical line whose text names one, joined over continuations; in a
+    pom.xml, a line from the property's opening tag to its closing tag. Where a run the diff shows may
+    start inside one (it starts below line 1 on a continued value, or at a closing tag), the guard
+    can't tell and counts those lines too.
+    """
+    out = set()
+    properties = _ext(fd.path) == ".properties"
+    for side in "-+":
+        for from_top, run in _side_runs(fd, side):
+            if properties:
+                groups, continued = [], False
+                for i, l in run:
+                    if not continued:
+                        groups.append([])
+                    groups[-1].append((i, l))
+                    comment = not continued and l.text.lstrip().startswith(("#", "!"))
+                    continued = not comment and bool(PROPERTIES_CONTINUED.search(l.text))
+                for n, group in enumerate(groups):
+                    text = "".join(PROPERTIES_CONTINUED.sub("", l.text).lstrip() for _, l in group)
+                    first = group[0][1].text
+                    unknown = n == 0 and not from_top and first.strip() and not PROPERTIES_KEY.match(first)
+                    # Joined as Java joins them, so no word boundary is asked for where two lines meet.
+                    if unknown or re.search(r"jacoco\.minimum\.\w", text):
+                        out.update(i for i, _ in group)
+            elif _name(fd.path) == "pom.xml":
+                inside, seen, comment = False, from_top, False
+                for k, (i, l) in enumerate(run):
+                    # A tag in an XML comment opens or closes nothing.
+                    text, comment = _xml_uncommented(l.text, comment)
+                    tags = [m for m in JACOCO_PROPERTY_TAG.finditer(text) if not m.group(2)]
+                    if not seen and tags and tags[0].group(1):
+                        # The run starts inside a property: its first lines are part of the value.
+                        out.update(j for j, _ in run[:k])
+                    seen = seen or bool(tags)
+                    if inside or tags or JACOCO_PROPERTY_LINE.search(l.text):
+                        out.add(i)
+                    if tags:
+                        inside = not tags[-1].group(1)
+    return out
+
+
+def gate_config_hits(files, facts):
     hits = []
     for fd in files:
         paths = [p.lower() for p in fd.paths]
         names = {_name(p) for p in fd.paths}
+        review = _floor_review(fd)
+        floor_only, blocks = (review.floor_only, review.blocks) if review else (set(), set())
         if any(p.startswith(".github/workflows/") for p in paths):
             hits.append(Hit("gate-config", fd.path, None, f"workflow {fd.status}"))
             continue
@@ -880,28 +2479,48 @@ def gate_config_hits(files):
             hits.append(Hit("gate-config", fd.path, None, f"CODEOWNERS {fd.status}"))
             continue
         if any(COVERAGE_FILES.match(n) for n in names):
-            hits.append(Hit("gate-config", fd.path, None, f"coverage config {fd.status}"))
+            changed = [i for i, l in enumerate(fd.lines) if l.kind != " "]
+            if fd.status != "modified" or not changed or not floor_only.issuperset(changed):
+                hits.append(Hit("gate-config", fd.path, None, f"coverage config {fd.status}"))
             continue
+        # A tool finds its config by name and place, so a config that moves may drop its floors and settings,
+        # even to a doc or lint name.
+        moved = fd.status == "renamed" and bool(
+            {("-", fd.old_path), ("+", fd.new_path)} & facts.coverage_configs)
+        if moved:
+            hits.append(Hit("gate-config", fd.path, None, "coverage config renamed"))
         if any(is_doc(p) for p in fd.paths):
             continue
         if any(LINT_FILES.match(n) for n in names):
             hits.extend(_lint_hits(fd, fd.lines))
             continue
+        if review is None and _unfollowed_floors(fd):
+            hits.append(Hit("gate-config", fd.path, None,
+                            "coverage floor in a string or heredoc the guard can't follow"))
 
         sections = line_sections(fd) if is_ini(fd.path) else [""] * len(fd.lines)
         coverage, lint = [], []
         js_config = (_ext(fd.path) in JS_EXTS and is_config(fd.path)) or bool(JS_CONFIG_JSON.match(_name(fd.path)))
         gradle = ".gradle" in _name(fd.path)
-        for l, section in zip(fd.lines, sections):
+        jacoco = _jacoco_property_lines(fd) if _name(fd.path) == "pom.xml" or _ext(fd.path) == ".properties" else set()
+        # A change block that touches a jacoco.minimum.* property is read whole: its other lines may be what
+        # folds the property into another's value, or out of its own.
+        jacoco_blocks = set()
+        for block in _change_blocks(fd):
+            if any(j in jacoco and j not in floor_only for j in block):
+                jacoco_blocks.update(block)
+        for i, (l, section) in enumerate(zip(fd.lines, sections)):
             if section.startswith(LINT_SECTIONS):
                 lint.append(l)
-            if l.kind == " ":
+            if l.kind == " " or i in floor_only:
                 continue
-            if (section.startswith(COVERAGE_SECTIONS) or COVERAGE_LINE.search(l.text)
+            if (i in blocks or section.startswith(COVERAGE_SECTIONS) or COVERAGE_LINE.search(l.text)
+                    or (COVERAGE_FLOOR_NAME.search(l.text) and not is_test_file(fd.path))
                     or (js_config and JS_THRESHOLD.search(l.text))
-                    or (gradle and GRADLE_MINIMUM.search(l.text))):
+                    or (gradle and GRADLE_MINIMUM.search(l.text))
+                    or i in jacoco_blocks):
                 coverage.append(l)
-        if coverage:
+        if coverage and not moved:
             first = coverage[0]
             more = f" (+{len(coverage) - 1} more)" if len(coverage) > 1 else ""
             hits.append(Hit("gate-config", fd.path, first.new,
@@ -988,9 +2607,14 @@ class GitTrees:
 # c_cpp: whether either tree has a platformio.ini or a C/C++ source or header;
 # open_configs: [(platformio.ini, why)] for those that name extra_configs or
 # test_dir, or that cannot be read; blind: symbolic links and submodules at or
-# in a test directory, in a C/C++ repository.
-TreeFacts = collections.namedtuple("TreeFacts", "c_cpp open_configs blind")
+# in a test directory, in a C/C++ repository; c_test_roots: the outermost test
+# directories (see _test_root) that hold a C/C++ source or header in either
+# tree, counting any file with no extension but git's own; coverage_configs:
+# the (side, path) of each config a tool finds by name (COVERAGE_CONFIG_NAMES)
+# that is on one side only and holds coverage settings or can't be read.
+TreeFacts = collections.namedtuple("TreeFacts", "c_cpp open_configs blind c_test_roots coverage_configs")
 PIO_OPEN_OPTION = re.compile(r"extra_configs|test_dir", re.IGNORECASE)
+GIT_FILES = {".gitignore", ".gitattributes", ".gitkeep", ".keep"}
 
 
 def tree_facts(trees):
@@ -1010,22 +2634,132 @@ def tree_facts(trees):
             open_configs[path] = f"names {' and '.join(sorted({m.lower() for m in PIO_OPEN_OPTION.findall(text)}))}"
     links = dict.fromkeys(link for side in ("-", "+") for link in trees.links(side))
     blind = [link for link in links if _at_test_dir(link)] if c_cpp else []
-    return TreeFacts(c_cpp, sorted(open_configs.items()), blind)
+    c_test_roots = {_test_root(p) for _, p in paths if _ext(p) in C_FILE_EXTS and _name(p) not in GIT_FILES} - {None}
+    # A renamed file the diff shows no hunk of reads as empty from DiffTrees; git never pairs empty files.
+    coverage_configs = set()
+    for side, path in paths:
+        if COVERAGE_CONFIG_NAMES.match(_name(path)) and (("+" if side == "-" else "-"), path) not in paths:
+            text = trees.read(side, path)
+            if not text or COVERAGE_TEXT.search(text):
+                coverage_configs.add((side, path))
+    return TreeFacts(c_cpp, sorted(open_configs.items()), blind, c_test_roots, coverage_configs)
 
 
-def repo_hits(repo_dir, base, head):
+def repo_hits(repo_dir, base, head, extra=()):
     """The hits from base to head of a git repository, reading its trees beyond the diff."""
-    return analyze(parse_diff(git_diff(repo_dir, base, head)), tree_facts(GitTrees(repo_dir, base, head)))
+    return analyze(parse_diff(git_diff(repo_dir, base, head)), tree_facts(GitTrees(repo_dir, base, head)), extra)
+
+
+# ------------------------------------------------------------ extra gate paths
+
+# A glob names repository paths from the root: * and ? match within one path
+# segment, dotfiles included, and ** as a whole segment matches any number of
+# segments, none included. Everything else is literal. The guard refuses what
+# it might read differently from the caller (classes, braces, escapes,
+# negation, empty, . and .. segments, a leading or trailing /, and ** inside a
+# segment), so a typo fails the job instead of quietly matching nothing.
+GLOB_REFUSED = re.compile(r"[\[\]{}\\!]")
+
+
+class ExtraPath(collections.namedtuple("ExtraPath", "glob segments")):
+    """One validated --extra-gate-path glob, matched without regex backtracking.
+
+    Both levels use dynamic programming: O(len(glob) * len(path)) time and
+    O(len(path)) space, even for separated * or ** with a long near miss.
+    """
+
+    def matches(self, path):
+        segments = path.split("/")
+        # reachable[n]: the glob prefix matches the first n path segments.
+        reachable = [True] + [False] * len(segments)
+        for i, part in enumerate(self.segments):
+            if part == "**":
+                if i == len(self.segments) - 1:
+                    # A final ** consumes the remaining suffix, including empty
+                    # segments. It still needs a suffix after the preceding /:
+                    # tests/golden/** matches tests/golden/, not tests/golden.
+                    return any(reachable[:-1])
+                for end, segment in enumerate(segments, 1):
+                    # Non-final ** consumes zero or more nonempty segments.
+                    reachable[end] = reachable[end] or (bool(segment) and reachable[end - 1])
+            else:
+                reachable = [False] + [reachable[n] and _segment_matches(part, segment)
+                                       for n, segment in enumerate(segments)]
+        return reachable[-1]
+
+
+def _segment_matches(pattern, segment):
+    """Match * and ? within one segment, visiting each prefix pair once."""
+    if "*" not in pattern and "?" not in pattern:
+        return pattern == segment
+    reachable = [True] + [False] * len(segment)
+    for token in pattern:
+        if token == "*":
+            for end in range(1, len(segment) + 1):
+                # * consumes nothing, or extends its match by one character.
+                reachable[end] = reachable[end] or reachable[end - 1]
+        else:
+            reachable = [False] + [reachable[n] and (token == "?" or token == char)
+                                   for n, char in enumerate(segment)]
+    return reachable[-1]
+
+
+def _glob_segments(glob):
+    refused = GLOB_REFUSED.search(glob)
+    if refused:
+        raise ValueError(f"it has {refused.group()!r}; only *, ? and ** are wildcards")
+    split = glob.split("/")
+    # Consecutive ** segments are equivalent to one **, including at the end.
+    parts = [part for i, part in enumerate(split) if not (part == "**" and i and split[i - 1] == "**")]
+    for part in parts:
+        if part in ("", ".", ".."):
+            raise ValueError(f"it has an empty, . or .. segment ({part!r})")
+        if part != "**" and "**" in part:
+            raise ValueError("it has ** inside a segment; ** stands alone between slashes, as in tests/golden/**")
+    return tuple(parts)
+
+
+def parse_extra_paths(values):
+    """The ExtraPath of each glob in values, one glob per line of each value; blank lines name nothing.
+
+    Raises ValueError, naming the glob, for one the guard refuses (see GLOB_REFUSED)."""
+    globs = []
+    for value in values or ():
+        for line in value.split("\n"):
+            glob = line.strip()
+            if not glob:
+                continue
+            try:
+                globs.append(ExtraPath(glob, _glob_segments(glob)))
+            except ValueError as e:
+                raise ValueError(f"extra gate path {glob!r} is malformed: {e}") from None
+    return globs
+
+
+def extra_path_hits(files, extra):
+    """A gate-config hit for each changed file whose new or old path matches an extra gate path, whatever the change."""
+    hits = []
+    for fd in files:
+        for path in [fd.path] + [p for p in fd.paths if p != fd.path]:
+            glob = next((g.glob for g in extra if g.matches(path)), None)
+            if glob is not None:
+                detail = f"matches extra gate path `{glob}`"
+                hits.append(Hit("gate-config", fd.path, None,
+                                detail if path == fd.path else f"{fd.status} from {path}, which {detail}"))
+                break
+    return hits
 
 
 # ------------------------------------------------------------------ reporting
 
-def analyze(files, facts=None):
-    """The hits of a diff. facts come from the base and head trees; without them, from the files the diff shows."""
+def analyze(files, facts=None, extra=()):
+    """The hits of a diff. facts come from the base and head trees; without them, from the files the diff shows.
+    extra holds the repository's own gate paths (parse_extra_paths)."""
     facts = facts or tree_facts(DiffTrees(files))
     removed = removed_test_hits(files)
     hits = (removed + c_cpp_hits(files, facts, {h.path for h in removed}) + skip_hits(files, facts)
-            + retry_hits(files) + gate_config_hits(files))
+            + retry_hits(files) + gate_config_hits(files, facts) + floor_lowered_hits(files)
+            + extra_path_hits(files, extra))
     seen = set()
     unique = []
     for h in hits:
@@ -1195,20 +2929,143 @@ def head_pushed_at(activities, ref, sha):
     return max(times) if times else None
 
 
-def owner_label(label, labels, events, owner, sha, pushed_at):
+def _by(comment, owner):
+    return ((comment.get("user") or {}).get("login") or "").lower() == owner.lower()
+
+
+def _now():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def newest_label_event(label, events):
+    """The newest labeled/unlabeled event for label, or None."""
+    history = [e for e in events if e.get("event") in ("labeled", "unlabeled")
+               and ((e.get("label") or {}).get("name") or "").lower() == label]
+    return max(history, key=lambda e: (e.get("created_at") or "", e.get("id") or 0)) if history else None
+
+
+def awaiting_record(events, owner, comments):
+    """Whether the owner's newest gate-change-approved label is under RECORD_WAIT seconds old and has no head
+    record yet, which `ao owner-label apply` or approve_gate.py may still be posting."""
+    newest = newest_label_event(APPROVAL_LABEL, events)
+    actor = ((newest or {}).get("actor") or {}).get("login") or ""
+    if newest is None or newest.get("event") != "labeled" or actor.lower() != owner.lower():
+        return False
+    applied = parse_time(newest.get("created_at"))
+    return (applied is not None and (_now() - applied).total_seconds() < RECORD_WAIT
+            and recorded_head(comments, APPROVAL_LABEL, owner, applied) is None)
+
+
+def _records(comment, label):
+    """The head SHAs that comment's head records for label name."""
+    return [m.group(2) for m in HEAD_RECORD.finditer(comment.get("body") or "") if m.group(1).lower() == label]
+
+
+def _check_edit_node(node, comment):
+    """Raise unless node is a whole EDIT_QUERY answer for comment, every field of exactly its type (#62 security
+    rounds 2 and 3). type(x) is int rules out a bool or float that == would take for a count or an id; a missing
+    key is not a null."""
+    def fail(why):
+        raise ValueError(f"the GraphQL API's edit history of comment {comment.get('id')} is malformed: {why}")
+
+    if type(node) is not dict:
+        fail("not an object")
+    missing = [key for key in EDIT_KEYS if key not in node]
+    if missing:
+        fail(f"no {', '.join(missing)}")
+    if type(node["__typename"]) is not str or node["__typename"] != "IssueComment":
+        fail("not an IssueComment")
+    if type(node["id"]) is not str or node["id"] != comment.get("node_id"):
+        fail("an id other than the comment's node_id")
+    if type(node["databaseId"]) is not int or node["databaseId"] != comment.get("id"):
+        fail("a databaseId other than the comment's id")
+    if node["lastEditedAt"] is not None and type(node["lastEditedAt"]) is not str:
+        fail("lastEditedAt is neither a string nor null")
+    if node["editor"] is not None and type(node["editor"]) is not dict:
+        fail("editor is neither an object nor null")
+    if type(node["includesCreatedEdit"]) is not bool:
+        fail("includesCreatedEdit is not a boolean")
+    edits = node["userContentEdits"]
+    if type(edits) is not dict or "totalCount" not in edits:
+        fail("userContentEdits is not an object with a totalCount")
+    if type(edits["totalCount"]) is not int or edits["totalCount"] < 0:
+        fail("userContentEdits.totalCount is not a non-negative integer")
+
+
+def _never_edited(node, comment):
+    """Whether node, GraphQL's answer for comment, shows affirmatively that it was never edited: no last edit, no
+    editor, no edit history. The whole node is checked first; a malformed or mismatched answer raises, an edited
+    one says no."""
+    _check_edit_node(node, comment)
+    return (node["lastEditedAt"] is None and node["editor"] is None
+            and node["includesCreatedEdit"] is False and node["userContentEdits"]["totalCount"] == 0)
+
+
+def with_edit_history(github, comments, owner):
+    """comments, each with never_edited: True only for an owner head record for gate-change-approved whose server
+    edit history GraphQL shows empty. Only those candidates are looked up, EDIT_BATCH per query, so the reads
+    stay linear in the comments. Raises when a history can't be read: the guard fails closed."""
+    marked = [dict(c, never_edited=False) for c in comments]
+    candidates = [c for c in marked if _by(c, owner) and _records(c, APPROVAL_LABEL)]
+    for start in range(0, len(candidates), EDIT_BATCH):
+        batch = candidates[start:start + EDIT_BATCH]
+        ids = [c.get("node_id") for c in batch]
+        if not all(isinstance(i, str) and i for i in ids):
+            raise ValueError("a head record comment has no node_id to read its edit history by")
+        nodes = (github.graphql(EDIT_QUERY, {"ids": ids}) or {}).get("nodes")
+        if not isinstance(nodes, list) or len(nodes) != len(batch):
+            raise ValueError("the GraphQL API did not return the edit history of every head record")
+        for comment, node in zip(batch, nodes):
+            comment["never_edited"] = _never_edited(node, comment)
+    return marked
+
+
+def recorded_head(comments, label, owner, since):
+    """(sha, posted) from the owner's newest unedited head record for label posted at or after since, or None.
+
+    Anyone with write access can edit the owner's comment, so an edited one
+    never counts (the rule of agent-ops `ao owner-label`). Unedited means
+    GraphQL's edit history showed none (never_edited, from with_edit_history)
+    and the REST timestamps agree; a comment not looked up never counts.
+    """
+    found = None
+    for c in comments:
+        at = parse_time(c.get("created_at"))
+        if (not _by(c, owner) or at is None or at < since or c.get("updated_at") != c.get("created_at")
+                or c.get("never_edited") is not True):
+            continue
+        for seen in _records(c, label):
+            if found is None or at >= found[1]:
+                found = (seen, at)
+    return found
+
+
+def how_to_approve(sha):
+    """The two ways the owner approves a gate change at sha; each labels, then posts the head record."""
+    return (f"the owner approves {sha[:7]} by commenting `/approve-gate {sha}` or running "
+            f"`ao owner-label apply <repo> <pr> {APPROVAL_LABEL} --head {sha}`")
+
+
+def owner_label(label, labels, events, owner, sha, pushed_at, comments=()):
     """(counts, reason) for an owner-only label on a pull request whose head is sha.
 
     The label counts only when the newest labeled/unlabeled event for it is
     'labeled' by the owner, after sha was pushed. A label a worker re-applies
     becomes the worker's, and a new push makes the owner's label stale.
+
+    gate-change-approved also needs the owner's newest unedited head record for
+    it, posted at or after the label (so after the push), to name sha. The label
+    alone never counts (#62): the /approve-gate workflow labels with the owner's
+    token, so its label reads like a hand label, and a run that dies before its
+    record or its re-read of the head can leave the label on a head pushed in
+    between. The comments that showed it was the workflow's can be deleted or
+    edited, so the guard no longer tries to tell the two apart.
     """
     if label not in labels:
         return False, f"`{label}` is not on this pull request"
-    history = [e for e in events if e.get("event") in ("labeled", "unlabeled")
-               and ((e.get("label") or {}).get("name") or "").lower() == label]
-    if not history:
+    newest = newest_label_event(label, events)
+    if newest is None:
         return False, f"no labeled event was found for `{label}`"
-    newest = max(history, key=lambda e: (e.get("created_at") or "", e.get("id") or 0))
     actor = (newest.get("actor") or {}).get("login") or "unknown"
     if newest.get("event") != "labeled":
         return False, f"`{label}` was last removed, by @{actor}"
@@ -1221,15 +3078,35 @@ def owner_label(label, labels, events, owner, sha, pushed_at):
     if applied is None or applied <= pushed_at:
         return False, (f"`{label}` was applied by the owner at {newest.get('created_at')}, before {sha[:7]} "
                        f"was pushed at {_stamp(pushed_at)}; the owner re-applies it after reviewing the new commits")
-    return True, (f"`{label}` was applied by the owner @{actor} at {_stamp(applied)}, after {sha[:7]} "
-                  f"was pushed at {_stamp(pushed_at)}")
+    reason = (f"`{label}` was applied by the owner @{actor} at {_stamp(applied)}, after {sha[:7]} "
+              f"was pushed at {_stamp(pushed_at)}")
+    if label != APPROVAL_LABEL:
+        return True, reason
+    record = recorded_head(comments, label, owner, applied)
+    if record is None:
+        return False, (f"`{label}` was applied by the owner, but no unedited head record from the owner was posted "
+                       f"at or after it, and the label alone doesn't count; {how_to_approve(sha)}")
+    seen, posted = record
+    if seen != sha:
+        return False, (f"`{label}` was applied by the owner, but the owner's newest unedited head record names "
+                       f"{seen[:7]}, not the head {sha[:7]}; {how_to_approve(sha)}")
+    return True, f"{reason}, and the owner's head record posted at {_stamp(posted)} names {sha[:7]}"
 
 
 class GitHub:
     """The GitHub API calls the pull_request_target mode makes."""
 
-    def __init__(self, api, token):
+    def __init__(self, api, token, graphql_url=None):
         self.api, self.token = api, token
+        self.graphql_url = graphql_url or os.environ.get("GITHUB_GRAPHQL_URL") or f"{api}/graphql"
+
+    def graphql(self, query, variables):
+        """The data of one GraphQL query. Any error, even beside partial data, raises: nothing is judged from half
+        an answer."""
+        answer = api_request(self.graphql_url, self.token, "POST", {"query": query, "variables": variables})[0]
+        if not isinstance(answer, dict) or answer.get("errors") or not isinstance(answer.get("data"), dict):
+            raise ValueError(f"the GraphQL API answered with errors: {str((answer or {}).get('errors'))[:300]}")
+        return answer["data"]
 
     def get(self, path):
         return api_request(self.api + path, self.token)[0]
@@ -1394,13 +3271,13 @@ def _write_outputs(values):
             f.writelines(f"{k}={v}\n" for k, v in values.items())
 
 
-def _target_hits(github, repo, base_ref, sha, server, token):
+def _target_hits(github, repo, base_ref, sha, server, token, extra=()):
     """(hits, error) for what the pull request changes since its merge base."""
     try:
         compare = github.get(f"/repos/{repo}/compare/{urllib.parse.quote(base_ref, safe='/')}...{sha}?per_page=1")
         merge_base = compare["merge_base_commit"]["sha"]
         diff, facts = fetch_diff(f"{server}/{repo}.git", token, merge_base, sha)
-        return analyze(parse_diff(diff), facts), None
+        return analyze(parse_diff(diff), facts, extra), None
     except subprocess.CalledProcessError as e:
         detail = (e.stderr or b"").decode("utf-8", "replace").strip()
         return [], f"could not fetch the pull request's commits ({detail or e})"
@@ -1411,7 +3288,7 @@ def _target_hits(github, repo, base_ref, sha, server, token):
 def _target_labels(github, repo, number, head, sha, owner):
     """(labels on the PR, {label: (counts, reason)}) for the owner-only labels."""
     labels = {l["name"].lower() for l in github.pages(f"/repos/{repo}/issues/{number}/labels")}
-    events, pushed_at = [], None
+    events, comments, pushed_at = [], [], None
     if labels & set(OWNER_LABELS):
         events = github.pages(f"/repos/{repo}/issues/{number}/events")
         head_repo = (head.get("repo") or {}).get("full_name")
@@ -1419,13 +3296,23 @@ def _target_labels(github, repo, number, head, sha, owner):
         if head_repo:
             activity = github.pages(f"/repos/{head_repo}/activity?ref={urllib.parse.quote(ref, safe='/')}")
             pushed_at = head_pushed_at(activity, ref, sha)
-    return labels, {label: owner_label(label, labels, events, owner, sha, pushed_at) for label in OWNER_LABELS}
+    if APPROVAL_LABEL in labels:
+        def read():
+            return with_edit_history(github, github.pages(f"/repos/{repo}/issues/{number}/comments"), owner)
+        comments = read()
+        for _ in range(RECORD_WAIT // RECORD_POLL):
+            if not awaiting_record(events, owner, comments):
+                break
+            time.sleep(RECORD_POLL)
+            comments = read()
+    return labels, {label: owner_label(label, labels, events, owner, sha, pushed_at, comments)
+                    for label in OWNER_LABELS}
 
 
-def judge_pull_request(github, repo, pr, sha, owner, server, token):
+def judge_pull_request(github, repo, pr, sha, owner, server, token, extra=()):
     """The Judgment of one pull request whose head is sha, against the base pr names."""
     base, head = pr["base"]["ref"], pr.get("head") or {}
-    hits, error = _target_hits(github, repo, base, sha, server, token)
+    hits, error = _target_hits(github, repo, base, sha, server, token, extra)
     try:
         labels, verdicts = _target_labels(github, repo, pr["number"], head, sha, owner)
     except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as e:
@@ -1483,7 +3370,8 @@ def run_target(args, github=None):
     server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
     github = github or GitHub(os.environ.get("GITHUB_API_URL", "https://api.github.com"), token)
     prs, list_error = pull_requests_with_head(github, repo, sha, pr)
-    judgments = [judge_pull_request(github, repo, p, sha, owner, server, token) for p in prs]
+    extra = getattr(args, "extra", ())
+    judgments = [judge_pull_request(github, repo, p, sha, owner, server, token, extra) for p in prs]
     if list_error:
         # Without the whole list, another pull request's failure could go unseen.
         judgments = [j._replace(error=j.error or list_error) for j in judgments]
@@ -1514,8 +3402,8 @@ def read_hits(args):
     """The hits of the diff file, or of base to head in the repository, whose trees are read too."""
     if args.diff_file:
         with open(args.diff_file, encoding="utf-8", errors="replace") as f:
-            return analyze(parse_diff(f.read()))
-    return repo_hits(args.repo_dir, args.base, args.head)
+            return analyze(parse_diff(f.read()), extra=args.extra)
+    return repo_hits(args.repo_dir, args.base, args.head, args.extra)
 
 
 def parse_args(argv):
@@ -1536,6 +3424,10 @@ def parse_args(argv):
                    help="judge the pull request of the pull_request_target event in $GITHUB_EVENT_PATH, "
                         "date owner labels against the head push, and exit with the verdict")
     p.add_argument("--guard-sha", help="commit of this script, named in the report")
+    p.add_argument("--extra-gate-path", action="append", metavar="GLOB",
+                   help="a repository path glob whose changes are gate-config hits, such as tests/golden/**; "
+                        "repeat it, or give several globs one per line. * and ? stay within a segment, ** "
+                        "stands alone for any segments, and a glob the guard refuses exits 2")
     return p.parse_args(argv)
 
 
@@ -1544,6 +3436,14 @@ def main(argv=None):
     if reconfigure:
         reconfigure(errors="replace")
     args = parse_args(argv)
+    try:
+        args.extra = parse_extra_paths(args.extra_gate_path)
+    except ValueError as e:
+        # Fail closed: a glob read as matching nothing would let the changes it names pass unapproved.
+        print(f"gate-guard: {e}", file=sys.stderr)
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            print(f"::error title=gate-guard::{_escape_data(str(e))}")
+        return 2
     if args.pull_request_target:
         return run_target(args)
     try:

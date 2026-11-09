@@ -1,0 +1,33 @@
+# gate-guard fixture: a literal flipped in a project macro named like an assertion, which may skip the test
+# expect: removed-tests
+# hits: 1
+# detail: not an assertion macro call
+
+diff --git a/test/unit/clamp_test.cpp b/test/unit/clamp_test.cpp
+index e157471..dbd1b44 100644
+--- a/test/unit/clamp_test.cpp
++++ b/test/unit/clamp_test.cpp
+@@ -1,22 +1,22 @@
+ #include <gtest/gtest.h>
+ #include "logic.h"
+ 
+ namespace {
+ 
+ class ClampTest : public ::testing::Test {
+  protected:
+   void SetUp() override { limit_ = 10; }
+   int limit_ = 0;
+ };
+ 
+ TEST(Clamp, Low) {
+-  EXPECT_SKIP_IF(board() == 0);
++  EXPECT_SKIP_IF(board() == 1);
+   EXPECT_EQ(0, clamp(-5, 0, 10));
+   EXPECT_TRUE(clamp(5, 0, 10) == 5);
+ }
+ 
+ TEST_F(ClampTest, High) {
+   EXPECT_EQ(limit_, clamp(50, 0, limit_));
+ }
+ 
+ }  // namespace

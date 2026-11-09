@@ -51,6 +51,13 @@ def test_rename_targets_exist():
     assert not missing, f"rename targets not in labels: {missing}"
 
 
+def test_user_action_and_user_present_are_separate_labels():
+    names = {l["name"] for l in LABELS}
+    assert {"user-action", "user-present"} <= names, "both labels must be defined in labels.json"
+    assert "user-action" not in CONFIG["renames"], (
+        "user-action (an owner task) must not be renamed to user-present (someone at the machine)")
+
+
 def test_contributing_table_matches_labels_json():
     documented = contributing_labels()
     defined = {l["name"] for l in LABELS}

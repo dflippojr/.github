@@ -1,5 +1,5 @@
-# gate-guard fixture: .coveragerc, [tool.coverage] and [coverage:report] edits
-# expect: gate-config
+# gate-guard fixture: .coveragerc, [tool.coverage] and [coverage:report] edits (floors lowered are floor-lowered hits)
+# expect: floor-lowered gate-config
 # hits: 3
 
 diff --git a/.coveragerc b/.coveragerc

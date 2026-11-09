@@ -1,0 +1,45 @@
+# gate-guard fixture: a raise beside an omit stays gate-config; a floor line respaced as it rises (setup.cfg) is not a hit
+# expect: gate-config
+# hits: 2
+# detail: coverage config modified
+# detail: coverage config edited: omit
+
+diff --git a/.coveragerc b/.coveragerc
+index f924547..0536e67 100644
+--- a/.coveragerc
++++ b/.coveragerc
+@@ -1,6 +1,7 @@
+ [run]
+ source = calc
+ 
+ [report]
+-fail_under = 90
++fail_under = 95
+ show_missing = true
++omit = calc/slow.py
+diff --git a/pyproject.toml b/pyproject.toml
+index 614912b..55642a2 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,8 +1,9 @@
+ [project]
+ name = "calc"
+ 
+ [tool.pytest.ini_options]
+ addopts = "--cov=calc --cov-fail-under=85"
+ 
+ [tool.coverage.report]
+-fail_under = 90.5
++fail_under = 91
++omit = ["calc/slow.py"]
+diff --git a/setup.cfg b/setup.cfg
+index d147418..8004e44 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -1,5 +1,5 @@
+ [metadata]
+ name = calc
+ 
+ [coverage:report]
+-fail_under = 80
++fail_under=81

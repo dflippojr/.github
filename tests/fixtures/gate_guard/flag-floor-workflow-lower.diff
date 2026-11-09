@@ -1,0 +1,23 @@
+# gate-guard fixture: a floor lowered in a workflow is a workflow edit and a floor-lowered hit
+# expect: floor-lowered gate-config
+# hits: 3
+# detail: workflow modified
+# detail: COVERAGE_FLOOR lowered from 83.07 to 80
+# detail: --fail-under-line lowered from 97.1 to 96
+
+diff --git a/.github/workflows/coverage.yml b/.github/workflows/coverage.yml
+index d863e98..b0ebfad 100644
+--- a/.github/workflows/coverage.yml
++++ b/.github/workflows/coverage.yml
+@@ -1,9 +1,9 @@
+ name: Coverage
+ on: [pull_request]
+ env:
+-  COVERAGE_FLOOR: 83.07
++  COVERAGE_FLOOR: 80
+ jobs:
+   coverage:
+     runs-on: ubuntu-latest
+     steps:
+-      - run: gcovr --root .. --fail-under-line 97.1
++      - run: gcovr --root .. --fail-under-line 96

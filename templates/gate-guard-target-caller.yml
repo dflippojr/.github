@@ -39,3 +39,6 @@ jobs:
       guard-ref: <full-sha>
       # Private repositories run on the tower:
       # runs-on: '["self-hosted", "Linux", "X64", "tower-linux"]'
+      # Repository-specific gate paths, one glob per line:
+      # extra-gate-paths: |
+      #   tests/golden/**

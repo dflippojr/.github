@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import collections
 import hashlib
 import ipaddress
 import json
@@ -18,6 +19,11 @@ SHA = re.compile(r"[0-9a-f]{40}")
 TOKEN = re.compile(r"[\w@.+:/\\-]+", re.UNICODE)
 MAILBOX = re.compile(r"[\w.+-]+@[\w.-]+", re.UNICODE)
 NUMBER = re.compile(r"(?<!\d)(?:\d[ -]?){8,}\d(?!\d)")
+REPOSITORY = re.compile(r"[\w.-]+/[\w.-]+")
+# Reviewed exemptions load only from the trusted scanner checkout, never the scanned repository.
+EXEMPTIONS = pathlib.Path(__file__).resolve().parent.parent / "config" / "secret-scan-exemptions.json"
+EXEMPTION_FIELDS = {"repository", "path_sha256", "rule", "max_count", "reason"}
+FINANCIAL_RULES = {"luhn-number", "aba-routing-number", "account-like-number", "missing-synthetic-header"}
 
 
 class ScanError(Exception):
@@ -100,17 +106,22 @@ def aba(number):
     return sum(int(char) * (3, 7, 1)[index % 3] for index, char in enumerate(number)) % 10 == 0
 
 
-def financial_rules(text):
-    rules = set()
+def financial_matches(text):
+    """Count matching values per rule; one line can hold several."""
+    matches = collections.Counter()
     for match in NUMBER.finditer(text):
         number = re.sub(r"\D", "", match.group())
         if luhn(number):
-            rules.add("luhn-number")
+            matches["luhn-number"] += 1
         if aba(number):
-            rules.add("aba-routing-number")
+            matches["aba-routing-number"] += 1
         if len(number) >= 10:
-            rules.add("account-like-number")
-    return rules
+            matches["account-like-number"] += 1
+    return matches
+
+
+def financial_rules(text):
+    return set(financial_matches(text))
 
 
 def git(repo, *args, env=None):
@@ -166,7 +177,8 @@ def requires_synthetic_header(path):
 
 
 def scan_financial(repo, head):
-    findings = set()
+    """Map each (path, line, rule) finding to how many values matched it."""
+    findings = collections.Counter()
     for raw_path in git(repo, "ls-tree", "-r", "--name-only", "-z", head).split(b"\0"):
         path = raw_path.decode("utf-8", errors="surrogateescape")
         if not path or not fixture_path(path):
@@ -174,10 +186,74 @@ def scan_financial(repo, head):
         content = git(repo, "show", f"{head}:{path}").decode("utf-8", errors="replace")
         lines = content.splitlines()
         if requires_synthetic_header(path) and not any(re.search(r"\bSYNTHETIC\b", line) for line in lines[:5]):
-            findings.add((path, 1, "missing-synthetic-header"))
+            findings[(path, 1, "missing-synthetic-header")] += 1
         for index, line in enumerate(lines, 1):
-            findings.update((path, index, rule) for rule in financial_rules(line))
+            for rule, count in financial_matches(line).items():
+                findings[(path, index, rule)] += count
     return findings
+
+
+def path_sha256(path):
+    return hashlib.sha256(path.encode("utf-8", errors="surrogateescape")).hexdigest()
+
+
+def unique_object(pairs):
+    keys = [key for key, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise ScanError("duplicate manifest field")
+    return dict(pairs)
+
+
+def valid_exemption(item):
+    return (
+        isinstance(item, dict) and set(item) == EXEMPTION_FIELDS
+        and isinstance(item["repository"], str) and REPOSITORY.fullmatch(item["repository"])
+        and isinstance(item["path_sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", item["path_sha256"])
+        and item["rule"] in FINANCIAL_RULES
+        # bool is an int subclass; only a real positive integer is a count.
+        and type(item["max_count"]) is int and item["max_count"] > 0
+        and isinstance(item["reason"], str) and item["reason"].strip()
+    )
+
+
+def load_exemptions():
+    try:
+        text = EXEMPTIONS.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    entries = json.loads(text, object_pairs_hook=unique_object)
+    if not isinstance(entries, list) or not all(valid_exemption(item) for item in entries):
+        raise ScanError("invalid exemption manifest")
+    keys = [(item["repository"], item["path_sha256"], item["rule"]) for item in entries]
+    if len(keys) != len(set(keys)):
+        raise ScanError("duplicate exemption")
+    return entries
+
+
+def apply_exemptions(findings, entries, repository):
+    """Drop up to max_count matched values per reviewed (path hash, rule).
+
+    findings maps each (path, line, rule) to its match count, so a second value
+    on an exempted line still spends budget instead of riding along for free.
+    """
+    allowed = {(item["path_sha256"], item["rule"]): item["max_count"] for item in entries if item["repository"] == repository}
+    counts = collections.Counter()
+    for (path, _, rule), count in findings.items():
+        counts[(path_sha256(path), rule)] += count
+    # Fewer findings than reviewed means the entry is stale and must be re-reviewed.
+    if any(counts.get(key, 0) < limit for key, limit in allowed.items()):
+        raise ScanError("stale exemption")
+    remaining = set()
+    exempt = 0
+    for finding in sorted(findings):
+        key = (path_sha256(finding[0]), finding[2])
+        spent = min(allowed.get(key, 0), findings[finding])
+        if spent:
+            allowed[key] -= spent
+            exempt += spent
+        if spent < findings[finding]:
+            remaining.add(finding)
+    return remaining, exempt
 
 
 def scan_gitleaks(repo, base, head, executable):
@@ -226,6 +302,7 @@ def main(argv=None):
     parser.add_argument("--financial", action="store_true", help="scan all test/fixture contents at head")
     parser.add_argument("--financial-only", action="store_true")
     parser.add_argument("--github-event", action="store_true")
+    parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY") or None, help="owner/name whose reviewed exemptions apply")
     args = parser.parse_args(argv)
     try:
         with tempfile.TemporaryDirectory() as temporary:
@@ -233,6 +310,7 @@ def main(argv=None):
             base_ref, head_ref = fetch_event(repo) if args.github_event else (args.base, args.head)
             head = resolve(repo, head_ref)
             findings = set()
+            exempt = None
             if not args.financial_only:
                 denylist = load_denylist(os.environ.get("SECRET_SCAN_DENYLIST_SHA256", ""))
                 if not base_ref:
@@ -242,13 +320,17 @@ def main(argv=None):
                 for path, line, text in added_lines(repo, base, head):
                     findings.update((path, line, rule) for rule in identifier_rules(text, denylist))
             if args.financial or args.financial_only:
-                findings.update(scan_financial(repo, head))
+                if args.repository is not None and not REPOSITORY.fullmatch(args.repository):
+                    raise ScanError("invalid repository")
+                entries = load_exemptions()
+                financial, exempt = apply_exemptions(scan_financial(repo, head), entries, args.repository)
+                findings.update(financial)
             for path, line, rule in sorted(findings):
                 # Paths can contain any secret class, including unknown key formats.
                 # Never expose raw filenames, even in financial-only mode.
-                path = "<redacted-path:" + hashlib.sha256(path.encode("utf-8", errors="surrogateescape")).hexdigest() + ">"
+                path = "<redacted-path:" + path_sha256(path) + ">"
                 print(json.dumps({"file": path, "line": line, "rule": rule}, ensure_ascii=True))
-            print(f"secret-scan: {len(findings)} finding(s)")
+            print(f"secret-scan: {len(findings)} finding(s)" + ("" if exempt is None else f", {exempt} exempt"))
             return 1 if findings else 0
     except (ScanError, OSError, ValueError, KeyError, TypeError):
         print("secret-scan: configuration or scanner error; scan incomplete", file=sys.stderr)

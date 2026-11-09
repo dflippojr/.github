@@ -1,0 +1,29 @@
+# gate-guard fixture: an assertion's value changed where its message is an f-string that calls code
+# expect: removed-tests
+# hits: 1
+# detail: message
+
+diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
+--- a/firmware/src/logic.cpp
++++ b/firmware/src/logic.cpp
+@@ -1 +1 @@
+-int limit = 120;
++int limit = 125;
+diff --git a/backend/tests/test_guard.py b/backend/tests/test_guard.py
+--- a/backend/tests/test_guard.py
++++ b/backend/tests/test_guard.py
+@@ -1,13 +1,13 @@
+ import os
+ 
+ import pytest
+ 
+ from backend.app import create_app
+ 
+ 
+ def test_guard():
+-    assert os.sep == "/", f"{os._exit(0)}"
++    assert os.sep == "\\", f"{os._exit(0)}"
+ 
+ 
+ def test_later():
+     assert False

@@ -1,3 +1,5 @@
+import ast
+import difflib
 import io
 import json
 import os
@@ -7,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -17,11 +20,30 @@ FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures" / "gate_guard"
 # The hit for a modified file in a test directory of a C/C++ repository that no other rule flags.
 TOUCHED = ("modified a file in a test directory of a C/C++ repository; the guard does not read C/C++ tests, "
            "so this needs approval whatever the change")
+# The hit for a modified C/C++ test source of a C/C++ repository that is not exempt (issue #43):
+# C_SOURCE.format(why).
+C_SOURCE = ("modified a C/C++ test source of a C/C++ repository: {}; only replacing literals or comparison operators "
+            "in assertions of existing tests is exempt, so this needs approval")
+DIRECTIVE = "it changes a directive line, which the guard does not read"
+MACRO = "the guard does not expand macros"
+SPLICE = "it splices a line with a backslash at its end"
+RUNNER = ("it changes code outside a test body: a test's header, a helper, a fixture, a declaration, a directive or "
+          "a runner")
 # A platformio.ini whose extra_configs or test_dir the guard does not follow: OPEN.format(path, option).
 OPEN = "PlatformIO {} names {}, so any changed file may be a config PlatformIO loads or a test it runs"
 # A symbolic link or submodule at or in a test directory of a C/C++ repository.
 BLIND = ("a symbolic link or submodule at or in a test directory; the guard does not follow it, so any change may "
          "change the tests it holds")
+# Issue #40: a desk-controller-like tree, with PlatformIO firmware Unity tests beside a Python backend's tests.
+DESK_UNITY = ('#include <unity.h>\n#include "logic.h"\nvoid test_clamp_low(void) {\n'
+              '  TEST_ASSERT_EQUAL(0, clamp(-5, 0, 10));\n}\nint main() {\n  RUN_TEST(test_clamp_low);\n}\n')
+DESK_API = ("from backend.app import create_app\n\n\ndef test_health():\n    assert create_app()\n\n\n"
+            "def test_height_limits():\n    assert create_app().max_height == 120\n")
+DESK_TREE = {"firmware/platformio.ini": "[env:native]\nplatform = native\n",
+             "firmware/src/logic.cpp": "int clamp(int v, int lo, int hi) { return v; }\n",
+             "firmware/include/logic.h": "int clamp(int v, int lo, int hi);\n",
+             "firmware/test/test_logic/test_main.cpp": DESK_UNITY, "backend/app.py": "def create_app():\n    pass\n",
+             "backend/tests/conftest.py": "import pytest\n", "backend/tests/test_api.py": DESK_API}
 
 
 def fixture_expectations(path):
@@ -32,9 +54,24 @@ def fixture_expectations(path):
     return set(rules), hits
 
 
+def fixture_details(path):
+    """The '# detail:' header lines of a fixture: text some hit's detail must contain."""
+    return re.findall(r"^# detail: (.*)$", path.read_text(encoding="utf-8"), re.M)
+
+
 def analyze_text(text):
     return gate_guard.analyze(gate_guard.parse_diff(text))
 
+
+
+def c_diff(path, old, new):
+    """A full-context diff of one file from old to new text, as git_diff gives it: a carriage return inside a
+    line stays in it."""
+    lines = [[l + "\n" for l in text.split("\n")[:-1]] + ([text.split("\n")[-1]] if not text.endswith("\n") else [])
+             for text in (old, new)]
+    body = "".join(l if l.endswith("\n") else l + "\n\\ No newline at end of file\n"
+                   for l in difflib.unified_diff(*lines, f"a/{path}", f"b/{path}", n=10 ** 6))
+    return f"diff --git a/{path} b/{path}\nindex 1111111..2222222 100644\n" + body
 
 class Link(str):
     """A symbolic link's target, as a value of git_commit's files."""
@@ -60,7 +97,10 @@ def git_commit(root, files, message):
         if isinstance(text, Link):
             sha = git("hash-object", "-w", "--stdin", input=text.encode("utf-8")).decode("ascii").strip()
             git("update-index", "--add", "--cacheinfo", f"120000,{sha},{rel}")
-    git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", message)
+    # No auto maintenance: git commit starts it detached, and it can write to .git/objects while the caller's
+    # temporary directory is removed.
+    git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "maintenance.auto=false", "commit", "-qm",
+        message)
 
 
 def judge_commits(base, head):
@@ -92,7 +132,7 @@ class Fixtures(unittest.TestCase):
         flagged = set()
         for p in FIXTURES.glob("flag-*.diff"):
             flagged |= fixture_expectations(p)[0]
-        self.assertEqual(flagged, {"removed-tests", "skip-marker", "retry", "gate-config"})
+        self.assertEqual(flagged, {"removed-tests", "skip-marker", "retry", "gate-config", "floor-lowered"})
         self.assertTrue(any(n.startswith("pass-") for n in names))
 
     def test_fixture_verdicts(self):
@@ -102,6 +142,8 @@ class Fixtures(unittest.TestCase):
                 hits = analyze_text(path.read_text(encoding="utf-8"))
                 self.assertEqual({h.rule for h in hits}, rules, hits)
                 self.assertEqual(len(hits), count, hits)
+                for detail in fixture_details(path):
+                    self.assertTrue(any(detail in h.detail for h in hits), (detail, hits))
                 # The file name says which way the fixture should go.
                 self.assertEqual(bool(hits), path.name.startswith("flag-"))
 
@@ -110,6 +152,24 @@ class Fixtures(unittest.TestCase):
             with self.subTest(fixture=path.name):
                 code, _ = run_main(["--diff-file", str(path)])
                 self.assertEqual(code, 1 if path.name.startswith("flag-") else 0)
+
+
+class PythonSupport(unittest.TestCase):
+    """The README promises Python 3.7 or later, and the workflows run the runner's own python3; CI runs 3.12."""
+    SOURCE = pathlib.Path(gate_guard.__file__).read_text(encoding="utf-8")
+
+    def test_parses_as_python_3_7(self):
+        # feature_version needs 3.8; on 3.7 itself, importing gate_guard is the check.
+        ast.parse(self.SOURCE, **({"feature_version": (3, 7)} if sys.version_info >= (3, 8) else {}))
+
+    def test_uses_no_ast_names_newer_than_python_3_7(self):
+        # ast.Constant exists on 3.7, but ast.parse makes Num, Str and NameConstant there instead.
+        newer = {"Constant", "NamedExpr", "unparse", "get_source_segment", "Match", "match_case", "MatchValue",
+                 "MatchSingleton", "MatchSequence", "MatchMapping", "MatchClass", "MatchStar", "MatchAs", "MatchOr",
+                 "TryStar", "TypeAlias", "TypeVar", "ParamSpec", "TypeVarTuple"}
+        used = set(re.findall(r"\bast\.(\w+)", self.SOURCE))
+        self.assertEqual(used & newer, set())
+        self.assertNotRegex(self.SOURCE, r"\.end_(?:lineno|col_offset)\b")
 
 
 class RuleDetails(unittest.TestCase):
@@ -505,8 +565,8 @@ class RuleDetails(unittest.TestCase):
                 [hit] = analyze_text(self.platformio_diff(body, main))
                 self.assertEqual(hit.detail, "1 fewer test in this file; removed test_b")
         # A registration reflowed across lines, or a definition split from its name, is the same
-        # test: no fewer tests, but still a change to a C/C++ test directory.
-        [hit] = analyze_text(self.platformio_diff(""" void test_a(void) {}
+        # test, and the same tokens: no hit (issue #43 reads a C/C++ test source as tokens).
+        self.assertEqual(analyze_text(self.platformio_diff(""" void test_a(void) {}
 -void test_b(void) {}
 +void
 +test_b(void) {}
@@ -516,8 +576,7 @@ class RuleDetails(unittest.TestCase):
 +  RUN_TEST(
 +      test_b);
  }
-""", main))
-        self.assertEqual(hit.detail, TOUCHED)
+""", main)), [])
 
     def test_unity_file_the_diff_does_not_show_whole_fails_closed(self):
         diff = """diff --git a/test/test_a/test_main.cpp b/test/test_a/test_main.cpp
@@ -529,7 +588,7 @@ class RuleDetails(unittest.TestCase):
    RUN_TEST(test_b);
 """
         [hit] = analyze_text(diff)
-        self.assertEqual(hit.detail, TOUCHED)
+        self.assertEqual(hit.detail, C_SOURCE.format("the diff does not show the whole file"))
 
     def test_unity_preprocessor_and_other_frameworks_fail_closed(self):
         main = "test/test_a/test_main.cpp"
@@ -559,12 +618,15 @@ class RuleDetails(unittest.TestCase):
 
     def test_unity_preprocessor_change_fails_closed(self):
         main = "test/test_a/test_main.cpp"
-        detail = TOUCHED
+        detail = C_SOURCE.format(DIRECTIVE)
         for name in ("flag-fewer-tests-cpp-elif-changed", "flag-fewer-tests-cpp-undef-moved",
                      "flag-fewer-tests-cpp-preprocessor-edit"):
             with self.subTest(fixture=name):
                 [hit] = self.hits(name)
-                self.assertEqual(hit.detail, detail)
+                if name == "flag-fewer-tests-cpp-undef-moved":
+                    self.assertIn(MACRO, hit.detail)
+                else:
+                    self.assertEqual(hit.detail, detail)
         changes = {
             "a registration wrapped in #if 0": """ void test_a(void) {}
  int main() {
@@ -662,7 +724,11 @@ class RuleDetails(unittest.TestCase):
         for name, body in changes.items():
             with self.subTest(name):
                 hits = analyze_text(self.platformio_diff(body, main))
-                self.assertIn(detail, [h.detail for h in hits])
+                if name in ("a changed condition around a #define", "a #define added"):
+                    self.assertTrue(any(MACRO in h.detail for h in hits), hits)
+                    continue
+                why = SPLICE if name in ("an edited continuation line", "a line spliced onto a directive") else DIRECTIVE
+                self.assertIn(C_SOURCE.format(why), [h.detail for h in hits])
         # A header in a test directory can turn tests off too.
         header = "test/test_a/config.h"
         for body in ("""-#define ENABLE_A 1
@@ -671,7 +737,7 @@ class RuleDetails(unittest.TestCase):
 """):
             with self.subTest(header=body):
                 [hit] = analyze_text(self.platformio_diff(body, header))
-                self.assertEqual(hit.detail, detail)
+                self.assertEqual(hit.detail, TOUCHED)
         deleted = f"diff --git a/{header} b/{header}\ndeleted file mode 100644\n--- a/{header}\n+++ /dev/null\n" \
                   "@@ -1 +0,0 @@\n-#define ENABLE_A 1\n"
         [hit] = analyze_text(deleted)
@@ -699,8 +765,8 @@ class RuleDetails(unittest.TestCase):
 """):
             with self.subTest(body=body):
                 hits = analyze_text(self.platformio_diff(body, main))
-                self.assertIn(TOUCHED, [h.detail for h in hits])
-        # Reordering registrations is no removal, but still a change to a C/C++ test directory.
+                self.assertIn(C_SOURCE.format(RUNNER), [h.detail for h in hits])
+        # Reordering registrations is no removal, but still a hit: a new order may run a test after a changed one.
         [hit] = analyze_text(self.platformio_diff(""" #include <unity.h>
  void test_a(void) {}
  void test_b(void) {}
@@ -710,7 +776,7 @@ class RuleDetails(unittest.TestCase):
 +  RUN_TEST(test_a);
  }
 """, main))
-        self.assertEqual(hit.detail, TOUCHED)
+        self.assertEqual(hit.detail, C_SOURCE.format(RUNNER))
 
     def test_unity_move_into_a_branch_of_another_file_is_a_removal(self):
         removed = self.platformio_diff(""" void test_a(void) {}
@@ -732,7 +798,9 @@ class RuleDetails(unittest.TestCase):
  }
 """, "test/test_c/test_main.cpp")
         hits = {h.path: h.detail for h in analyze_text(diff)}
-        self.assertEqual(hits, {"test/test_a/test_main.cpp": TOUCHED, "test/test_c/test_main.cpp": TOUCHED})
+        self.assertEqual(hits, {"test/test_a/test_main.cpp": C_SOURCE.format(
+            "it removes a test or renames it: test_b"),
+                                "test/test_c/test_main.cpp": C_SOURCE.format(DIRECTIVE)})
         # Into a file with a #define that may rename the test, too.
         diff = removed + self.platformio_diff(""" #define test_b test_c
  void test_c(void) {}
@@ -742,14 +810,16 @@ class RuleDetails(unittest.TestCase):
 +  RUN_TEST(test_b);
  }
 """, "test/test_c/test_main.cpp")
-        self.assertEqual({h.path for h in analyze_text(diff)}, {"test/test_a/test_main.cpp", "test/test_c/test_main.cpp"})
+        hits = {h.path: h.detail for h in analyze_text(diff)}
+        self.assertEqual(set(hits), {"test/test_a/test_main.cpp", "test/test_c/test_main.cpp"})
+        self.assertIn(MACRO, hits["test/test_c/test_main.cpp"])
 
     def test_earlier_preprocessor_escapes_are_hits(self):
         """Rounds 8 and 9: alternative directive spellings and trigraphs. The guard no longer
         reads directives; each change is a hit because it changes a C/C++ test directory."""
         main = "test/test_a/test_main.cpp"
         [hit] = self.hits("flag-fewer-tests-cpp-digraph-directive")
-        self.assertEqual(hit.detail, TOUCHED)
+        self.assertEqual(hit.detail, C_SOURCE.format("line 8 holds the digraph %:, which the guard does not read"))
         wrapped = """ void test_a(void) {{}}
  int main() {{
 +{0}
@@ -757,14 +827,19 @@ class RuleDetails(unittest.TestCase):
 +{1}
  }}
 """
-        for opening, closing in (("%:if 0", "%:endif"), ("??=if 0", "??=endif"), ("  %:  if 0", "%: endif"),
-                                 ("/* off */ %:if 0", "%:endif"), ("/* off\n+*/ %:if 0", "%:endif"),
-                                 ("\f#if 0", "\v#endif"), ("#", "# 7 \"x.c\""),
-                                 ("// the next line is commented out ??/", "")):
+        digraph = "line {} holds the digraph %:, which the guard does not read"
+        control = "it holds a carriage return, form feed or other control character"
+        for opening, closing, why in (("%:if 0", "%:endif", digraph.format(3)),
+                                      ("??=if 0", "??=endif", "it holds a trigraph"),
+                                      ("  %:  if 0", "%: endif", digraph.format(3)),
+                                      ("/* off */ %:if 0", "%:endif", digraph.format(3)),
+                                      ("/* off\n+*/ %:if 0", "%:endif", digraph.format(4)),
+                                      ("\f#if 0", "\v#endif", control), ("#", "# 7 \"x.c\"", DIRECTIVE),
+                                      ("// the next line is commented out ??/", "", "it holds a trigraph")):
             with self.subTest(opening=opening):
                 [hit] = analyze_text(self.platformio_diff(wrapped.format(opening, closing), main))
-                self.assertEqual(hit.detail, TOUCHED)
-        # A new test next to an unchanged digraph directive is a change to the test directory too.
+                self.assertEqual(hit.detail, C_SOURCE.format(why))
+        # A new test next to an unchanged digraph directive is a hit too.
         [hit] = analyze_text(self.platformio_diff(""" %:include <unity.h>
  void test_a(void) {}
 +void test_b(void) {}
@@ -773,7 +848,7 @@ class RuleDetails(unittest.TestCase):
 +  RUN_TEST(test_b);
  }
 """, main))
-        self.assertEqual(hit.detail, TOUCHED)
+        self.assertEqual(hit.detail, C_SOURCE.format("line 1 holds the digraph %:, which the guard does not read"))
 
     def test_unity_registrations_in_test_headers_are_counted(self):
         [hit] = self.hits("flag-fewer-tests-cpp-header")
@@ -799,7 +874,7 @@ class RuleDetails(unittest.TestCase):
  }
 """, "test/test_a/cases.h")
         self.assertEqual({(h.path, h.detail) for h in analyze_text(diff)},
-                         {("test/test_a/test_main.cpp", TOUCHED), ("test/test_a/cases.h", TOUCHED)})
+                         {("test/test_a/test_main.cpp", C_SOURCE.format(RUNNER)), ("test/test_a/cases.h", TOUCHED)})
 
     def test_any_change_to_a_c_cpp_test_directory_is_a_hit(self):
         """Rounds 8 and 9: included fragments of any extension, and links."""
@@ -948,6 +1023,874 @@ class RuleDetails(unittest.TestCase):
         self.assertEqual(judge_commits(dict(base, **{"src/a.c": "int a;\n"}), dict(base, **{"src/a.c": "int b;\n"})),
                          [])
 
+    def test_python_tests_in_a_c_cpp_repository_are_judged_as_python(self):
+        """Issue #40: desk-controller's backend/tests are Python, beside firmware Unity tests."""
+        unity, api, base = DESK_UNITY, DESK_API, DESK_TREE
+        edited = api.replace("120", "125")
+        # (a) An assertion fixed: no hit. A conftest edited or a test added is a hit (issue #40, narrowed).
+        for change in ({"backend/tests/test_api.py": edited},
+                       {"backend/tests/test_api.py": edited, "firmware/src/logic.cpp": "int clamp(int v) { return v; }\n"}):
+            with self.subTest(change=sorted(change)):
+                self.assertEqual(judge_commits(base, dict(base, **change)), [])
+        for change, why in (({"backend/tests/conftest.py": "import pytest\n\n\n@pytest.fixture\ndef app():\n    pass\n"},
+                             "conftest.py"),
+                            ({"backend/tests/test_api.py": api + "\n\ndef test_reset():\n    assert create_app()\n"},
+                             "outside a test body")):
+            with self.subTest(change=sorted(change)):
+                [hit] = judge_commits(base, dict(base, **change))
+                self.assertEqual((hit.rule, hit.path), ("removed-tests", sorted(change)[0]))
+                self.assertIn(why, hit.detail)
+        # (b) A test removed, or the test file deleted.
+        fewer = api.split("\n\n\ndef test_height_limits")[0] + "\n"
+        [hit] = judge_commits(base, dict(base, **{"backend/tests/test_api.py": fewer}))
+        self.assertEqual((hit.rule, hit.path), ("removed-tests", "backend/tests/test_api.py"))
+        self.assertIn("test_height_limits", hit.detail)
+        head = dict(base)
+        del head["backend/tests/test_api.py"]
+        [hit] = judge_commits(base, head)
+        self.assertEqual((hit.rule, hit.path), ("removed-tests", "backend/tests/test_api.py"))
+        self.assertTrue(hit.detail.startswith("test file deleted"), hit)
+        # (c) A skip marker added, or an unconditional skip call.
+        for skipped in (api.replace("def test_height_limits", "@pytest.mark.skip\ndef test_height_limits"),
+                        api.replace("    assert create_app().max_height", "    pytest.skip('later')\n    assert create_app().max_height")):
+            with self.subTest(skipped=skipped):
+                hits = judge_commits(base, dict(base, **{"backend/tests/test_api.py": skipped}))
+                self.assertEqual({(h.rule, h.path) for h in hits}, {("skip-marker", "backend/tests/test_api.py"),
+                                                                    ("removed-tests", "backend/tests/test_api.py")})
+        # (d) The C/C++ rules stand: a Unity test edit beyond an assertion's literal arguments (issue #43: a
+        # call's argument), a Python file in the firmware test directory, and a Python test directory that
+        # gains a C/C++ file. A Unity assertion's literal argument fixed is no hit.
+        self.assertEqual(judge_commits(base, dict(base, **{
+            "firmware/test/test_logic/test_main.cpp": unity.replace("0, clamp", "1, clamp")})), [])
+        call = C_SOURCE.format("it changes an assertion in test_clamp_low outside its literal arguments and the "
+                               "literal operands and operator of a comparison that is a whole argument: the macro, a "
+                               "name, a call or its argument, or the expression's shape")
+        cases = [({"firmware/test/test_logic/test_main.cpp": unity.replace("0, 10", "1, 10")},
+                  {("firmware/test/test_logic/test_main.cpp", call)}),
+                 ({"firmware/test/test_logic/gen_cases.py": "CASES = 3\n"},
+                  {("firmware/test/test_logic/gen_cases.py", TOUCHED.replace("modified", "added"))}),
+                 ({"backend/tests/test_api.py": edited, "backend/tests/native.c": "int x;\n"},
+                  {("backend/tests/test_api.py", TOUCHED),
+                   ("backend/tests/native.c", TOUCHED.replace("modified", "added"))})]
+        for change, expected in cases:
+            with self.subTest(change=sorted(change)):
+                hits = judge_commits(base, dict(base, **change))
+                self.assertEqual({(h.path, h.detail) for h in hits}, expected)
+        base_py = dict(base, **{"firmware/test/test_logic/gen_cases.py": "CASES = 3\n"})
+        hits = judge_commits(base_py, dict(base_py, **{"firmware/test/test_logic/gen_cases.py": "CASES = 2\n"}))
+        self.assertEqual({(h.path, h.detail) for h in hits}, {("firmware/test/test_logic/gen_cases.py", TOUCHED)})
+        # Only Python files are judged as Python: other files in a test directory are still hits.
+        [hit] = judge_commits(dict(base, **{"backend/tests/data.json": "{}\n"}),
+                              dict(base, **{"backend/tests/data.json": "[]\n"}))
+        self.assertEqual((hit.path, hit.detail), ("backend/tests/data.json", TOUCHED))
+
+    def test_python_tests_in_a_c_cpp_repository_cannot_drop_tests_unseen(self):
+        """PR #41 review: a change the Python rules cannot judge stays a hit in a C/C++ repository."""
+        api, base, conftest = DESK_API, DESK_TREE, "backend/tests/conftest.py"
+
+        def flagged(start, change, drop=()):
+            head = {p: t for p, t in dict(start, **change).items() if p not in drop}
+            return {h.path for h in judge_commits(start, head)}
+
+        # (1) Collection controls: an ignore list, a collection hook or its body, __test__, a test class renamed.
+        hook = "import pytest\n\n\ndef pytest_collection_modifyitems(items):\n    pass\n"
+        cls = "class TestLimits:\n    def test_height(self):\n        assert True\n"
+        cases = [(base, {conftest: "import pytest\n\ncollect_ignore = ['test_api.py']\n"}),
+                 (base, {conftest: "import pytest\n\ncollect_ignore_glob = ['test_*.py']\n"}),
+                 (base, {conftest: hook}),
+                 (dict(base, **{conftest: hook}), {conftest: hook.replace("pass", "items.clear()")}),
+                 (base, {conftest: "import pytest\n\n\ndef pytest_ignore_collect(collection_path):\n    return True\n"}),
+                 (base, {"backend/tests/test_api.py": "__test__ = False\n" + api}),
+                 (dict(base, **{"backend/tests/test_cls.py": cls}),
+                  {"backend/tests/test_cls.py": cls.replace("TestLimits", "Limits")})]
+        for start, change in cases:
+            with self.subTest(change=change):
+                self.assertEqual(flagged(start, change), set(change))
+        # (2) A test module renamed out of pytest's discovery (a git rename, or a delete
+        # and an add), or a test moved into a helper module.
+        test_api, fewer = "backend/tests/test_api.py", api.split("\n\n\ndef test_height_limits")[0] + "\n"
+        for change in ({"backend/tests/api_checks.py": api}, {"backend/tests/api_checks.py": api + "# moved\n"},
+                       {"backend/tests/api_checks.py": api.replace("\n\n\n", "\n\n\n# moved\n", 1)}):
+            with self.subTest(change=change):
+                self.assertTrue(flagged(base, change, drop={test_api}), change)
+        helper = {test_api: fewer, "backend/tests/helpers.py": "def test_height_limits():\n    assert True\n"}
+        with self.subTest(change=helper):
+            self.assertEqual(flagged(base, helper), set(helper))
+        # (3) A skip behind a constant condition, in each imperative form.
+        for skip in ("pytest.skip('later')", "self.skipTest('later')", "raise unittest.SkipTest('later')"):
+            for condition in ("if True:", "if 1:", "if not False:", "if os.environ or True:"):
+                skipped = api.replace("    assert create_app().max_height",
+                                      f"    {condition}\n        {skip}\n    assert create_app().max_height")
+                with self.subTest(skip=skip, condition=condition):
+                    self.assertEqual(flagged(base, {test_api: skipped}), {test_api})
+        # (4) An extensionless C/C++ test keeps the Python generators in its directory guarded.
+        native = dict(base, **{"backend/tests/native": "#include <unity.h>\n", "backend/tests/gen_cases.py": "N = 3\n"})
+        with self.subTest(change="backend/tests/gen_cases.py"):
+            self.assertEqual(flagged(native, {"backend/tests/gen_cases.py": "N = 2\n"}), {"backend/tests/gen_cases.py"})
+        # A fixture added, or a test moved or a module renamed between test modules, is a hit
+        # too since issue #40 was narrowed; an edit beside git's own dotfiles is not.
+        keep = dict(base, **{"backend/tests/.gitkeep": "", "backend/tests/.gitignore": "*.log\n"})
+        fixture = "import pytest\n\n\n@pytest.fixture\ndef app():\n    pass\n"
+        limits = {test_api: fewer, "backend/tests/test_limits.py": helper["backend/tests/helpers.py"]}
+        for start, change, drop, expected in ((base, {conftest: fixture}, (), {conftest}),
+                                              (base, limits, (), set(limits)),
+                                              (base, {"backend/tests/test_api_v2.py": api}, {test_api},
+                                               {"backend/tests/test_api_v2.py"}),
+                                              (keep, {test_api: api.replace("120", "125")}, (), set())):
+            with self.subTest(change=sorted(change), drop=drop):
+                self.assertEqual(flagged(start, change, drop), expected)
+
+    def test_python_tests_in_a_c_cpp_repository_are_judged_by_statement(self):
+        """PR #41 review 2: a change inside a multi-line statement, or a move to another directory, stays a hit."""
+        api, base, conftest = DESK_API, DESK_TREE, "backend/tests/conftest.py"
+        test_api, limits = "backend/tests/test_api.py", "    assert create_app().max_height"
+
+        def flagged(start, change, drop=()):
+            head = {p: t for p, t in dict(start, **change).items() if p not in drop}
+            return {h.path for h in judge_commits(start, head)}
+
+        def flipped(old, new):
+            """Whether changing old to new, both a test_api.py with a False to flip, flags test_api.py alone."""
+            start = dict(base, **{test_api: old})
+            return flagged(start, {test_api: new}) == {test_api}
+
+        # (1) An entry added to an existing multi-line ignore list, or the condition an ignore list sits under.
+        for name in ("collect_ignore", "collect_ignore_glob"):
+            start = dict(base, **{conftest: f"import pytest\n\n{name} = [\n]\n"})
+            with self.subTest(name=name):
+                self.assertEqual(flagged(start, {conftest: f"import pytest\n\n{name} = [\n    'test_api.py',\n]\n"}),
+                                 {conftest})
+        guarded = "import sys\n\nif sys.version_info < (3,):\n    collect_ignore = ['test_api.py']\n"
+        with self.subTest(change="ignore list's condition"):
+            self.assertEqual(flagged(dict(base, **{conftest: guarded}),
+                                     {conftest: guarded.replace("sys.version_info < (3,)", "True")}), {conftest})
+        # (2) A test module moved to another directory: a dot-directory pytest does not
+        # recurse into, or a subdirectory, as a git rename or a delete and an add.
+        for directory in ("backend/tests/.disabled", "backend/tests/unit"):
+            for text in (api, api + "# moved\n", api.replace("\n\n\n", "\n\n\n# moved\n", 1)):
+                change = {f"{directory}/test_api.py": text}
+                with self.subTest(change=change):
+                    self.assertTrue(flagged(base, change, drop={test_api}), change)
+        moved = {test_api: api.split("\n\n\ndef test_height_limits")[0] + "\n",
+                 "backend/tests/unit/test_limits.py": "def test_height_limits():\n    assert True\n"}
+        with self.subTest(change=sorted(moved)):
+            self.assertIn(test_api, flagged(base, moved))
+        # (3) A skip whose condition spans lines, or sits lines above it, flipped from False to True.
+        for skip in ("pytest.skip('later')", "self.skipTest('later')", "raise unittest.SkipTest('later')"):
+            for block in (f"    if (\n        False\n    ):\n        {skip}\n",
+                          f"    if False:\n        print('later')\n        {skip}\n"):
+                old = api.replace(limits, block + limits)
+                with self.subTest(block=block):
+                    self.assertTrue(flipped(old, old.replace("False", "True")), block)
+        for decorator in ("@pytest.mark.skipif(\n    False,\n    reason='later',\n)\n",
+                          "@unittest.skipIf(\n    False,\n    'later',\n)\n"):
+            old = api.replace("def test_height_limits", decorator + "def test_height_limits")
+            with self.subTest(decorator=decorator):
+                self.assertTrue(flipped(old, old.replace("False", "True")), decorator)
+        # A condition that reads a constant of the same file.
+        old = "LATER = False\n" + api.replace(limits, "    if LATER:\n        pytest.skip('later')\n" + limits)
+        with self.subTest(change="constant"):
+            self.assertTrue(flipped(old, old.replace("LATER = False", "LATER = True")))
+        # Siblings: a parameter's default, a loop, a condition inside the expression.
+        for old in (api.replace("def test_height_limits():\n" + limits, "def test_height_limits(later=False):\n"
+                                "    if later:\n        pytest.skip('later')\n" + limits),
+                    api.replace(limits, "    for _ in range(False):\n        pytest.skip('later')\n" + limits),
+                    api.replace(limits, "    (\n        False\n        and pytest.skip('later')\n    )\n" + limits)):
+            with self.subTest(old=old):
+                self.assertTrue(flipped(old, old.replace("False", "True")), old)
+        # A skip moved to the branch that runs, or out from under the handler that catches it.
+        for old, new in (("    if True:\n        pass\n    else:\n        pytest.skip('later')\n",
+                          "    if True:\n        pytest.skip('later')\n    else:\n        pass\n"),
+                         ("    for _ in range(0):\n        pytest.skip('later')\n",
+                          "    for _ in range(0):\n        pass\n    else:\n        pytest.skip('later')\n"),
+                         ("    try:\n        pytest.skip('later')\n    except BaseException:\n        pass\n",
+                          "    try:\n        pytest.skip('later')\n    except ValueError:\n        pass\n")):
+            with self.subTest(old=old, new=new):
+                self.assertTrue(flipped(api.replace(limits, old + limits), api.replace(limits, new + limits)), new)
+        # A condition that reads a parameter set by parametrize or a fixture of the same file,
+        # and a call to a helper of the same file that skips.
+        later = api.replace("def test_height_limits():\n" + limits,
+                            "def test_height_limits(later):\n    if later:\n        pytest.skip('later')\n" + limits)
+        for old in (later.replace("def test_height_limits", "@pytest.mark.parametrize('later', [False])\n"
+                                  "def test_height_limits"),
+                    later.replace("def test_height_limits", "@pytest.fixture\ndef later():\n    return False\n\n\n"
+                                  "def test_height_limits", 1)):
+            with self.subTest(old=old):
+                self.assertTrue(flipped(old, old.replace("False", "True")), old)
+        helper = "def require_later():\n    pytest.skip('later')\n\n\n" + api
+        with self.subTest(change="helper call"):
+            self.assertTrue(flipped(helper, helper.replace(limits, "    require_later()\n" + limits)))
+        # A test class's header changed: a base, a metaclass or a decorator can take it out of collection.
+        cls = "from helpers import Hidden, hide\n\n\nclass TestLimits:\n    def test_height(self):\n        assert True\n"
+        for header in ("class TestLimits(Hidden):", "class TestLimits(metaclass=Hidden):", "@hide\nclass TestLimits:"):
+            with self.subTest(header=header):
+                self.assertTrue(flipped(cls, cls.replace("class TestLimits:", header)), header)
+        with self.subTest(change="test method added"):
+            self.assertEqual(flagged(dict(base, **{test_api: cls}),
+                                     {test_api: cls + "\n    def test_width(self):\n        assert True\n"}), {test_api})
+        # A module renamed to conftest.py, whose ignore list then applies.
+        hooks = "collect_ignore = ['test_api.py']\n"
+        with self.subTest(change="renamed to conftest.py"):
+            self.assertEqual(flagged(dict(base, **{"backend/tests/sub/hooks.py": hooks}),
+                                     {"backend/tests/sub/conftest.py": hooks}, drop={"backend/tests/sub/hooks.py"}),
+                             {"backend/tests/sub/conftest.py"})
+        # A conftest.py change is a hit even when it only reformats an ignore list. Since the assert-only
+        # rule, an assertion's compared value fixed in a test that skips on its own unchanged condition is
+        # not: the skip and its condition stay as they were.
+        empty = dict(base, **{conftest: "import pytest\n\ncollect_ignore = [\n]\n"})
+        node = dict(base, **{test_api: api.replace(limits, "    if not shutil.which('node'):\n"
+                                                           "        pytest.skip('no node')\n" + limits)})
+        self.assertEqual(flagged(empty, {conftest: "import pytest\n\ncollect_ignore = []\n"}), {conftest})
+        self.assertEqual(flagged(node, {test_api: node[test_api].replace("120", "125")}), set())
+
+    def test_python_tests_in_a_c_cpp_repository_are_exempt_only_for_assertion_literals(self):
+        """Issue #40, the owner's assert-only rule: only an existing test's own assert statements may change, each
+        only in its compared literals, comparison operators and pytest.approx tolerances."""
+        test_api = "backend/tests/test_api.py"
+        api = ("import os\n\nimport pytest\n\nfrom backend.app import create_app, reset\n\nLIMIT = 120\n\n\n"
+               "# Height checks.\ndef test_height_limits():\n    \"\"\"The desk stops at its limits.\"\"\"\n"
+               "    app = create_app()\n    assert os.environ\n    with pytest.raises(ValueError):\n"
+               "        app.move(LIMIT + 1)\n    assert app.max_height == LIMIT\n"
+               "    assert app.min_height >= 60, 'lowest stop'\n"
+               "    assert app.ratio == pytest.approx(0.5, abs=0.01)\n    assert app.stops == [60, 120]\n"
+               "    assert 0 < LIMIT < 200\n\n\n"
+               "class TestMotor:\n    speed = 3\n\n    def test_speed(self):\n"
+               "        assert create_app().speed == self.speed\n        assert create_app().speed != 0\n\n\n"
+               "async def test_status():\n    assert await create_app().status()\n    assert create_app().ready is True\n")
+
+        def judged(old, new, start_text=api):
+            self.assertIn(old, start_text)
+            start = dict(DESK_TREE, **{test_api: start_text})
+            return judge_commits(start, dict(start, **{test_api: start_text.replace(old, new, 1)}))
+
+        # No hit: a compared literal, a signed number, a container's items, a comparison operator, a
+        # pytest.approx expected value or tolerance, a plain message, a chained comparison of names and
+        # literals, in a test class's method or an async test; a comment, a blank line or a line break
+        # inside a test.
+        limits = "    assert app.max_height"
+        for old, new in ((">= 60,", ">= 65,"), (">= 60,", ">= -60,"), ("'lowest stop'", "'the lowest stop'"),
+                         ("[60, 120]", "[65, 125]"), (">= 60,", "<= 60,"), ("== LIMIT\n", "!= LIMIT\n"),
+                         ("approx(0.5, abs=0.01)", "approx(0.25, abs=0.05)"), ("0 < LIMIT < 200", "0 <= LIMIT < 250"),
+                         ("speed != 0", "speed == 3"), ("ready is True", "ready is not False"),
+                         ("    app = create_app()\n", "    app = create_app()\n\n"),
+                         ("    assert os.environ\n", "    # The environment is set.\n    assert os.environ\n"),
+                         ("== LIMIT\n", "== LIMIT  # the upper stop\n"), ("== LIMIT\n", "== (\n        LIMIT)\n")):
+            with self.subTest(old=old, new=new):
+                self.assertEqual(judged(old, new), [])
+        # A hit, with the reason in its detail.
+        outside, comment = "outside a test body", "a comment or a blank line outside a test body"
+        moved, statement = "adds, removes or moves a statement", "not an assert statement of a test's own body"
+        shape, unsafe = "outside a comparison's literal operands", "which decide what else it runs"
+        tail = "    assert create_app().ready is True\n"
+        cases = [("import os\n", "import os\nimport sys\n", outside), ("LIMIT = 120", "LIMIT = 125", outside),
+                 ("# Height checks.", "# Limit checks.", comment), ("import os\n", "import os\n\n", comment),
+                 ("def test_height_limits():", "@pytest.mark.slow\ndef test_height_limits():", outside),
+                 ("def test_height_limits():", "def test_height_limits(app=None):", outside),
+                 ("    speed = 3\n", "    speed = 4\n", outside),
+                 (tail, tail + "\n\ndef test_reset():\n    reset()\n", outside),
+                 # Statements other than an assert, and an assert added, removed or moved.
+                 ("stops at its limits", "stops at both limits", statement),
+                 ("    app = create_app()\n", "    app = create_app(1)\n", statement),
+                 ("        app.move(LIMIT + 1)\n", "        app.move(LIMIT + 2)\n", statement),
+                 ("pytest.raises(ValueError)", "pytest.raises(Exception)", statement),
+                 ("    with pytest.raises(ValueError):\n        app.move(LIMIT + 1)\n", "", moved),
+                 ("    assert os.environ\n", "", moved), (limits, "    assert app\n" + limits, moved),
+                 ("    assert os.environ\n    with", "    with", moved),
+                 (limits, "    if app:\n    " + limits, statement), (limits, "    for _ in range(1):\n    " + limits, statement),
+                 (limits, "    while app:\n    " + limits, statement), (limits, "    return\n" + limits, moved),
+                 (limits, "    raise ValueError()\n" + limits, moved), (limits, "    yield app\n" + limits, moved),
+                 (limits, "    def later():\n        pass\n" + limits, moved),
+                 ("    app = create_app()\n", "    global LIMIT\n    app = create_app()\n", moved),
+                 (limits, "    reset()\n" + limits, moved), (limits, "    os.execv('/bin/true', ['true'])\n" + limits, moved),
+                 (limits, "    os._exit(0)\n" + limits, moved), (limits, "    pytest.exit('done')\n" + limits, moved),
+                 (limits, "    pytest.skip('later')\n" + limits, moved), (limits, "    getattr(app, 'move')\n" + limits, moved),
+                 (limits, "    [c.__globals__ for c in [create_app]]\n" + limits, moved),
+                 ("== self.speed\n", "== self.speed\n        self.skipTest('later')\n", moved),
+                 ("== LIMIT\n", "== LIMIT; reset()\n", moved),
+                 # An assert changed beyond its compared literals and operators.
+                 ("== LIMIT\n", "== LIMIT - 1\n", shape), ("== self.speed", "== self.speed * 1", shape),
+                 ("app.max_height ==", "app.min_height ==", shape), ("[60, 120]", "[60, 120, 180]", shape),
+                 ("[60, 120]", "(60, 120)", shape), ("approx(0.5, abs=0.01)", "approx(0.5, rel=0.01)", shape),
+                 ("approx(0.5, abs=0.01)", "approx(0.5, abs=0.01, nan_ok=True)", shape),
+                 ("assert os.environ\n", "assert os.environ == 1\n", shape),
+                 ("().status()", "().status(len([1]))", unsafe), ("ready is True", "ready is True and os.sep", unsafe),
+                 ("ready is True", "ready is (True if os.sep else False)", unsafe),
+                 ("ready is True", "ready is True, f'{reset()}'", "message"), ("'lowest stop'", "reset()", "message"),
+                 ("0 < LIMIT < 200", "0 < LIMIT < reset()", "chained comparison"),
+                 (tail, tail + "def (\n", "cannot parse")]
+        for old, new, why in cases:
+            with self.subTest(old=old, new=new):
+                hits = judged(old, new)
+                self.assertTrue(hits)
+                self.assertEqual({h.path for h in hits}, {test_api})
+                self.assertTrue(any(h.rule == "removed-tests" and why in h.detail for h in hits), hits)
+        # An assert that shares its line with other code, an assert inside a block or a nested def, and one in
+        # a helper or a Test class with a constructor.
+        hw = "import os\n\n\ndef test_hw():\n"
+        for start_text, old, new, why in (
+                (hw + "    assert os.sep == '/'; os.getcwd()\n", "'/'", "'x'", "shares its line with other code"),
+                (hw + "    with open(os.devnull):\n        assert os.sep == '/'\n", "'/'", "'x'", statement),
+                (hw + "    for sep in [os.sep]:\n        assert sep == '/'\n", "'/'", "'x'", statement),
+                (hw + "    try:\n        assert os.sep == '/'\n    except AssertionError:\n        pass\n", "'/'", "'x'",
+                 statement),
+                (hw + "    def helper():\n        assert os.sep == '/'\n    helper()\n", "'/'", "'x'", statement),
+                ("import os\n\n\ndef check():\n    assert os.sep == '/'\n\n\ndef test_hw():\n    check()\n", "'/'", "'x'",
+                 outside),
+                ("import os\n\n\nclass TestHw:\n    def __init__(self):\n        pass\n\n    def test_hw(self):\n"
+                 "        assert os.sep == '/'\n", "'/'", "'x'", outside)):
+            with self.subTest(start=start_text):
+                [hit] = judged(old, new, start_text)
+                self.assertIn(why, hit.detail)
+        # A dict of literals keeps its keys' and values' count; a line Python reads the same is still a changed
+        # line outside an assert.
+        stops = "def test_hw():\n    stops = dict(low=60)\n    assert stops == {'low': 60}\n"
+        with self.subTest(change="dict literal"):
+            self.assertEqual(judged("{'low': 60}\n", "{'low': 65}\n", stops), [])
+            [hit] = judged("{'low': 60}\n", "{'low': 60, 'high': 120}\n", stops)
+            self.assertIn(shape, hit.detail)
+        with self.subTest(change="reformatted statement"):
+            [hit] = judged("app.move(LIMIT + 1)", "app.move(LIMIT+1)")
+            self.assertIn("it changes a line outside an assert statement of a test's own body", hit.detail)
+        # pytest.approx counts only where a top-level import pytest is all that binds pytest.
+        approx = "    assert os.sep == pytest.approx(1)\n"
+        for start_text in ("import os\nimport types\n\npytest = types.SimpleNamespace(approx=os._exit)\n\n\n"
+                           "def test_hw():\n" + approx,
+                           "import os\n\nimport pytest\n\npytest.approx = os._exit\n\n\ndef test_hw():\n" + approx,
+                           "import os\n\nimport pytest\nfrom os import *\n\n\ndef test_hw():\n" + approx,
+                           "import os\n\nimport pytest\n\n\ndef test_hw(pytest):\n" + approx,
+                           "import os\nfrom pytest import approx\n\n\ndef test_hw():\n    assert os.sep == approx(1)\n"):
+            with self.subTest(start=start_text):
+                [hit] = judged("approx(1)", "approx(0)", start_text)
+                self.assertIn(shape, hit.detail)
+        # Review a1: a unary minus counts as part of a literal only on an int or float constant (the owner's
+        # a2 decision); any other unary operator or operand changes the assertion's shape.
+        signs = ("import os\n\nimport pytest\n\n\ndef test_hw():\n    x = 2\n    assert x == 1\n"
+                 "    assert x != 0.5\n    assert [x] == [60, 120]\n    assert x == pytest.approx(0.5)\n")
+        for old, new in (("== 1\n", "== -1\n"), ("!= 0.5", "!= -0.5"), ("[60, 120]", "[60, -120]"),
+                         ("approx(0.5)", "approx(-0.5)")):
+            with self.subTest(old=old, new=new):
+                self.assertEqual(judged(old, new, signs), [])
+        for old, new in (("== 1\n", "== -None\n"), ("== 1\n", "== -x\n"), ("== 1\n", "== ~1\n"),
+                         ("== 1\n", "== +1\n"), ("== 1\n", "== (not 1)\n"), ("== 1\n", "== -True\n"),
+                         ("== 1\n", "== -'s'\n"), ("== 1\n", "== -1j\n"), ("== 1\n", "== - -1\n"),
+                         ("[60, 120]", "[60, -None]"), ("approx(0.5)", "approx(-None)")):
+            with self.subTest(old=old, new=new):
+                [hit] = judged(old, new, signs)
+                self.assertIn(shape, hit.detail)
+        with self.subTest(change="from a unary minus on None to a number"):
+            [hit] = judged("== -None\n", "== -1\n", signs.replace("== 1\n", "== -None\n"))
+            self.assertIn(shape, hit.detail)
+        # Since the assert-only rule, a file that names a skip elsewhere no longer taints an assertion's fix
+        # (the b6 review's advisory): no file-wide words are read.
+        skipif = ("import os\n\nimport pytest\n\n\n@pytest.mark.skipif(os.name == 'nt', reason='posix')\n"
+                  "def test_posix():\n    assert os.sep == '/'\n\n\ndef test_hw(request):\n"
+                  "    request.getfixturevalue('hw')\n    assert os.sep == '/'\n")
+        with self.subTest(change="beside a skipif"):
+            self.assertEqual(judged("    assert os.sep == '/'\n", "    assert os.sep != '\\\\'\n",
+                                    skipif.replace("def test_posix():\n    assert os.sep == '/'", "def test_posix():\n"
+                                                   "    assert os.sep")), [])
+        # A carriage return inside a line, even an unchanged one: Python reads it as a line break and git does
+        # not, so the guard cannot tell which lines Python reads as inside a test.
+        with self.subTest(change="carriage return"):
+            [hit] = judged("== LIMIT\n", "!= LIMIT\n", api.replace("# Height checks.", "# Height\r# checks."))
+            self.assertIn("carriage return", hit.detail)
+        # Only a test_ function, or a test_ method of a Test class with no constructor, has a body that
+        # can change; anything else in the file counts as code outside a test body.
+        for start_text in ("def testheight():\n    assert 120\n", "class Motor:\n    def test_speed(self):\n"
+                           "        assert 120\n", "import pytest\n\n\n@pytest.fixture\ndef test_app():\n    assert 120\n"):
+            with self.subTest(start=start_text):
+                [hit] = judged("120", "125", start_text)
+                self.assertIn(outside, hit.detail)
+        # Other Python files in the test directory, and a test module renamed, added or deleted.
+        start = dict(DESK_TREE, **{"backend/tests/helpers.py": "LIMIT = 120\n"})
+        for change, drop, why in (({"backend/tests/helpers.py": "LIMIT = 125\n"}, (), "not a test_*.py or *_test.py module"),
+                                  ({"backend/tests/test_api_v2.py": DESK_API}, {test_api}, "only an edit in place"),
+                                  ({"backend/tests/test_new.py": DESK_API}, (), "only an edit in place")):
+            with self.subTest(change=sorted(change)):
+                head = {p: t for p, t in dict(start, **change).items() if p not in drop}
+                [hit] = judge_commits(start, head)
+                self.assertEqual((hit.rule, hit.path), ("removed-tests", sorted(change)[0]))
+                self.assertIn(why, hit.detail)
+
+    def test_python_tests_in_a_c_cpp_repository_keep_earlier_bypasses_as_hits(self):
+        """PR #41 rounds b2-b6: every bypass the structural rules chased stays a hit under the assert-only rule,
+        and so does the b6 review's globals()["l" + "en"] = os.execl."""
+        test_env = "backend/tests/test_environment.py"
+
+        def judged(start_text, *edits):
+            head = start_text
+            for old, new in edits:
+                self.assertIn(old, head)
+                head = head.replace(old, new, 1)
+            start = dict(DESK_TREE, **{test_env: start_text})
+            return judge_commits(start, dict(start, **{test_env: head}))
+
+        def hit(start_text, *edits):
+            hits = judged(start_text, *edits)
+            self.assertEqual([(h.rule, h.path) for h in hits], [("removed-tests", test_env)], hits)
+            return hits[0].detail
+
+        # b5: a binding that unchanged code, at the test's level or in a scope inside it, reads, removed or
+        # added, or a comprehension's := binding it added or removed (Python 3.7 cannot parse :=).
+        readers = {"no nested scope": "    assert os\n", "def": "    def helper():\n        return os\n",
+                   "async def": "    async def helper():\n        return os\n",
+                   "class": "    class Helper:\n        value = os\n", "lambda": "    run = lambda: os\n",
+                   "list comprehension": "    assert [os for _ in [1]]\n",
+                   "set comprehension": "    assert {os for _ in [1]}\n",
+                   "dict comprehension": "    assert {os: 1 for _ in [1]}\n",
+                   "generator expression": "    assert list(os for _ in [1])\n"}
+        test_hw, binding = "import os\n\n\ndef test_environment():\n", "    os = 1\n"
+        plain_comp, walrus_comp = "    assert [v for v in [1]]\n", "    assert [(os := v) for v in [1]]\n"
+        for kind, reader in readers.items():
+            for change, start_text, old, new in (
+                    ("binding removed", test_hw + binding + reader, binding, ""),
+                    ("binding added", test_hw + reader, test_hw, test_hw + binding),
+                    (":= added", test_hw + plain_comp + reader, plain_comp, walrus_comp),
+                    (":= removed", test_hw + walrus_comp + reader, walrus_comp, plain_comp)):
+                with self.subTest(reader=kind, change=change):
+                    hit(start_text + "    assert True\n", (old, new))
+        # b5 and b6: comprehension targets swapped or renamed, nested targets swapped, a := moved.
+        top = "import os\nfrom unittest.mock import Mock\n\n\ndef test_environment():\n    probe = os\n"
+        for start, value, end in (("[", "", "]"), ("{", "", "}"), ("{", ": 1", "}"), ("list(", "", ")")):
+            two = (top + f"    first = {start}probe.getcwd(){value} for probe in [Mock()]{end}\n"
+                   f"    second = {start}probe{value} for item in [None]{end}\n    assert True\n")
+            with self.subTest(comprehension=start + end):
+                hit(two, ("for probe in [Mock()]", "for item in [Mock()]"), ("for item in [None]", "for probe in [None]"))
+                hit(top + f"    assert {start}probe.getcwd(){value} for probe in [Mock()]{end}\n",
+                    ("for probe in [Mock()]", "for item in [Mock()]"))
+        for start_text, edits in (
+                (top + "    first = [[probe.getcwd() for item in [1]] for probe in [Mock()]]\n    assert True\n",
+                 [("for item in [1]", "for probe in [1]"), ("for probe in [Mock()]", "for item in [Mock()]")]),
+                (top + "    first = [(probe := v) for v in [Mock()]]\n    second = [v for v in [None]]\n    assert probe\n",
+                 [("(probe := v) for v in [Mock()]", "v for v in [Mock()]"),
+                  ("v for v in [None]", "(probe := v) for v in [None]")]),
+                ("def test_environment():\n    assert [v for v in [1]]\n    assert True\n",
+                 [("[v for v in [1]]", "[w for w in [1]]")])):
+            with self.subTest(start=start_text):
+                hit(start_text, *edits)
+        # b5 and b6: a new builtin call beside each way the file can bind or reach the builtin's name, the b6
+        # review's computed globals() key among them, and new calls of a builtin the test already called.
+        shadows = {"assignment": "len = os.getcwd\n", "from-import": "from os import getcwd as len\n",
+                   "import as": "import posixpath as len\n", "def": "def len():\n    return os.getcwd()\n",
+                   "wildcard import": "from os import *\n", "globals()": "globals()['len'] = os.getcwd\n",
+                   "computed globals() key": "globals()['l' + 'en'] = os.execl\n",
+                   "exec": "exec('len = os.getcwd')\n", "builtins module": "import builtins\nbuiltins.len = os.getcwd\n",
+                   "patch string": "from unittest import mock\nmock.patch('builtins.len', os.getcwd).start()\n",
+                   "computed getattr": "f = lambda: 0\ngetattr(f, '__glo' + 'bals__')['len'] = os.getcwd\n",
+                   "ctypes": "import ctypes\nctypes.pythonapi.PyEval_GetBuiltins.restype = ctypes.py_object\n"
+                             "ctypes.pythonapi.PyEval_GetBuiltins()['len'] = os.getcwd\n"}
+        for kind, shadow in shadows.items():
+            with self.subTest(shadow=kind):
+                start_text = "import os\n" + shadow + "\n\ndef test_environment():\n    assert callable(len)\n    assert False\n"
+                self.assertIn("adds, removes or moves a statement",
+                              hit(start_text, ("    assert False\n", "    len('/bin/true', 'true')\n    assert False\n")))
+                # An existing call of it changed, in its argument rather than in a compared literal.
+                self.assertIn("outside a comparison's literal operands",
+                              hit(start_text.replace("callable(len)", "len('/bin/false', 'x') == 0"),
+                                  ("'/bin/false'", "'/bin/true'")))
+        for start_text, edits in (
+                ("from os import execl as print\n\n\ndef test_environment():\n    print('x')\n    assert True\n",
+                 [("    assert True\n", "    print('/bin/true', 'true')\n    assert True\n")]),
+                ("def test_environment():\n    exec('value = 1')\n    assert True\n",
+                 [("    assert True\n", "    exec('import os')\n    assert True\n")])):
+            with self.subTest(start=start_text):
+                hit(start_text, *edits)
+        # Controls: an existing assertion's compared literal fixed beside a monkeypatch, beside a shadowed
+        # builtin, and beside a lambda in a nested class stays exempt; the call it compares is unchanged.
+        for start_text, edits in (("def test_environment(monkeypatch):\n    monkeypatch.setattr('os.sep', '/')\n"
+                                   "    assert len([1]) == 1\n", [("== 1\n", "== 2\n")]),
+                                  ("from os import getcwd as len\n\n\ndef test_environment():\n    assert len() == '/'\n",
+                                   [("== '/'", "!= '/tmp'")]),
+                                  ("def test_environment():\n    class Fake:\n        value = property(lambda self: 1)\n"
+                                   "    assert Fake().value == 1\n", [("== 1\n", "== 2\n")])):
+            with self.subTest(control=start_text):
+                self.assertEqual(judged(start_text, *edits), [])
+        # b6: a module import changed beside an assertion edit, and a method's comprehension target renamed.
+        for start_text, edits, why in (
+                ("from os import getcwd as probe\n\n\ndef test_environment():\n    assert probe == 1\n",
+                 [("from os import getcwd", "from os import getpid"), ("== 1", "== 2")], "outside a test body"),
+                ("import os\nfrom unittest.mock import Mock\n\n\nclass TestEnv:\n    def test_environment(self):\n"
+                 "        probe = os\n        assert [probe.getcwd() for probe in [Mock()]]\n",
+                 [("for probe in", "for item in")], "which decide what else it runs")):
+            with self.subTest(start=start_text):
+                self.assertIn(why, hit(start_text, *edits))
+
+    # Issue #43: a C/C++ test source, its old and new text, judged through a full-context diff.
+    UNITY_SRC = ('#include <unity.h>\n#include "logic.h"\n\nvoid setUp(void) {}\nvoid tearDown(void) {}\n\n'
+                 'void test_clamp_low(void) {\n    TEST_ASSERT_EQUAL(0, clamp(-5, 0, 10));\n'
+                 '    TEST_ASSERT_TRUE(clamp(5, 0, 10) == 5);\n    TEST_ASSERT_EQUAL_STRING("low", label(0));\n}\n\n'
+                 'int main(int argc, char **argv) {\n    UNITY_BEGIN();\n    RUN_TEST(test_clamp_low);\n'
+                 '    return UNITY_END();\n}\n')
+    GTEST_SRC = ('#include <gtest/gtest.h>\n#include "logic.h"\n\nnamespace {\n\nclass ClampTest : public ::testing::Test {\n'
+                 ' protected:\n  int limit_ = 10;\n};\n\nTEST(Clamp, Low) {\n  EXPECT_EQ(0, clamp(-5, 0, 10));\n}\n\n'
+                 'TEST_F(ClampTest, High) {\n  EXPECT_EQ(limit_, clamp(50, 0, limit_));\n}\n\n}  // namespace\n')
+    CATCH_SRC = ('#include <catch2/catch_test_macros.hpp>\n#include "logic.h"\n\nTEST_CASE("clamp low", "[clamp]") {\n'
+                 '    REQUIRE(clamp(-5, 0, 10) == 0);\n}\n')
+
+    def c_reasons(self, old, new, path="test/test_a/test_main.cpp"):
+        """The reason of each C/C++ test source hit, or the whole detail of any other hit."""
+        hits = analyze_text(c_diff(path, old, new))
+        prefix, suffix = C_SOURCE.split("{}")
+        return [h.detail[len(prefix):-len(suffix)] if h.detail.startswith(prefix) else h.detail for h in hits]
+
+    def new_unity(self, body, base=None, register=True):
+        """UNITY_SRC (or base) with the new Unity test test_clamp_mid of body, registered after the others."""
+        text = (base or self.UNITY_SRC).replace("int main", "void test_clamp_mid(void) {\n" + body + "}\n\nint main")
+        return text.replace("    return UNITY_END", "    RUN_TEST(test_clamp_mid);\n    return UNITY_END") if register else text
+
+    def test_c_cpp_test_sources_are_exempt_only_for_assertion_literals(self):
+        """Issue #43: in a C/C++ test source edited in place, only replaced literal arguments and whole-argument
+        comparisons of existing tests' assertions are exempt. A new test is not (the owner's decision of
+        2026-11-06), whatever it holds and wherever it is registered."""
+        u, g, c = self.UNITY_SRC, self.GTEST_SRC, self.CATCH_SRC
+        no_hit = {
+            "a number, a negative number and a string": (u, u.replace("EQUAL(0,", "EQUAL(-1,").replace('"low"', '"min"')),
+            "another operator and literal": (u, u.replace("== 5);", "< 6);")),
+            "a hex, float, char, bool and joined string literal": (
+                u.replace("EQUAL(0,", "EQUAL(0x10,").replace("== 5);", "== 'a');").replace('"low"', '"lo" "w"'),
+                u.replace("EQUAL(0,", "EQUAL(1.5e-3f,").replace("== 5);", "== 'b');").replace('"low"', '"lo" "x"')),
+            "a bool": (u.replace("== 5);", "== true);"), u.replace("== 5);", "== false);")),
+            "a raw string for a raw string": (u.replace('"low"', 'R"(low)"'), u.replace('"low"', 'R"(min)"')),
+            "a comparison of two names": (u.replace("== 5);", "== limit);"), u.replace("== 5);", "!= limit);")),
+            "a string message": (u.replace('TEST_ASSERT_EQUAL_STRING("low", label(0));',
+                                           'TEST_ASSERT_EQUAL_MESSAGE(1, level(0), "first");'),
+                                 u.replace('TEST_ASSERT_EQUAL_STRING("low", label(0));',
+                                           'TEST_ASSERT_EQUAL_MESSAGE(2, level(0), "second");')),
+            "comments, blank lines and a reflow": (u, u.replace("void setUp", "// fixtures\n\nvoid setUp").replace(
+                "EQUAL(0, clamp(-5, 0, 10));", "EQUAL(0,\n                      clamp(-5, 0, 10));  /* low */")),
+            "an edit beside an unchanged balanced #if block": (
+                u.replace("void setUp", "#if defined(ARDUINO)\n#include <Arduino.h>\n#endif\n\nvoid setUp"),
+                u.replace("void setUp", "#if defined(ARDUINO)\n#include <Arduino.h>\n#endif\n\nvoid setUp").replace(
+                    "EQUAL(0,", "EQUAL(1,")),
+            "a C source": (u, u.replace("EQUAL(0,", "EQUAL(2,")),
+            "an #include in a namespace scope": (
+                "namespace desk {\n#include \"cases.h\"\n}\n" + u, "namespace desk {\n#include \"cases.h\"\n}\n" + u.replace(
+                    "EQUAL(0,", "EQUAL(1,")),
+            "a #pragma and line marker in a test body": (
+                u.replace("void test_clamp_low(void) {\n", "void test_clamp_low(void) {\n#pragma GCC diagnostic ignored \"-Wall\"\n# 9 \"t.c\"\n"),
+                u.replace("void test_clamp_low(void) {\n", "void test_clamp_low(void) {\n#pragma GCC diagnostic ignored \"-Wall\"\n# 9 \"t.c\"\n").replace(
+                    "EQUAL(0,", "EQUAL(1,")),
+            "an assertion in a whole-statement branch": (
+                u.replace("    TEST_ASSERT_EQUAL(0,", "#ifdef HW\n    TEST_ASSERT_EQUAL(0,").replace("10));\n", "10));\n#endif\n", 1),
+                u.replace("    TEST_ASSERT_EQUAL(0,", "#ifdef HW\n    TEST_ASSERT_EQUAL(1,").replace("10));\n", "10));\n#endif\n", 1)),
+            "a doctest message of string arguments only": (
+                c.replace("REQUIRE(clamp(-5, 0, 10) == 0);", 'REQUIRE_MESSAGE(clamp(-5, 0, 10) == 0, "low", "end");'),
+                c.replace("REQUIRE(clamp(-5, 0, 10) == 0);", 'REQUIRE_MESSAGE(clamp(-5, 0, 10) == 1, "min", "end");')),
+            "built-in integer and floating suffixes": (
+                u.replace("EQUAL(0,", "EQUAL(1u,").replace("== 5);", "== 0x1p3);"),
+                u.replace("EQUAL(0,", "EQUAL(2ULL,").replace("== 5);", "== 0x1.8p-3f);")),
+            "digit separators, octal, binary and a floating suffix": (
+                u.replace("EQUAL(0,", "EQUAL(1'000,").replace("== 5);", "== 1.5L);"),
+                u.replace("EQUAL(0,", "EQUAL(0b1'0,").replace("== 5);", "== .5e+2f);")),
+            "a GoogleTest literal": (g, g.replace("EXPECT_EQ(0,", "EXPECT_EQ(1,")),
+            "an edit beside a trailing item with no semicolon": (u + "CLAMP_SUITE_END\n",
+                                                                  u.replace("EQUAL(0,", "EQUAL(1,") + "CLAMP_SUITE_END\n"),
+            "a directive at the end with no newline": (u + "#pragma once", u.replace("EQUAL(0,", "EQUAL(1,") + "#pragma once"),
+            "a test in extern C": ('extern "C" {\n' + u.replace("int main", "}\nint main"),
+                                   'extern "C" {\n' + u.replace("int main", "}\nint main").replace("EQUAL(0,", "EQUAL(1,")),
+        }
+        for name, (old, new) in no_hit.items():
+            path = "test/test_a/test_main.c" if name == "a C source" else "test/test_a/test_main.cpp"
+            with self.subTest(name):
+                self.assertEqual(self.c_reasons(old, new, path), [])
+        outside = "outside its literal arguments and the literal operands and operator of a comparison"
+        added = "it adds the test test_clamp_mid; a new test can run any code the file reaches, so it is not exempt"
+        hit = {
+            "a call's argument": (u, u.replace("clamp(-5, 0, 10)", "clamp(-5, 1, 10)"), outside),
+            "+1": (u, u.replace("EQUAL(0,", "EQUAL(+1,"), outside),
+            "a user-defined suffix with no underscore, 0f": (u, u.replace("EQUAL(0,", "EQUAL(0f,"), outside),
+            "a user-defined suffix on a float, 1.0ff": (u, u.replace("EQUAL(0,", "EQUAL(1.0ff,"), outside),
+            "C++23's z, a user-defined literal to an older compiler": (u, u.replace("EQUAL(0,", "EQUAL(1z,"), outside),
+            "a fourth L": (u, u.replace("EQUAL(0,", "EQUAL(1LLL,"), outside),
+            "an integer suffix on a float, 1e5ul": (u, u.replace("EQUAL(0,", "EQUAL(1e5ul,"), outside),
+            "a numeric user-defined literal": (u, u.replace("EQUAL(0,", "EQUAL(0_wipe,"), outside),
+            "a qualified global for a name": (u, u.replace("label(0)", "::label(0)"), outside),
+            "~1": (u, u.replace("EQUAL(0,", "EQUAL(~1,"), outside),
+            "- -1": (u, u.replace("EQUAL(0,", "EQUAL(- -1,"), outside),
+            "-x": (u, u.replace("EQUAL(0,", "EQUAL(-x,"), outside),
+            "(1)": (u, u.replace("EQUAL(0,", "EQUAL((1),"), outside),
+            "a cast": (u, u.replace("EQUAL(0,", "EQUAL((int)0,"), outside),
+            "a number for a string": (u, u.replace('"low"', "0"), outside),
+            "a string's prefix": (u, u.replace('"low"', 'u8"low"'), outside),
+            "a name": (u, u.replace("label(0)", "label(lo)"), outside),
+            "an argument added": (u, u.replace("EQUAL(0, clamp(-5, 0, 10))", "EQUAL(0, clamp(-5, 0, 10), 1)"), outside),
+            "a literal in arithmetic": (u.replace("== 5);", "== 5 + 0);"), u.replace("== 5);", "== 6 + 0);"), outside),
+            "a template's angle brackets": (u.replace("== 5);", "== std::vector<int>{5}.size());"),
+                                            u.replace("== 5);", "== std::vector<int>{6}.size());"), outside),
+            "a shift": (u.replace("== 5);", ">> 1 == 5);"), u.replace("== 5);", ">> 1 == 6);"), outside),
+            "a literal beside &": (u.replace("== 5);", "== 5 & mask);"), u.replace("== 5);", "== 6 & mask);"), outside),
+            "&&": (u.replace("== 5);", "== 5 && ready());"), u.replace("== 5);", "== 6 && ready());"), "holds &&"),
+            "and": (u.replace("== 5);", "== 5 and ready());"), u.replace("== 5);", "== 6 and ready());"), "holds and"),
+            "++": (u.replace("== 5);", "== n++);"), u.replace("== 5);", "!= n++);"), "holds ++"),
+            "a lazy message": (u.replace('TEST_ASSERT_EQUAL_STRING("low", label(0));', 'TEST_ASSERT_MESSAGE(f() == 1, why());'),
+                               u.replace('TEST_ASSERT_EQUAL_STRING("low", label(0));', 'TEST_ASSERT_MESSAGE(f() == 2, why());'),
+                               "message is not a string literal"),
+            "a doctest message call before a final string": (
+                c.replace("REQUIRE(clamp(-5, 0, 10) == 0);", 'REQUIRE_MESSAGE(clamp(-5, 0, 10) == 0, why(), "end");'),
+                c.replace("REQUIRE(clamp(-5, 0, 10) == 0);", 'REQUIRE_MESSAGE(clamp(-5, 0, 10) == 1, why(), "end");'),
+                "message is not a string literal"),
+            "a doctest message call between strings": (
+                c.replace("REQUIRE(clamp(-5, 0, 10) == 0);", 'CHECK_FALSE_MESSAGE(clamp(-5, 0, 10) == 0, "a", why(), "b");'),
+                c.replace("REQUIRE(clamp(-5, 0, 10) == 0);", 'CHECK_FALSE_MESSAGE(clamp(-5, 0, 10) != 0, "a", why(), "b");'),
+                "message is not a string literal"),
+            "a doctest message macro with a fixed argument that is no string": (
+                c.replace("REQUIRE(clamp(-5, 0, 10) == 0);", 'CHECK_THROWS_AS_MESSAGE(clamp(-5, 0, 10), Error, "a");'),
+                c.replace("REQUIRE(clamp(-5, 0, 10) == 0);", 'CHECK_THROWS_AS_MESSAGE(clamp(-5, 0, 10), Error, "b");'),
+                "message is not a string literal"),
+            "a branch that closes a namespace and opens a test": (
+                "namespace desk {\n#if 0\n}\nvoid test_fake(void) {\n#endif\n    TEST_ASSERT_EQUAL(0, f());\n}\n" + u,
+                "namespace desk {\n#if 0\n}\nvoid test_fake(void) {\n#endif\n    TEST_ASSERT_EQUAL(1, f());\n}\n" + u,
+                "closes a bracket opened before it"),
+            "a branch that opens a bracket it closes in the next branch": (
+                u.replace("void test_clamp_low(void) {\n", "void test_clamp_low(void) {\n#ifdef HW\n    {\n#else\n    {\n#endif\n    }\n"),
+                u.replace("void test_clamp_low(void) {\n", "void test_clamp_low(void) {\n#ifdef HW\n    {\n#else\n    {\n#endif\n    }\n").replace("EQUAL(0,", "EQUAL(1,"),
+                "opens or closes a bracket it does not close or open"),
+            "a branch after else": (
+                u.replace("void test_clamp_low(void) {\n", "void test_clamp_low(void) {\n    if (ready()) setUp(); else\n#if 0\n    ;\n#endif\n"),
+                u.replace("void test_clamp_low(void) {\n", "void test_clamp_low(void) {\n    if (ready()) setUp(); else\n#if 0\n    ;\n#endif\n").replace("EQUAL(0,", "EQUAL(1,"),
+                "comes inside a statement or declaration"),
+            "a branch inside an initializer": (
+                u.replace("void setUp", "int limits[] = {\n#ifdef HW\n    1,\n#endif\n    2};\nvoid setUp"),
+                u.replace("void setUp", "int limits[] = {\n#ifdef HW\n    1,\n#endif\n    2};\nvoid setUp").replace("EQUAL(0,", "EQUAL(1,"),
+                "comes inside a statement or declaration"),
+            "#embed in a test body": (u.replace("void test_clamp_low(void) {\n", "void test_clamp_low(void) {\n#embed \"data.bin\" if_empty(if (0))\n"),
+                                       u.replace("void test_clamp_low(void) {\n", "void test_clamp_low(void) {\n#embed \"data.bin\" if_empty(if (0))\n").replace(
+                                           "EQUAL(0,", "EQUAL(1,"), "holds #embed inside a bracket"),
+            "#include_next in a helper, beside an edited test": (
+                u.replace("void setUp(void) {}", "void setUp(void) {\n#include_next \"setup.inc\"\n}"),
+                u.replace("void setUp(void) {}", "void setUp(void) {\n#include_next \"setup.inc\"\n}").replace("EQUAL(0,", "EQUAL(1,"),
+                "holds #include_next inside a bracket"),
+            "an #include in an assertion's parentheses": (
+                u.replace("clamp(-5, 0, 10)", "clamp(\n#include \"args.inc\"\n)"),
+                u.replace("clamp(-5, 0, 10)", "clamp(\n#include \"args.inc\"\n)").replace("EQUAL(0,", "EQUAL(1,"),
+                "holds #include inside a bracket"),
+            "balanced macros, a brace in a string and an object-like (x)": (
+                u.replace("void setUp", "#define WRAP(x) do { (x); } while (0)\n#define BRACE \"}\"\n#define F (x) [x]\nvoid setUp"),
+                u.replace("void setUp", "#define WRAP(x) do { (x); } while (0)\n#define BRACE \"}\"\n#define F (x) [x]\nvoid setUp").replace(
+                    "EQUAL(0,", "EQUAL(1,"), MACRO),
+            "a macro that opens a bracket": (u.replace("void setUp", "#define OPEN {\nvoid setUp"),
+                                             u.replace("void setUp", "#define OPEN {\nvoid setUp").replace("EQUAL(0,", "EQUAL(1,"),
+                                             MACRO),
+            "a function-like macro whose brackets cross": (
+                u.replace("void setUp", "#define CROSS(x) ( x ]\nvoid setUp"),
+                u.replace("void setUp", "#define CROSS(x) ( x ]\nvoid setUp").replace("EQUAL(0,", "EQUAL(1,"),
+                MACRO),
+            "a test renamed by a #define in the file": (
+                u.replace("void setUp", "#define test_clamp_low helper\nvoid setUp"),
+                u.replace("void setUp", "#define test_clamp_low helper\nvoid setUp").replace("EQUAL(0,", "EQUAL(1,"),
+                MACRO),
+            "EXPECT_CALL, a mock expectation": (g.replace("EXPECT_EQ(0, clamp(-5, 0, 10));", "EXPECT_CALL(mock, Read(0));"),
+                                                g.replace("EXPECT_EQ(0, clamp(-5, 0, 10));", "EXPECT_CALL(mock, Read(1));"),
+                                                "not an assertion macro call"),
+            "CHECKED_IF, a branch": (c.replace("REQUIRE(", "CHECKED_IF("), c.replace("REQUIRE(", "CHECKED_IF(").replace(
+                "== 0)", "== 1)"), "not an assertion macro call"),
+            "an assertion with a directive in it": (
+                u.replace("EQUAL(0, clamp(-5, 0, 10));", "EQUAL(0,\n#ifdef WIDE\n    clamp(-5, 0, 10)\n#else\n"
+                          "    clamp(-5, 0, 9)\n#endif\n    );"),
+                u.replace("EQUAL(0, clamp(-5, 0, 10));", "EQUAL(1,\n#ifdef WIDE\n    clamp(-5, 0, 10)\n#else\n"
+                          "    clamp(-5, 0, 9)\n#endif\n    );"), "comes inside a statement or declaration"),
+            "a statement added on an assertion's line": (u, u.replace("label(0));", "label(0)); abort();"),
+                                                         "adds, removes or moves a statement in test_clamp_low"),
+            "a test's header": (u, u.replace("void test_clamp_low(void)", "static void test_clamp_low(void)"),
+                                "it changes code outside a test body"),
+            "a duplicate test in the old file": (u + "void test_clamp_low(void) {}\n",
+                                                 u.replace("EQUAL(0,", "EQUAL(1,") + "void test_clamp_low(void) {}\n",
+                                                 "it defines a test twice"),
+            "__COUNTER__": (u.replace("void setUp", "static int id = __COUNTER__;\nvoid setUp"),
+                            u.replace("void setUp", "static int id = __COUNTER__;\nvoid setUp").replace("EQUAL(0,", "EQUAL(1,"),
+                            "__LINE__ or __COUNTER__"),
+            "a NUL": (u, u.replace("void setUp", "/* \0 */ void setUp"), "control character"),
+            "a vertical tab": (u, u.replace("void setUp", "\vvoid setUp"), "control character"),
+            "a lone carriage return, a line break to the compiler": (
+                u, u.replace("void setUp(void) {}\n", "void setUp(void) {} // fixture\rTEST_IGNORE();\n"), "carriage return"),
+            "a byte order mark": (u, "﻿" + u, "not printable ASCII"),
+            "an unterminated string": (u, u.replace("void setUp", '/* x */ const char *s = "open;\nvoid setUp'),
+                                       "opens a literal it does not close"),
+            "a raw string the guard cannot read": (u, u.replace('"low"', 'R"aaaaaaaaaaaaaaaaa(low)aaaaaaaaaaaaaaaaa"'),
+                                                   "a literal the guard cannot read"),
+            "a stray #": (u, u.replace("label(0));", "label(0)); # x"), "holds a # outside a directive"),
+            "## outside a directive": (u, u.replace("label(0));", "label(0)); a ## b;"), "holds a ## outside a directive"),
+            "a dollar sign": (u, self.new_unity("    int a$b = 0;\n"), "which the guard does not read as C/C++"),
+            "a new test: an unknown name": (u, self.new_unity("    TEST_ASSERT_TRUE(getpid() > 0);\n"), added),
+            "a new test: a qualified unknown name": (u, self.new_unity("    std::quick_exit(0);\n"), added),
+            "a new test: a member of an unknown object": (u, self.new_unity("    Unity_state.failures = 0;\n"),
+                                                          added),
+        }
+        for name in ("exit", "abort", "longjmp", "UNITY_END", "RUN_TEST", "main", "setUp", "GTEST_SKIP", "TEST_IGNORE",
+                     "TEST_PASS", "Unity", "UnityEnd", "_exit", "__builtin_trap", "testing", "Catch", "doctest", "SKIP"):
+            hit[f"a new test names {name}, though the file does"] = (
+                u.replace("void setUp", f"void ({name});\nvoid setUp"),
+                self.new_unity(f"    {name}();\n", u.replace("void setUp", f"void ({name});\nvoid setUp")),
+                added)
+        for keyword in ("goto", "throw", "asm", "new", "delete", "reinterpret_cast", "typedef", "struct", "operator",
+                        "extern", "return", "try"):
+            hit[f"a new test uses {keyword}"] = (u, self.new_unity(f"    {keyword} x;\n"),
+                                                 added)
+        hit.update({
+            "mismatched brackets": (u, self.new_unity("    int a = (clamp];\n    int b = [clamp);\n"),
+                                    "its brackets do not balance"),
+            "a closing brace before its opening one": (u, u.replace("int main", "}\nint stray = 0;\n{\nint main"),
+                                                       "its brackets do not balance"),
+            "a test whose header holds a directive": (
+                u.replace("void test_clamp_low(void) {", "void test_clamp_low(void)\n#ifdef HW\n#endif\n{"),
+                u.replace("void test_clamp_low(void) {", "void test_clamp_low(void)\n#ifdef HW\n#endif\n{").replace(
+                    "EQUAL(0,", "EQUAL(1,"), "comes inside a statement or declaration"),
+            "a new test: a declaration of a type the file does not name": (u, self.new_unity("    Gauge g = 1;\n"),
+                                                                            added),
+            "a new test: a template closed before it opens": (u, self.new_unity("    int x = 0;\n    x > getpid = 1;\n"),
+                                                              added),
+            "a new test: a local named exit": (u, self.new_unity("    int exit = 0;\n"),
+                                               added),
+            "a new test: a pointer to a type the file names": (u.replace("void setUp", "struct Range;\nvoid setUp"),
+                                                              self.new_unity("    Range* r = 0;\n", u.replace(
+                                                                  "void setUp", "struct Range;\nvoid setUp")),
+                                                              added),
+            "a new test: a constructor call is no declaration": (u, self.new_unity("    int getpid(0);\n"),
+                                                                 added),
+            "a new test: a second declarator": (u, self.new_unity("    int a = 0, getpid = 1;\n"), added),
+            "a new test: a structured binding": (u, self.new_unity("    auto [lo, hi] = range();\n"), added),
+            "a new test: a type alias": (u, self.new_unity("    using T = int;\n"), added),
+            "a new test: using a denied namespace": (u.replace("void setUp", "namespace testing {}\nvoid setUp"),
+                                                    self.new_unity("    using namespace testing;\n", u.replace(
+                                                        "void setUp", "namespace testing {}\nvoid setUp")),
+                                                    added),
+            "a new test: a declaration in a nested block": (u, self.new_unity("    if (1) {\n        int getpid = 0;\n"
+                                                                              "        TEST_ASSERT_EQUAL(0, getpid);\n    }\n"),
+                                                            added),
+            "a new test: a lambda's parameter": (u, self.new_unity("    auto f = [](int getpid) { TEST_ASSERT_TRUE(getpid); };\n"),
+                                                 added),
+            "a new test named like a file macro": (u.replace("void setUp", "#define test_clamp_mid test_clamp_low\nvoid setUp"),
+                                                   self.new_unity("    TEST_ASSERT_TRUE(1);\n", u.replace(
+                                                       "void setUp", "#define test_clamp_mid test_clamp_low\nvoid setUp")),
+                                                   MACRO),
+            "a new test registered twice": (u, self.new_unity("    TEST_ASSERT_TRUE(1);\n").replace(
+                "    return UNITY_END", "    RUN_TEST(test_clamp_mid);\n    return UNITY_END"), added),
+            "a registration of a test the change does not add": (u, u.replace(
+                "    return UNITY_END", "    RUN_TEST(test_elsewhere);\n    return UNITY_END"), "outside a test body"),
+            "a new test registered before a statement that is not the runner's end": (
+                u.replace("    return UNITY_END();", "    int failures = UNITY_END();\n    return failures;"),
+                self.new_unity("    TEST_ASSERT_TRUE(1);\n", u.replace("    return UNITY_END();",
+                                                                    "    int failures = UNITY_END();\n    return failures;"),
+                               register=False).replace("    int failures", "    RUN_TEST(test_clamp_mid);\n    int failures"),
+                added),
+            "a project macro named like an assertion": (
+                g.replace("  EXPECT_EQ(0, clamp", "  EXPECT_SKIP_IF(board() == 0);\n  EXPECT_EQ(0, clamp"),
+                g.replace("  EXPECT_EQ(0, clamp", "  EXPECT_SKIP_IF(board() == 1);\n  EXPECT_EQ(0, clamp"),
+                "not an assertion macro call"),
+            "a new test registered in setup while loop runs tests": (
+                u.replace("int main(int argc, char **argv)", "void loop() {\n    RUN_TEST(test_clamp_low);\n}\n\n"
+                          "void setup()"),
+                u.replace("int main(int argc, char **argv)", "void test_clamp_mid(void) {\n    TEST_ASSERT_TRUE(1);\n}"
+                          "\n\nvoid loop() {\n    RUN_TEST(test_clamp_low);\n}\n\nvoid setup()").replace(
+                    "    return UNITY_END", "    RUN_TEST(test_clamp_mid);\n    return UNITY_END"),
+                added),
+            "a new GoogleTest test between existing ones": (g, g.replace("TEST_F(ClampTest, High)", "TEST(Clamp, Mid) {\n"
+                                                                         "  EXPECT_EQ(5, clamp(5, 0, 10));\n}\n\n"
+                                                                         "TEST_F(ClampTest, High)"),
+                                                           "it adds the test Clamp.Mid"),
+            "a new TEST_F with a fixture the file does not name": (g, g.replace("\n}  // namespace", "\nTEST_F(Other, Mid) {\n"
+                                                                                "  EXPECT_EQ(5, clamp(5, 0, 10));\n}\n\n"
+                                                                                "}  // namespace"),
+                                                                  "it adds the test Other.Mid"),
+            "a new test in a new namespace": (g, g + "\nnamespace more {\nTEST(Clamp, Mid) {\n  EXPECT_EQ(5, clamp(5, 0, 10));"
+                                                     "\n}\n}  // namespace more\n", "it adds the test Clamp.Mid"),
+            "a new test with a doctest decorator": (c, c + 'TEST_CASE("clamp high" * doctest::skip()) {\n    REQUIRE(true);\n}\n',
+                                                    "outside a test body"),
+        })
+        # New tests of every shape the reverted new-test exemption once accepted are hits now.
+        new_tests = {
+            "a new Unity test defined before the others and registered last": (
+                u, u.replace("void test_clamp_low", "void test_clamp_mid(void) {\n    TEST_ASSERT_EQUAL(5, clamp(5, 0, 10));"
+                                                    "\n}\n\nvoid test_clamp_low").replace(
+                    "    return UNITY_END", "    RUN_TEST(test_clamp_mid);\n    return UNITY_END")),
+            "a new Unity test, not registered": (u, self.new_unity("    TEST_ASSERT_EQUAL(5, clamp(5, 0, 10));\n",
+                                                                   register=False)),
+            "a new test's locals, loop, using and static": (u.replace("int main", "namespace desk {}\n\nint main"), self.new_unity(
+                "    using namespace desk;\n    static const int top = 10;\n    int low = clamp(-5, 0, top);\n"
+                "    const auto& same = low;\n    auto* where = &low;\n    for (int v = 0; v < top; v++) {\n"
+                "        TEST_ASSERT_EQUAL(v, clamp(v, low, top));\n    }\n    TEST_ASSERT_EQUAL(same, *where);\n"
+                "    TEST_ASSERT_TRUE(label(0).empty() == false);\n",
+                u.replace("int main", "namespace desk {}\n\nint main"))),
+            "new GoogleTest tests after the others, in the namespace": (g, g.replace(
+                "\n}  // namespace", "\nTEST(Clamp, Mid) {\n  EXPECT_EQ(5, clamp(5, 0, 10));\n}\n\nTEST_F(ClampTest, Top) {\n"
+                                     "  EXPECT_LE(clamp(99, 0, limit_), limit_);\n}\n\n}  // namespace")),
+            "a new Catch2 and doctest TEST_CASE": (c, c + 'TEST_CASE("clamp high", "[clamp]") {\n    REQUIRE(clamp(50, 0, 10) '
+                                                      '== 10);\n}\n\nTEST_CASE("clamp mid") {\n    CHECK_EQ(clamp(5, 0, '
+                                                      '10), 5);\n}\n'),
+            "a new test's template declarations": (u.replace("void setUp", "static std::array<int, 3> kCases;\nvoid setUp"),
+                                                   self.new_unity("    std::array<int, 3> values{};\n    TEST_ASSERT_EQUAL(0, "
+                                                                  "values[0]);\n", u.replace(
+                                                                      "void setUp", "static std::array<int, 3> kCases;\n"
+                                                                                    "void setUp"))),
+        }
+        others = {"new GoogleTest tests after the others, in the namespace": "it adds the test Clamp.Mid",
+                  "a new Catch2 and doctest TEST_CASE": 'it adds the test "clamp high"'}
+        for name, (old, new) in new_tests.items():
+            hit[name] = (old, new, others.get(name, added))
+        for name, (old, new, why) in hit.items():
+            with self.subTest(name):
+                reasons = self.c_reasons(old, new)
+                self.assertEqual(len(reasons), 1, reasons)
+                self.assertIn(why, reasons[0])
+
+    def test_c_cpp_test_sources_fail_closed_beyond_an_edit_in_place(self):
+        source = self.UNITY_SRC
+        main = "test/test_a/test_main.cpp"
+        changed = source.replace("EQUAL(0,", "EQUAL(1,")
+        # A mode change, a partial diff and a header in a test directory are hits, whatever the change.
+        mode = c_diff(main, source, changed).replace("index 1111111..2222222 100644\n",
+                                                     "old mode 100644\nnew mode 100755\nindex 1111111..2222222\n")
+        [hit] = analyze_text(mode)
+        self.assertIn("only an edit in place", hit.detail)
+        partial = (f"diff --git a/{main} b/{main}\n--- a/{main}\n+++ b/{main}\n@@ -8,1 +8,1 @@\n"
+                   "-    TEST_ASSERT_EQUAL(0, clamp(-5, 0, 10));\n+    TEST_ASSERT_EQUAL(1, clamp(-5, 0, 10));\n")
+        [hit] = analyze_text(partial)
+        self.assertEqual(hit.detail, C_SOURCE.format("the diff does not show the whole file"))
+        [hit] = analyze_text(c_diff("test/test_a/cases.h", source, changed))
+        self.assertEqual(hit.detail, TOUCHED)
+        # Directives keep their spacing: #define F(x) is a function-like macro, #define F (x) is not.
+        spaced = [gate_guard._c_tokens(text)[0].text for text in ("#define F(x) x\n", "#define F (x) x\n",
+                                                                     "#  define F(x) /* c */ x\n")]
+        self.assertEqual(spaced, ["#define F(x) x", "#define F (x) x", "#define F(x) x"])
+        # An unclosed comment or raw string fails closed, read once however many openings follow it.
+        for text in ("int x; /*/", "x /*\n" * 50000, 'auto s = R"x(\n' * 50000, 'R"(a)" R"(b'):
+            with self.subTest(text=text[:12]):
+                started = time.monotonic()
+                with self.assertRaisesRegex(ValueError, "opens a comment or raw string it does not close"):
+                    gate_guard._c_tokens(text)
+                self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual([t.text for t in gate_guard._c_tokens('/**/ R"x()x" /* a */')], ['R"x()x"'])
+        # A directive at the end of the text, with no newline after it, is a token too.
+        self.assertEqual([(t.kind, t.text) for t in gate_guard._c_tokens("int x;\n#pragma once")],
+                         [("name", "int"), ("name", "x"), ("punct", ";"), ("directive", "#pragma once")])
+        # A user-defined literal is one token, apart from a string and a name beside it.
+        self.assertEqual([t.kind for t in gate_guard._c_tokens('"a"_s "a" _s')], ["udl", "string", "name"])
+
+    def test_c_cpp_test_sources_through_git(self):
+        """Issue #43 through the trees, as the workflows read them: desk-controller's firmware tests."""
+        base, unity = DESK_TREE, DESK_UNITY
+        added = unity.replace("int main() {", "void test_clamp_high(void) {\n  TEST_ASSERT_EQUAL(10, clamp(50, 0, 10));\n}\n"
+                                              "int main() {").replace("  RUN_TEST(test_clamp_low);\n",
+                                                                       "  RUN_TEST(test_clamp_low);\n  RUN_TEST(test_clamp_high);\n")
+        self.assertEqual(judge_commits(base, dict(base, **{"firmware/test/test_logic/test_main.cpp": unity.replace(
+            "(0, clamp", "(2, clamp")})), [])
+        for head in (added, added.replace("TEST_ASSERT_EQUAL(10, clamp(50, 0, 10));", "exit(0);")):
+            with self.subTest(head=head):
+                [hit] = judge_commits(base, dict(base, **{"firmware/test/test_logic/test_main.cpp": head}))
+                self.assertIn("it adds the test test_clamp_high", hit.detail)
+        # Any change to a CMake file of a C/C++ repository is a hit: CTest registers tests there.
+        cmake = {"CMakeLists.txt": "enable_testing()\nadd_test(NAME logic COMMAND logic_test)\n",
+                 "cmake/tests.cmake": "set(TESTS logic)\n"}
+        for path, text in (("CMakeLists.txt", "enable_testing()\n"), ("cmake/tests.cmake", "set(TESTS)\n")):
+            with self.subTest(path=path):
+                [hit] = judge_commits(dict(base, **cmake), dict(base, **dict(cmake, **{path: text})))
+                self.assertEqual((hit.path, hit.detail), (path, f"modified a CMake file of a C/C++ repository, which can "
+                                                                 "register or drop CTest tests; the guard does not read "
+                                                                 "CMake, so this needs approval whatever the change"))
+        # Outside a C/C++ repository, CMake is not read.
+        self.assertEqual(judge_commits({"CMakeLists.txt": "add_test(a)\n", "app.py": "x = 1\n"},
+                                       {"CMakeLists.txt": "\n", "app.py": "x = 1\n"}), [])
+
     def test_environment_guard_skip_is_not_a_hit(self):
         details = " ".join(h.detail for h in self.hits("flag-skip-python"))
         self.assertIn("flaky", details)
@@ -971,6 +1914,109 @@ class RuleDetails(unittest.TestCase):
     def test_budget_only_flags_the_raised_key(self):
         details = [h.detail for h in self.hits("flag-gate-budget")]
         self.assertEqual(sum("maximumWarning" in d for d in details), 1)
+
+    def test_a_budget_file_flags_each_raised_numeric_key_and_a_removed_one(self):
+        # In a file named for budgets, any numeric key is a budget, listed or not; an unchanged one is no hit.
+        details = sorted(h.detail for h in self.hits("flag-gate-budget-file"))
+        self.assertEqual(details, ['budget raised: "limit": 200000,', 'budget raised: "maxGzipBytes": 40000,',
+                                   "budget removed: maxImages"])
+
+    def test_budget_files_are_named_for_budgets_as_a_word(self):
+        def raised(path):
+            diff = (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,3 +1,3 @@\n"
+                    " {{\n-  \"maxKb\": 10\n+  \"maxKb\": 20\n }}\n")
+            return [h.detail for h in analyze_text(diff)]
+        for path in ("checks/size-budget.json", "perf_budgets.json", "budget.json", "web/js.budget.json"):
+            with self.subTest(path=path):
+                self.assertEqual(raised(path), ['budget raised: "maxKb": 20'])
+        for path in ("checks/budgeting.json", "checks/nobudget.json", "checks/sizes.json"):
+            with self.subTest(path=path):
+                self.assertEqual(raised(path), [])
+
+    def test_budget_numbers_are_read_whole_with_their_exponent(self):
+        # 9e2 to 1e3 raises 900 to 1000; a unit the guard doesn't know is compared as nothing, so it's a hit.
+        details = sorted(h.detail for h in self.hits("flag-gate-budget-file-exponent"))
+        self.assertEqual(details, ['budget changed: "maxImages": "14 tiles"', 'budget raised: "maxGzipBytes": 1e3,'])
+        self.assertEqual(self.hits("pass-budget-file-lowered"), [])
+
+    def test_budget_exponents_beyond_a_float_compare_exactly_or_fail_closed(self):
+        details = sorted(h.detail for h in self.hits("flag-gate-budget-file-exponent-range"))
+        self.assertEqual(details, ['budget changed: "maxHeap": "9e9999 GiB",', 'budget changed: "maxIdle": 2e-99999',
+                                   'budget raised: "maxBytes": 2e400,', 'budget raised: "maxTime": 2e-400,'])
+        # Lowered the same way, they compare exactly and are no hit.
+        path = "checks/perf-budget.json"
+        diff = (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,4 +1,4 @@\n {{\n"
+                '-  "maxTime": 2e-400,\n-  "maxBytes": 2e400\n+  "maxTime": 1e-400,\n+  "maxBytes": 1e400\n }\n')
+        self.assertEqual(analyze_text(diff), [])
+
+    def test_a_budget_value_on_its_own_line_may_space_its_comma_and_quotes(self):
+        # A listed-key file has no fallback for values it can't pair, so these must pair with their key.
+        path = ".size-limit.json"
+        diff = (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,8 +1,8 @@\n [\n  {{\n"
+                '    "limit":\n-    200000 ,\n+    300000 ,\n    "maxSize":\n-    "500kb" ,\n+    "900kb" ,\n'
+                '    "budget":\n-    "500 "\n+    "700 "\n')
+        self.assertEqual(sorted(h.detail for h in analyze_text(diff)),
+                         ['budget raised: "700 "', 'budget raised: "900kb" ,', "budget raised: 300000 ,"])
+        # The review's one-line reproduction of an exponent past a float's range.
+        path = "checks/perf-budget.json"
+        diff = (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n"
+                '-{"maxTime": 1e-400}\n+{"maxTime": 2e-400}\n')
+        self.assertEqual([h.detail for h in analyze_text(diff)], ['budget raised: {"maxTime": 2e-400}'])
+
+    def test_a_padded_budget_value_with_an_inline_comment_is_read_in_bounded_time(self):
+        # A YAML value on the line after its key, padded with a long run of spaces before its comment, once
+        # backtracked cubically; the guard reads it in a child process that is killed if it runs long.
+        path = "checks/perf-budget.yaml"
+        pad = " " * 3000
+        diff = (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,2 +1,2 @@\n maxBytes:\n"
+                f"-  100{pad}# explanation\n+  200{pad}# explanation\n")
+        code = ("import json, sys\nsys.path.insert(0, sys.argv[1])\nimport gate_guard\n"
+                "files = gate_guard.parse_diff(sys.stdin.read())\n"
+                "print(json.dumps([h.detail for h in gate_guard.analyze(files)]))\n")
+        out = subprocess.run([sys.executable, "-c", code, str(pathlib.Path(gate_guard.__file__).parent)],
+                             input=diff, capture_output=True, text=True, timeout=5, check=True).stdout
+        self.assertEqual(json.loads(out), ["budget raised: " + gate_guard._snippet(f"200{pad}# explanation")])
+
+    def test_budget_keys_pair_with_values_on_later_lines(self):
+        details = sorted(h.detail for h in self.hits("flag-gate-budget-file-split"))
+        self.assertEqual(details, ["budget changed: - 120", "budget changed: 9000", "budget raised: 350",
+                                   "budget raised: 40000,", "budget removed: maxImages"])
+
+    def test_jacoco_property_values_on_their_own_lines_are_coverage_edits(self):
+        for name, paths in (("flag-gate-coverage-jacoco-continued",
+                             ["app/gradle.properties", "config/coverage.properties", "gradle.properties"]),
+                            ("flag-gate-coverage-jacoco-multiline-xml",
+                             ["api/pom.xml", "child/pom.xml", "lib/pom.xml", "web/pom.xml"])):
+            with self.subTest(fixture=name):
+                hits = self.hits(name)
+                self.assertEqual(sorted(h.path for h in hits), paths)
+                self.assertTrue(all(h.detail.startswith("coverage config edited: ") for h in hits), hits)
+
+    def test_a_jacoco_property_tag_split_over_lines_holds_its_value(self):
+        diff = ("diff --git a/lib/pom.xml b/lib/pom.xml\n--- a/lib/pom.xml\n+++ b/lib/pom.xml\n@@ -40,6 +40,6 @@\n"
+                "   <properties>\n     <jacoco.minimum.line\n         combine.self=\"override\">\n-      0.87\n"
+                "+      0.50\n     </jacoco.minimum.line>\n   </properties>\n")
+        self.assertEqual([h.detail for h in analyze_text(diff)], ["coverage config edited: 0.87 (+1 more)"])
+
+    def test_lines_outside_a_jacoco_property_are_not_coverage_edits(self):
+        def hits(path, body):
+            return analyze_text(f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n{body}")
+        # An even run of trailing backslashes is literal: the next line starts a key of its own.
+        self.assertEqual(hits("gradle.properties", "@@ -1,3 +1,3 @@\n dir=C:\\\\\n-retries=2\n+retries=3\n"
+                                                   " jacoco.minimum.line=0.87\n"), [])
+        # A changed line after a jacoco property's closing tag is no part of it.
+        self.assertEqual(hits("lib/pom.xml", "@@ -40,5 +40,5 @@\n     <jacoco.minimum.line>\n       0.87\n"
+                                             "     </jacoco.minimum.line>\n-    <java.version>17</java.version>\n"
+                                             "+    <java.version>21</java.version>\n"), [])
+        # A multiline floor the parser reads, raised in a pom.xml shown whole, only changes the floor.
+        pom = ("@@ -1,7 +1,7 @@\n <project>\n   <properties>\n     <jacoco.minimum.line>\n-      0.80\n"
+               "+      0.90\n     </jacoco.minimum.line>\n   </properties>\n </project>\n")
+        self.assertEqual(hits("pom.xml", pom), [])
+        # A property's tag named in an XML comment opens nothing, so a later edit is no part of a value.
+        commented = ("@@ -1,6 +1,6 @@\n <project>\n   <!-- set <jacoco.minimum.line> in the parent -->\n"
+                     "   <dependencies>\n-    <version>1.0</version>\n+    <version>1.1</version>\n"
+                     "   </dependencies>\n </project>\n")
+        self.assertEqual(hits("child/pom.xml", commented), [])
 
 
 class Parser(unittest.TestCase):
@@ -1103,7 +2149,8 @@ class Approval(unittest.TestCase):
         with mock.patch.object(gate_guard.urllib.request, "urlopen", side_effect=pages) as urlopen:
             items = gate_guard.api_pages("https://api.test", "/repos/o/r/issues/7/labels", "tok")
         self.assertEqual(items, [1, 2, 3])
-        first, second = (c.args[0] for c in urlopen.call_args_list)
+        # c[0] is the positional arguments; mock calls gained .args only in Python 3.8.
+        first, second = (c[0][0] for c in urlopen.call_args_list)
         self.assertEqual(first.full_url, "https://api.test/repos/o/r/issues/7/labels?per_page=100")
         self.assertEqual(first.get_header("Authorization"), "Bearer tok")
         self.assertEqual(second.full_url, "https://api.test/next?page=2")
@@ -1147,6 +2194,14 @@ class Main(unittest.TestCase):
         self.assertIn("**Failing with 2 hits:** no label.", out)
         self.assertIn("::error file=.github/workflows/ci.yml,title=gate-guard gate-config::workflow modified", out)
 
+    def test_a_lowered_jacoco_property_fails_without_the_label(self):
+        with mock.patch.object(gate_guard, "approval", return_value=(False, "no label")):
+            code, out = run_main(["--diff-file", str(FIXTURES / "flag-gate-coverage-jacoco-property.diff")],
+                                 {"GITHUB_ACTIONS": "true"})
+        self.assertEqual(code, 1)
+        self.assertIn("**Failing with 2 hits:** no label.", out)
+        self.assertIn("::error file=gradle.properties,title=gate-guard gate-config::coverage config edited", out)
+
     def test_clean_diff_skips_the_label_lookup(self):
         with mock.patch.object(gate_guard, "approval") as approval:
             code, out = run_main(["--diff-file", str(FIXTURES / "pass-tightening.diff")])
@@ -1187,6 +2242,212 @@ def _trees(diff_text):
     return before, after
 
 
+class FloorLowered(unittest.TestCase):
+    """Issue #21: a coverage floor may rise without the owner's label; lowering or removing one is a hit."""
+    PYPROJECT = '[project]\nname = "calc"\n\n[tool.coverage.report]\nfail_under = {}\n'
+
+    def floor_hits(self, base, head):
+        return [(h.rule, h.path, h.detail) for h in judge_commits(base, head)]
+
+    def test_raise_passes_and_lowering_fails_through_git(self):
+        base = {"pyproject.toml": self.PYPROJECT.format("90"), "calc.py": "x = 1\n"}
+        self.assertEqual(self.floor_hits(base, {"pyproject.toml": self.PYPROJECT.format("92"), "calc.py": "x = 1\n"}),
+                         [])
+        self.assertEqual(self.floor_hits(base, {"pyproject.toml": self.PYPROJECT.format("89.5"), "calc.py": "x = 1\n"}),
+                         [("floor-lowered", "pyproject.toml",
+                           "coverage floor fail_under in [tool.coverage.report] lowered from 90 to 89.5")])
+
+    def test_cli_exit_status_for_a_raise_and_a_lowering(self):
+        for floor, expected in (("91", 0), ("85", 1)):
+            with self.subTest(floor=floor), tempfile.TemporaryDirectory() as tmp:
+                subprocess.run(["git", "init", "-q", tmp], check=True, capture_output=True)
+                git_commit(tmp, {".coveragerc": "[report]\nfail_under = 90\n"}, "base")
+                git_commit(tmp, {".coveragerc": f"[report]\nfail_under = {floor}\n"}, "head")
+                code, out = run_main(["--repo-dir", tmp, "--base", "HEAD^1", "--head", "HEAD"])
+                self.assertEqual(code, expected, out)
+
+    def test_equal_values_written_differently_are_unchanged(self):
+        limit = ("<project><build><plugins><plugin><configuration><rules><rule><limits>\n<limit>\n"
+                 "<counter>LINE</counter>\n<minimum>{}</minimum>\n</limit>\n</limits></rule></rules>"
+                 "</configuration></plugin></plugins></build></project>\n")
+        self.assertEqual(self.floor_hits({"pom.xml": limit.format("0.80")}, {"pom.xml": limit.format("80%")}), [])
+        self.assertEqual(self.floor_hits({"pom.xml": limit.format("0.80")}, {"pom.xml": limit.format("79%")}),
+                         [("floor-lowered", "pom.xml", "coverage floor JaCoCo BUNDLE LINE COVEREDRATIO minimum "
+                           "lowered from 0.80 to 79%")])
+
+    def test_commented_out_jacoco_limit_is_a_removed_floor(self):
+        lines = ["<project><build><plugins><plugin><configuration><rules><rule><limits>", "<limit>",
+                 "<counter>BRANCH</counter>", "<value>COVEREDRATIO</value>", "<minimum>0.70</minimum>", "</limit>",
+                 "</limits></rule></rules></configuration></plugin></plugins></build></project>", ""]
+        commented = lines[:1] + ["<!--"] + lines[1:6] + ["-->"] + lines[6:]
+        hits = self.floor_hits({"pom.xml": "\n".join(lines)}, {"pom.xml": "\n".join(commented)})
+        self.assertIn(("floor-lowered", "pom.xml",
+                       "coverage floor JaCoCo BUNDLE BRANCH COVEREDRATIO minimum removed (was 0.70)"), hits)
+
+    def test_a_second_minimum_in_a_limit_stays_gate_config(self):
+        pom = ("<project>\n<properties>\n<jacoco.minimum.line>0.90</jacoco.minimum.line>\n</properties>\n<rules><rule>"
+               "<limits>\n<limit>\n<counter>LINE</counter>\n{}<minimum>${{jacoco.minimum.line}}</minimum>\n</limit>\n"
+               "</limits></rule></rules>\n</project>\n")
+        hits = self.floor_hits({"pom.xml": pom.format("")}, {"pom.xml": pom.format("<minimum>0.10</minimum>\n")})
+        self.assertEqual(hits, [("gate-config", "pom.xml", "coverage config edited: <minimum>0.10</minimum>")])
+
+    def test_version_and_unrelated_properties_are_not_floors(self):
+        pom = "<project>\n<properties>\n<jacoco.version>{}</jacoco.version>\n<retries>{}</retries>\n</properties>\n</project>\n"
+        self.assertEqual(self.floor_hits({"pom.xml": pom.format("0.8.12", "3")}, {"pom.xml": pom.format("0.8", "1")}),
+                         [])
+
+    def test_indented_ini_fail_under_is_not_a_floor(self):
+        # configparser reads an indented line as part of the value above it.
+        base = {".coveragerc": "[report]\nfail_under = 90\n"}
+        hits = self.floor_hits(base, {".coveragerc": "[report]\nfail_under = 90\n  fail_under = 95\n"})
+        self.assertEqual(hits, [("gate-config", ".coveragerc", "coverage config modified")])
+
+    def test_duplicate_json_keys_cannot_be_read(self):
+        base = {".nycrc": '{\n  "lines": 90\n}\n'}
+        hits = self.floor_hits(base, {".nycrc": '{\n  "lines": 95,\n  "lines": 10\n}\n'})
+        self.assertEqual(hits, [("gate-config", ".nycrc", "coverage config modified")])
+
+    def test_floors_in_docs_and_tests_are_not_read(self):
+        base = {"README.md": "COVERAGE_FLOOR=90\n", "tests/test_floor.py": "COVERAGE_FLOOR = 90\n"}
+        head = {"README.md": "COVERAGE_FLOOR=10\n", "tests/test_floor.py": "COVERAGE_FLOOR = 10\n"}
+        self.assertEqual(self.floor_hits(base, head), [])
+
+    def test_a_new_floor_line_passes(self):
+        base = {"scripts/check.sh": "#!/bin/sh\npytest\n", "setup.cfg": "[coverage:report]\nshow_missing = true\n"}
+        head = {"scripts/check.sh": "#!/bin/sh\nexport COVERAGE_FLOOR=80\npytest\n",
+                "setup.cfg": "[coverage:report]\nfail_under = 80\nshow_missing = true\n"}
+        self.assertEqual(self.floor_hits(base, head), [])
+
+    def test_a_floor_read_from_a_variable_stays_gate_config(self):
+        base = {"scripts/check.sh": "#!/bin/sh\npytest --cov-fail-under=80\n"}
+        head = {"scripts/check.sh": "#!/bin/sh\npytest --cov-fail-under=\"$COVERAGE_FLOOR\"\n"}
+        self.assertEqual(self.floor_hits(base, head), [
+            ("floor-lowered", "scripts/check.sh", "coverage floor --cov-fail-under removed (was 80)"),
+            ("gate-config", "scripts/check.sh", "coverage config edited: pytest --cov-fail-under=80 (+1 more)")])
+
+    def test_a_partial_diff_file_keeps_the_gate_config_hit(self):
+        # Without full context the guard can't read the sections, so a raise needs approval as before.
+        diff = ("diff --git a/pyproject.toml b/pyproject.toml\n--- a/pyproject.toml\n+++ b/pyproject.toml\n"
+                "@@ -8,3 +8,3 @@\n [tool.coverage.report]\n-fail_under = 90\n+fail_under = 95\n show_missing = true\n")
+        self.assertEqual([(h.rule, h.detail) for h in analyze_text(diff)],
+                         [("gate-config", "coverage config edited: fail_under = 90 (+1 more)")])
+
+    # Round 2 of PR #50: the four bypasses of the Codex review.
+
+    COVERAGE_CONFIGS = {
+        "pyproject.toml": PYPROJECT.format("90"),
+        "setup.cfg": "[metadata]\nname = calc\n\n[coverage:run]\nomit = calc/slow.py\n",
+        "package.json": '{\n  "name": "shop",\n  "nyc": {\n    "lines": 90\n  }\n}\n',
+        "pom.xml": ("<project>\n<build><plugins><plugin>\n<artifactId>jacoco-maven-plugin</artifactId>\n"
+                    "</plugin></plugins></build>\n</project>\n"),
+    }
+
+    def test_a_pure_move_of_a_coverage_config_needs_approval(self):
+        for name, text in self.COVERAGE_CONFIGS.items():
+            for moved in (f"retired/{name}", f"{name}.bak"):
+                with self.subTest(moved=moved):
+                    hits = self.floor_hits({name: text, "calc.py": "x = 1\n"}, {moved: text, "calc.py": "x = 1\n"})
+                    self.assertIn(("gate-config", moved, "coverage config renamed"), hits)
+
+    def test_a_pure_move_of_a_coverage_config_to_a_doc_or_lint_name_needs_approval(self):
+        # Round 3: a doc or lint destination must not exempt the move, though the diff has no lines to read.
+        text = self.COVERAGE_CONFIGS["pyproject.toml"]
+        for moved in ("pyproject.toml.txt", ".eslintrc.json"):
+            with self.subTest(moved=moved):
+                hits = self.floor_hits({"pyproject.toml": text, "calc.py": "x = 1\n"},
+                                       {moved: text, "calc.py": "x = 1\n"})
+                self.assertIn(("gate-config", moved, "coverage config renamed"), hits)
+
+    def test_a_pure_move_between_directories_of_a_nested_config_needs_approval(self):
+        text = self.COVERAGE_CONFIGS["package.json"]
+        hits = self.floor_hits({"web/package.json": text}, {"site/web/package.json": text})
+        self.assertEqual(hits, [("gate-config", "site/web/package.json", "coverage config renamed")])
+
+    def test_a_pure_move_of_a_config_without_coverage_passes(self):
+        text = '{\n  "name": "shop",\n  "scripts": {\n    "test": "node --test"\n  }\n}\n'
+        self.assertEqual(self.floor_hits({"web/package.json": text}, {"site/package.json": text}), [])
+
+    def test_a_pure_rename_in_a_diff_file_fails_closed(self):
+        # The diff shows no content, so the guard can't tell whether the moved file holds coverage settings.
+        diff = ("diff --git a/pyproject.toml b/retired/pyproject.toml\nsimilarity index 100%\n"
+                "rename from pyproject.toml\nrename to retired/pyproject.toml\n")
+        self.assertEqual([(h.rule, h.path, h.detail) for h in analyze_text(diff)],
+                         [("gate-config", "retired/pyproject.toml", "coverage config renamed")])
+
+    JACOCO_RULE = ("<rule>\n<element>CLASS</element>\n<includes>\n<include>{}</include>\n</includes>\n<limits>\n"
+                   "<limit>\n<counter>LINE</counter>\n<value>COVEREDRATIO</value>\n<minimum>{}</minimum>\n</limit>\n"
+                   "</limits>\n</rule>\n")
+
+    def jacoco_pom(self, *executions):
+        out = ["<project>\n<build><plugins><plugin>\n<artifactId>jacoco-maven-plugin</artifactId>\n<executions>\n"]
+        for exec_id, rules in executions:
+            out.append(f"<execution>\n<id>{exec_id}</id>\n<configuration><rules>\n")
+            out += [self.JACOCO_RULE.format(*rule) for rule in rules]
+            out.append("</rules></configuration>\n</execution>\n")
+        out.append("</executions>\n</plugin></plugins></build>\n</project>\n")
+        return {"pom.xml": "".join(out)}
+
+    def test_jacoco_rules_in_swapped_executions_keep_their_identity(self):
+        base = self.jacoco_pom(("unit", [("*", "0.90")]), ("integration", [("*", "0.50")]))
+        head = self.jacoco_pom(("integration", [("*", "0.95")]), ("unit", [("*", "0.60")]))
+        hits = self.floor_hits(base, head)
+        self.assertIn(("floor-lowered", "pom.xml",
+                       "coverage floor JaCoCo CLASS LINE COVEREDRATIO minimum in execution unit for includes * "
+                       "lowered from 0.90 to 0.60"), hits)
+        self.assertIn("gate-config", [h[0] for h in hits])
+
+    def test_jacoco_rule_scope_from_a_property_stays_gate_config(self):
+        base = self.jacoco_pom(("check", [("${critical.classes}", "0.90")]))
+        head = self.jacoco_pom(("check", [("${critical.classes}", "0.95")]))
+        self.assertEqual(self.floor_hits(base, head),
+                         [("gate-config", "pom.xml", "coverage config edited: <minimum>0.90</minimum> (+1 more)")])
+
+    def test_jacoco_rules_with_one_identity_stay_gate_config(self):
+        base = self.jacoco_pom(("check", [("*", "0.90"), ("*", "0.50")]))
+        head = self.jacoco_pom(("check", [("*", "0.95"), ("*", "0.60")]))
+        self.assertEqual(self.floor_hits(base, head),
+                         [("gate-config", "pom.xml", "coverage config edited: <minimum>0.90</minimum> (+3 more)")])
+
+    def test_commented_out_floors_are_removed(self):
+        for path, active, commented in (
+                (".gitlab-ci.yml", "variables:\n  COVERAGE_FLOOR: 90\n", "variables:\n  # COVERAGE_FLOOR: 95\n"),
+                ("scripts/check.mjs", "const COVERAGE_FLOOR = 90;\n", "// const COVERAGE_FLOOR = 95;\n"),
+                ("scripts/check.mjs", "const COVERAGE_FLOOR = 90;\n", "/*\nconst COVERAGE_FLOOR = 95;\n*/\n"),
+                ("Makefile", "check:\n\tpytest --cov-fail-under=90\n", "check:\n\tpytest  # --cov-fail-under=95\n")):
+            with self.subTest(path=path, commented=commented):
+                rules = {h[0] for h in self.floor_hits({path: active}, {path: commented})}
+                self.assertEqual(rules, {"floor-lowered", "gate-config"})
+
+    def test_quoted_floors_count_only_as_whole_values(self):
+        addopts = '[tool.pytest.ini_options]\naddopts = ["--cov", "--cov-fail-under={}"]\n'
+        self.assertEqual(self.floor_hits({"pyproject.toml": addopts.format(80)}, {"pyproject.toml": addopts.format(85)}),
+                         [])
+        script = "#!/bin/sh\npytest --cov-fail-under=\"${{COVERAGE_FLOOR:-{}}}\"\n"
+        self.assertEqual(self.floor_hits({"check.sh": script.format(80)}, {"check.sh": script.format(85)}), [])
+        hits = self.floor_hits({".gitlab-ci.yml": "script:\n  - COVERAGE_FLOOR=90 make check\n"},
+                               {".gitlab-ci.yml": "script:\n  - echo \"COVERAGE_FLOOR=95\"\n  - make check\n"})
+        self.assertEqual({h[0] for h in hits}, {"floor-lowered", "gate-config"})
+
+    def test_an_unchanged_floor_wrapped_in_a_string_or_heredoc_stays_gate_config(self):
+        # Only the wrapper lines change, and none of them names a floor.
+        for path, active, wrapped in (
+                ("noxfile.py", "COVERAGE_FLOOR = 90\n", '"""\nCOVERAGE_FLOOR = 90\n"""\n'),
+                ("scripts/check.sh", "COVERAGE_FLOOR=90\npytest\n", ": <<'EOF'\nCOVERAGE_FLOOR=90\nEOF\npytest\n"),
+                ("pyproject.toml", '[tool.pytest.ini_options]\naddopts = "--cov-fail-under=85"\n',
+                 "[tool.pytest.ini_options]\nx = '''\naddopts = \"--cov-fail-under=85\"\n'''\n")):
+            with self.subTest(path=path):
+                self.assertIn(("gate-config", path, "coverage floor in a string or heredoc the guard can't follow"),
+                              self.floor_hits({path: active}, {path: wrapped}))
+
+    def test_a_floor_in_a_docstring_or_heredoc_stays_gate_config(self):
+        for path, active, inactive in (
+                ("noxfile.py", "COVERAGE_FLOOR = 90\n", 'DOC = """\nCOVERAGE_FLOOR = 95\n"""\n'),
+                ("scripts/check.sh", "COVERAGE_FLOOR=90\n", "cat <<EOF\nCOVERAGE_FLOOR=95\nEOF\n")):
+            with self.subTest(path=path):
+                rules = {h[0] for h in self.floor_hits({path: active}, {path: inactive})}
+                self.assertIn("gate-config", rules)
+
+
 class GitEndToEnd(unittest.TestCase):
     """The CLI diffs two real commits the way the workflow does and reaches the same verdict."""
 
@@ -1200,7 +2461,21 @@ class GitEndToEnd(unittest.TestCase):
                      "flag-fewer-tests-cpp-root-test-dir", "flag-skip-platformio-test-dir-link",
                      "flag-fewer-tests-cpp-included-markdown", "flag-fewer-tests-cpp-has-include-spliced",
                      "flag-skip-platformio-test-dir-link-comment", "flag-skip-platformio-extra-config-negated-bracket",
-                     "flag-fewer-tests-cpp-shadow-header"]:
+                     "flag-fewer-tests-cpp-shadow-header", "pass-python-test-edit-cpp-repo",
+                     "flag-python-cpp-test-under-if-false", "flag-python-cpp-rename-disabled-dir",
+                     "flag-python-cpp-collect-ignore-multiline", "pass-python-cpp-assert-approx-tolerance",
+                     "pass-python-cpp-assert-beside-skipif", "flag-python-cpp-computed-globals-key",
+                     "flag-python-cpp-assert-in-with", "flag-python-cpp-assert-unary-none",
+                     "pass-python-cpp-assert-negative-literal", "flag-cpp-feature-with-new-test",
+                     "pass-cpp-unity-assert-literal", "flag-cpp-gtest-new-test", "flag-cpp-catch2-new-test-case",
+                     "pass-cpp-assert-with-python-tests", "flag-cpp-test-edit-with-python-tests",
+                     "flag-cpp-assert-call-argument", "flag-cpp-new-test-exit", "flag-cpp-run-test-before-existing",
+                     "flag-cpp-line-splice", "flag-cpp-if0-around-test", "flag-cpp-ctest-registration",
+                     "flag-cpp-rename-disabled-dir", "flag-cpp-assert-udl-reserved-suffix",
+                     "flag-cpp-new-test-qualified-call", "flag-cpp-doctest-message-call-first",
+                     "pass-cpp-doctest-message-literals", "flag-cpp-branch-swaps-scope",
+                     "flag-cpp-branch-swaps-scope-nested", "flag-cpp-include-in-test-body",
+                     "flag-cpp-macro-splits-test", "flag-cpp-macro-paste-digraph", "flag-cpp-macro-keyword"] + sorted(p.stem for p in FIXTURES.glob("*-floor-*.diff")):
             with self.subTest(fixture=name), tempfile.TemporaryDirectory() as tmp:
                 subprocess.run(["git", "init", "-q", tmp], check=True, capture_output=True)
                 text = (FIXTURES / f"{name}.diff").read_text(encoding="utf-8")

@@ -1,0 +1,18 @@
+# gate-guard fixture: a Catch2 test's tag changed to [.], which hides it
+# expect: removed-tests
+# hits: 1
+# detail: outside a test body
+
+diff --git a/tests/clamp_test.cpp b/tests/clamp_test.cpp
+index 474dc7a..7462fda 100644
+--- a/tests/clamp_test.cpp
++++ b/tests/clamp_test.cpp
+@@ -1,7 +1,7 @@
+ #include <catch2/catch_test_macros.hpp>
+ #include "logic.h"
+ 
+-TEST_CASE("clamp low", "[clamp]") {
++TEST_CASE("clamp low", "[.]") {
+     REQUIRE(clamp(-5, 0, 10) == 0);
+     CHECK(clamp(5, 0, 10) == 5);
+ }
