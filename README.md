@@ -385,7 +385,9 @@ base: the same head against a new base can bring hits the old base hid.
    `includesCreatedEdit` is false and `userContentEdits` is empty. An edit
    later restored to the original text still counts as an edit. If that
    history can't be read, or GitHub's answer leaves out any of those
-   fields, the job fails.
+   fields or gives one a type other than its own (a string or null time,
+   an object or null editor, a boolean flag, a non-negative integer count),
+   the job fails.
 
    The rule has no exceptions because the guard can't tell how a label got
    there. The approve-gate workflow labels with the owner's own token, so

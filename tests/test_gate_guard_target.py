@@ -1181,8 +1181,7 @@ class NeverEdited(unittest.TestCase):
 
     def test_any_edit_signal_means_edited(self):
         for change in ({"lastEditedAt": "2026-10-16T13:00:01Z"}, {"editor": {"login": "someone"}},
-                       {"includesCreatedEdit": True}, {"includesCreatedEdit": None},
-                       {"userContentEdits": {"totalCount": 1}}, {"userContentEdits": {"totalCount": None}}):
+                       {"includesCreatedEdit": True}, {"userContentEdits": {"totalCount": 1}}):
             with self.subTest(change=change):
                 [comment], _ = self.mark(dict(self.CLEAN, **change))
                 self.assertIs(comment["never_edited"], False)
@@ -1200,12 +1199,15 @@ class NeverEdited(unittest.TestCase):
                 gate_guard.with_edit_history(github, [self.COMMENT], "dflippojr")
 
     def test_a_missing_edit_key_fails_closed(self):
-        """#62 security round 2: every requested key must be present before its value is read."""
+        """#62 security round 2: every requested key must be present before its value is read. Round 3: a null
+        totalCount is malformed, not an edit."""
+        with self.assertRaises(ValueError):
+            self.mark(dict(self.CLEAN, includesCreatedEdit=None))
         for keys in (("lastEditedAt",), ("editor",), ("lastEditedAt", "editor"), ("includesCreatedEdit",),
                      ("userContentEdits",), ("__typename",), ("id",), ("databaseId",)):
             with self.subTest(missing=keys), self.assertRaises(ValueError):
                 self.mark({k: v for k, v in self.CLEAN.items() if k not in keys})
-        for edits in ({}, None, [], 0):
+        for edits in ({}, None, [], 0, {"totalCount": None}):
             with self.subTest(userContentEdits=edits), self.assertRaises(ValueError):
                 self.mark(dict(self.CLEAN, userContentEdits=edits))
 

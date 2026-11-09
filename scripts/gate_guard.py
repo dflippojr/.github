@@ -2961,18 +2961,44 @@ def _records(comment, label):
     return [m.group(2) for m in HEAD_RECORD.finditer(comment.get("body") or "") if m.group(1).lower() == label]
 
 
+def _check_edit_node(node, comment):
+    """Raise unless node is a whole EDIT_QUERY answer for comment, every field of exactly its type (#62 security
+    rounds 2 and 3). type(x) is int rules out a bool or float that == would take for a count or an id; a missing
+    key is not a null."""
+    def fail(why):
+        raise ValueError(f"the GraphQL API's edit history of comment {comment.get('id')} is malformed: {why}")
+
+    if type(node) is not dict:
+        fail("not an object")
+    missing = [key for key in EDIT_KEYS if key not in node]
+    if missing:
+        fail(f"no {', '.join(missing)}")
+    if type(node["__typename"]) is not str or node["__typename"] != "IssueComment":
+        fail("not an IssueComment")
+    if type(node["id"]) is not str or node["id"] != comment.get("node_id"):
+        fail("an id other than the comment's node_id")
+    if type(node["databaseId"]) is not int or node["databaseId"] != comment.get("id"):
+        fail("a databaseId other than the comment's id")
+    if node["lastEditedAt"] is not None and type(node["lastEditedAt"]) is not str:
+        fail("lastEditedAt is neither a string nor null")
+    if node["editor"] is not None and type(node["editor"]) is not dict:
+        fail("editor is neither an object nor null")
+    if type(node["includesCreatedEdit"]) is not bool:
+        fail("includesCreatedEdit is not a boolean")
+    edits = node["userContentEdits"]
+    if type(edits) is not dict or "totalCount" not in edits:
+        fail("userContentEdits is not an object with a totalCount")
+    if type(edits["totalCount"]) is not int or edits["totalCount"] < 0:
+        fail("userContentEdits.totalCount is not a non-negative integer")
+
+
 def _never_edited(node, comment):
     """Whether node, GraphQL's answer for comment, shows affirmatively that it was never edited: no last edit, no
-    editor, no edit history. Every key EDIT_QUERY asks for must be present before its value is read, since a
-    missing key is not a null. A partial or mismatched answer raises; an edited one says no."""
-    edits = node.get("userContentEdits") if isinstance(node, dict) else None
-    if (not isinstance(node, dict) or any(key not in node for key in EDIT_KEYS)
-            or not isinstance(edits, dict) or "totalCount" not in edits
-            or node["__typename"] != "IssueComment" or node["id"] != comment.get("node_id")
-            or node["databaseId"] != comment.get("id")):
-        raise ValueError(f"the GraphQL API did not return the whole edit history of comment {comment.get('id')}")
+    editor, no edit history. The whole node is checked first; a malformed or mismatched answer raises, an edited
+    one says no."""
+    _check_edit_node(node, comment)
     return (node["lastEditedAt"] is None and node["editor"] is None
-            and node["includesCreatedEdit"] is False and edits["totalCount"] == 0)
+            and node["includesCreatedEdit"] is False and node["userContentEdits"]["totalCount"] == 0)
 
 
 def with_edit_history(github, comments, owner):
