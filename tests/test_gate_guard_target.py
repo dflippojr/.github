@@ -21,6 +21,10 @@ SCENARIOS = pathlib.Path(__file__).resolve().parent / "fixtures" / "gate_guard_t
 WORKFLOWS = ROOT / ".github" / "workflows"
 OWNER, REPO, NUMBER, HEAD_REF = "dflippojr", "dflippojr/demo", 7, "feature"
 HEAD_GROUP = "group: gate-guard-target-${{ github.event.pull_request.head.sha }}"
+# The head record `ao owner-label apply` posts a second after its 13:00:00 label; {head} is the scenario's head.
+AO_RECORD = {"author": OWNER, "created_at": "2026-10-16T13:00:01Z",
+             "body": "Owner applied `gate-change-approved` at head {head}. A later push invalidates it.\n\n"
+                     "<!-- owner-label gate-change-approved head={head} -->"}
 
 
 def reject(status, body):
@@ -41,6 +45,30 @@ class FakeGitHub:
     def __init__(self, head, merge_bases, prs):
         self.head, self.merge_bases, self.prs = head, merge_bases, prs
         self.jobs, self.writes = [], []
+        # GraphQL edit-history reads, and the error the next one raises (None: it answers).
+        self.graphql_calls, self.graphql_error = [], None
+
+    def graphql(self, query, variables):
+        """Each comment's server edit history, as GraphQL's IssueComment has it. A comment is edited when its
+        scenario gives last_edited_at, or an updated_at other than its created_at; edits counts its history."""
+        self.graphql_calls.append(list(variables["ids"]))
+        if self.graphql_error:
+            raise self.graphql_error
+        comments = {f"IC_{number}_{i}": (i, c) for number, s in self.prs.items()
+                    for i, c in enumerate(s.get("comments", []))}
+        nodes = []
+        for node_id in variables["ids"]:
+            if node_id not in comments:
+                nodes.append(None)
+                continue
+            i, c = comments[node_id]
+            changed = c.get("updated_at", c["created_at"]) != c["created_at"]
+            edited = c.get("last_edited_at") or (c["updated_at"] if changed else None)
+            nodes.append({"__typename": "IssueComment", "id": node_id, "databaseId": i, "lastEditedAt": edited,
+                          "editor": {"login": c.get("editor", c["author"])} if edited else None,
+                          "includesCreatedEdit": bool(edited),
+                          "userContentEdits": {"totalCount": c.get("edits", 2 if edited else 0)}})
+        return {"nodes": nodes}
 
     @classmethod
     def single(cls, merge_base, head, scenario, base="main"):
@@ -76,7 +104,8 @@ class FakeGitHub:
                         for i, e in enumerate(s["events"])]
             if path == f"/repos/{REPO}/issues/{number}/comments":
                 # {head} in a body stands for the head sha, which the scenario's git trees decide.
-                return [{"id": i, "user": {"login": c["author"]}, "body": c["body"].format(head=self.head),
+                return [{"id": i, "node_id": f"IC_{number}_{i}", "user": {"login": c["author"]},
+                         "body": c["body"].format(head=self.head),
                          "created_at": c["created_at"], "updated_at": c.get("updated_at", c["created_at"]),
                          "html_url": f"https://github.com/{REPO}/pull/{number}#issuecomment-{i}"}
                         for i, c in enumerate(s.get("comments", []))]
@@ -215,7 +244,9 @@ class Scenarios(unittest.TestCase):
         self.assertLessEqual({"head-edits-caller", "stale-owner-label", "bot-label", "owner-label-after-head",
                               "approve-gate-no-record", "approve-gate-push-race", "approve-gate-head-record",
                               "approve-gate-record-without-command", "approve-gate-hand-label-after-workflow",
-                              "approve-gate-second-command-race", "approve-gate-command-rerun"},
+                              "approve-gate-second-command-race", "approve-gate-command-rerun",
+                              "approve-gate-command-deleted", "approve-gate-command-rewritten",
+                              "edited-ao-head-record", "bare-owner-label"},
                              names)
 
     def test_scenarios(self):
@@ -246,8 +277,9 @@ class Scenarios(unittest.TestCase):
 
 
 class RecordAfterTheGuard(unittest.TestCase):
-    """The label starts the guard, and approve_gate.py posts its head record a moment later. Nothing reruns the
-    guard on a comment, so it waits a little for the record of a fresh /approve-gate label (#46)."""
+    """The label starts the guard, and approve_gate.py or `ao owner-label apply` posts its head record a moment
+    later. Nothing reruns the guard on a comment, so it waits a little for the record of a fresh owner label (#46,
+    #62)."""
     SCENARIO = json.loads((SCENARIOS / "approve-gate-head-record.json").read_text(encoding="utf-8"))
 
     def run_guard(self, now, record_after=None):
@@ -287,6 +319,19 @@ class RecordAfterTheGuard(unittest.TestCase):
         self.assertLessEqual(sleeps * gate_guard.RECORD_POLL, gate_guard.RECORD_WAIT)
         self.assertEqual(reads, sleeps + 1)
 
+    def test_an_ao_owner_label_record_posted_after_the_first_read_counts(self):
+        """#62: `ao owner-label apply` labels, then posts its record, and the label starts the guard. With no
+        /approve-gate command at all the guard still waits for that record rather than judge the bare label."""
+        scenario = dict(self.SCENARIO, comments=[{
+            "author": OWNER, "created_at": "2026-10-16T13:00:01Z",
+            "body": "Owner applied `gate-change-approved` at head {head}. A later push invalidates it.\n\n"
+                    "<!-- owner-label gate-change-approved head={head} -->"}])
+        self.SCENARIO = scenario
+        code, check, reads, sleeps = self.run_guard("2026-10-16T13:00:01Z", record_after=1)
+        self.assertEqual((code, check["conclusion"]), (0, "success"), check["summary"])
+        self.assertIn("and the owner's head record posted at 2026-10-16T13:00:01Z names", check["summary"])
+        self.assertEqual((reads, sleeps), (2, 1))
+
     def test_an_old_label_gets_no_wait(self):
         code, check, reads, sleeps = self.run_guard("2026-10-16T13:10:00Z", record_after=1)
         self.assertEqual((code, check["conclusion"]), (1, "failure"))
@@ -303,7 +348,8 @@ class SharedHead(unittest.TestCase):
     TEST = "from src.billing import charge\n\n\ndef test_charge():\n    assert charge(1) == 1\n"
     NO_LABELS = {"labels": [], "events": [], "pushed_at": "2026-10-16T12:00:00Z"}
     APPROVED = {"labels": [gate_guard.APPROVAL_LABEL], "events": [
-        {"event": "labeled", "label": gate_guard.APPROVAL_LABEL, "actor": OWNER, "created_at": "2026-10-16T13:00:00Z"}]}
+        {"event": "labeled", "label": gate_guard.APPROVAL_LABEL, "actor": OWNER, "created_at": "2026-10-16T13:00:00Z"}],
+        "comments": [AO_RECORD]}
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -567,8 +613,13 @@ class OwnerLabel(unittest.TestCase):
     def event(event, actor, at, label=gate_guard.APPROVAL_LABEL, i=0):
         return {"id": i, "event": event, "label": {"name": label}, "actor": {"login": actor}, "created_at": at}
 
-    def verdict(self, events, labels=(gate_guard.APPROVAL_LABEL,), pushed=PUSHED):
-        return gate_guard.owner_label(gate_guard.APPROVAL_LABEL, set(labels), events, "Owner", "c" * 40, pushed)
+    # The owner's head record for the head, a second after the 13:00:00 labels below; the login's case differs.
+    RECORD = {"user": {"login": "owner"}, "created_at": "2026-10-16T13:00:01Z", "updated_at": "2026-10-16T13:00:01Z",
+              "body": f"<!-- owner-label {gate_guard.APPROVAL_LABEL} head={'c' * 40} -->", "never_edited": True}
+
+    def verdict(self, events, labels=(gate_guard.APPROVAL_LABEL,), pushed=PUSHED, comments=(RECORD,)):
+        return gate_guard.owner_label(gate_guard.APPROVAL_LABEL, set(labels), events, "Owner", "c" * 40, pushed,
+                                      comments)
 
     def test_label_not_on_the_pull_request(self):
         self.assertEqual(self.verdict([], labels=()), (False, "`gate-change-approved` is not on this pull request"))
@@ -612,16 +663,20 @@ class OwnerLabel(unittest.TestCase):
 
 
 class ApproveGateLabel(unittest.TestCase):
-    """approve_gate.py (#44) applies gate-change-approved with the owner's token, then posts the head record. Its
-    label counts only with an owner head record for the exact head, posted at or after the label (#46)."""
+    """approve_gate.py (#44) applies gate-change-approved with the owner's token, then posts the head record, as
+    `ao owner-label apply` does. Any owner gate-change-approved label counts only with the owner's newest unedited
+    head record for the exact head, posted at or after the label (#46); the label alone never counts (#62)."""
     HEAD, OTHER = "c" * 40, "a" * 40
     PUSHED = gate_guard.parse_time("2026-10-16T12:00:00Z")
     LABELED = "2026-10-16T13:00:00Z"
 
     @staticmethod
-    def comment(body, at, author="dflippojr", edited_at=None, i=0):
+    def comment(body, at, author="dflippojr", edited_at=None, i=0, never_edited=None):
+        """A comment as the guard has it after with_edit_history: never_edited is GraphQL's verdict, which follows
+        edited_at unless given."""
         return {"id": i, "user": {"login": author}, "body": body, "created_at": at, "updated_at": edited_at or at,
-                "html_url": f"https://github.com/x#issuecomment-{i}"}
+                "html_url": f"https://github.com/x#issuecomment-{i}",
+                "never_edited": edited_at is None if never_edited is None else never_edited}
 
     def command(self, sha=HEAD, at="2026-10-16T12:59:50Z", **kw):
         return self.comment(f"/approve-gate {sha}", at, **kw)
@@ -632,18 +687,55 @@ class ApproveGateLabel(unittest.TestCase):
                             f"{command}). A later push invalidates it.\n\n<!-- owner-label {label} head={sha} -->",
                             at, **kw)
 
-    def ao_record(self, sha=HEAD, at="2026-10-16T13:00:01Z", label=gate_guard.APPROVAL_LABEL):
+    def ao_record(self, sha=HEAD, at="2026-10-16T13:00:01Z", label=gate_guard.APPROVAL_LABEL, **kw):
+        """The record `ao owner-label apply` posts right after it labels."""
         return self.comment(f"Owner applied `{label}` at head {sha}. A later push invalidates it.\n\n"
-                            f"<!-- owner-label {label} head={sha} -->", at)
+                            f"<!-- owner-label {label} head={sha} -->", at, **kw)
 
     def verdict(self, comments, label=gate_guard.APPROVAL_LABEL, labeled=LABELED, pushed=PUSHED):
         events = [OwnerLabel.event("labeled", "dflippojr", labeled, label=label)]
         return gate_guard.owner_label(label, {label}, events, "dflippojr", self.HEAD, pushed, comments)
 
+    def assert_refused_naming_both_ways(self, verdict):
+        counts, why = verdict
+        self.assertFalse(counts, why)
+        self.assertIn(f"`/approve-gate {self.HEAD}`", why)
+        self.assertIn(f"`ao owner-label apply <repo> <pr> {gate_guard.APPROVAL_LABEL} --head {self.HEAD}`", why)
+
+    def test_interrupted_run_with_its_command_deleted_is_refused(self):
+        """#62: the owner comments /approve-gate A; B is pushed; the workflow labels after B's push and dies before
+        its record; someone deletes the command. No record names B, so B is refused."""
+        self.assert_refused_naming_both_ways(self.verdict([], labeled="2026-10-16T12:00:03Z"))
+
+    def test_interrupted_run_with_its_command_rewritten_is_refused(self):
+        """#62: the same run, with the owner's command rewritten to plain text instead of deleted."""
+        rewritten = self.comment("Looks good to me.", "2026-10-16T11:59:58Z", edited_at="2026-10-16T12:30:00Z")
+        self.assert_refused_naming_both_ways(self.verdict([rewritten], labeled="2026-10-16T12:00:03Z"))
+
+    def test_an_edited_head_record_never_counts_in_either_form(self):
+        """#62: anyone with write access can edit the owner's comment, so neither record form counts once edited."""
+        edited = "2026-10-16T14:00:00Z"
+        for form in (self.record, self.ao_record):
+            with self.subTest(form=form.__name__):
+                self.assert_refused_naming_both_ways(self.verdict([form(edited_at=edited)]))
+
+    def test_a_bare_label_with_no_record_is_refused(self):
+        """#62, owner decision: the owner's label alone no longer counts, however fresh."""
+        self.assert_refused_naming_both_ways(self.verdict([]))
+
+    def test_either_record_form_for_the_head_counts(self):
+        """The two ways to approve: approve_gate.py's record and `ao owner-label apply`'s both carry the marker."""
+        for form in (self.record, self.ao_record):
+            with self.subTest(form=form.__name__):
+                counts, why = self.verdict([form()])
+                self.assertTrue(counts, why)
+                self.assertIn(f"and the owner's head record posted at 2026-10-16T13:00:01Z names {self.HEAD[:7]}",
+                              why)
+
     def test_workflow_label_without_a_record_does_not_count(self):
         counts, why = self.verdict([self.command()])
         self.assertFalse(counts)
-        self.assertIn("applied through `/approve-gate`, but no unedited head record from the owner", why)
+        self.assertIn("applied by the owner, but no unedited head record from the owner", why)
 
     def test_workflow_label_with_a_record_for_another_sha_does_not_count(self):
         counts, why = self.verdict([self.command(), self.record(self.OTHER)])
@@ -681,6 +773,12 @@ class ApproveGateLabel(unittest.TestCase):
         counts, _ = self.verdict([self.command(), self.record(edited_at="2026-10-16T14:00:00Z")])
         self.assertFalse(counts)
 
+    def test_an_edit_the_rest_timestamps_hide_does_not_count_in_either_form(self):
+        """#62 round 1: equal created_at and updated_at, but the server's edit history isn't empty."""
+        for form in (self.record, self.ao_record):
+            with self.subTest(form=form.__name__):
+                self.assert_refused_naming_both_ways(self.verdict([form(never_edited=False)]))
+
     def test_someone_elses_record_does_not_count(self):
         for author in ("worker[bot]", "dflippojr-workers[bot]", "dflippojr2"):
             with self.subTest(author=author):
@@ -703,10 +801,10 @@ class ApproveGateLabel(unittest.TestCase):
         still needs an unedited record for the head."""
         counts, why = self.verdict([self.record(self.OTHER)])
         self.assertFalse(counts)
-        self.assertIn(f"applied through `/approve-gate`, but the owner's head record names {self.OTHER[:7]}", why)
+        self.assertIn(f"applied by the owner, but the owner's newest unedited head record names {self.OTHER[:7]}", why)
         counts, why = self.verdict([self.record(edited_at="2026-10-16T14:00:00Z")])
         self.assertFalse(counts)
-        self.assertIn("applied through `/approve-gate`, but no unedited head record from the owner", why)
+        self.assertIn("applied by the owner, but no unedited head record from the owner", why)
         self.assertTrue(self.verdict([self.record()])[0])
 
     def test_push_race_without_its_command_refuses_the_pushed_head(self):
@@ -736,7 +834,7 @@ class ApproveGateLabel(unittest.TestCase):
         counts, why = gate_guard.owner_label(gate_guard.APPROVAL_LABEL, {gate_guard.APPROVAL_LABEL}, events,
                                              "dflippojr", self.HEAD, self.PUSHED, comments)
         self.assertFalse(counts)
-        self.assertIn("applied through `/approve-gate`, but no unedited head record from the owner", why)
+        self.assertIn("applied by the owner, but no unedited head record from the owner", why)
 
     def test_a_hand_label_after_an_earlier_workflow_label_needs_a_record(self):
         """The limit of the shared token: the owner approved A by comment at 10:00, B was pushed at 12:00, and the
@@ -807,18 +905,27 @@ class ApproveGateLabel(unittest.TestCase):
                                              "dflippojr", self.HEAD, self.PUSHED, comments + [self.ao_record()])
         self.assertTrue(counts, why)
 
-    def test_someone_elses_command_does_not_mark_the_label(self):
-        counts, why = self.verdict([self.command(author="worker[bot]")])
+    def test_someone_elses_command_neither_approves_nor_blocks(self):
+        """Only the owner's head record decides; a command from anyone else changes nothing."""
+        self.assert_refused_naming_both_ways(self.verdict([self.command(author="worker[bot]")]))
+        counts, why = self.verdict([self.command(author="worker[bot]"), self.ao_record()])
         self.assertTrue(counts, why)
 
-    def test_a_command_after_the_label_does_not_mark_it(self):
-        """The workflow always labels after the command it acts on; a later refused command leaves the hand label."""
-        self.assertTrue(self.verdict([self.command(at="2026-10-16T13:30:00Z")])[0])
+    def test_a_command_after_the_label_does_not_approve_it(self):
+        """A command posted after the label is not the label's record; the ao record after the label is."""
+        self.assert_refused_naming_both_ways(self.verdict([self.command(at="2026-10-16T13:30:00Z")]))
+        self.assertTrue(self.verdict([self.command(at="2026-10-16T13:30:00Z"), self.ao_record()])[0])
 
-    def test_hand_label_keeps_todays_rule(self):
-        self.assertTrue(self.verdict([])[0])
-        self.assertTrue(self.verdict([self.ao_record(self.OTHER)])[0], "an ao record does not mark the label")
-        self.assertFalse(self.verdict([], pushed=gate_guard.parse_time("2026-10-16T13:30:00Z"))[0])
+    def test_hand_label_needs_a_head_record(self):
+        """Owner-approved behaviour change (#62), formerly test_hand_label_keeps_todays_rule: a hand label with no
+        head record, or with one for another head, no longer counts. `ao owner-label apply`'s record for the head
+        does, until a later push."""
+        self.assert_refused_naming_both_ways(self.verdict([]))
+        counts, why = self.verdict([self.ao_record(self.OTHER)])
+        self.assertFalse(counts)
+        self.assertIn(f"names {self.OTHER[:7]}, not the head {self.HEAD[:7]}", why)
+        self.assertTrue(self.verdict([self.ao_record()])[0])
+        self.assertFalse(self.verdict([self.ao_record()], pushed=gate_guard.parse_time("2026-10-16T13:30:00Z"))[0])
 
     def test_findings_accepted_keeps_todays_rule(self):
         """No workflow applies findings-accepted."""
@@ -829,6 +936,352 @@ class ApproveGateLabel(unittest.TestCase):
         counts, why = self.verdict([self.command(), self.record()], pushed=pushed)
         self.assertFalse(counts)
         self.assertIn("re-applies it after reviewing the new commits", why)
+
+
+MISSING = object()
+
+
+def wrong_types(clean_id, clean_database_id):
+    """{field: [wrong value, ...]} for every field of an EDIT_QUERY node (#62 security round 3). Each field gets
+    every one of bool, float, null, string, list, object and missing that its exact type rules out, plus look-alikes
+    Python's == would accept (0.0 and False for 0, 5.0 and True for an id). userContentEdits.totalCount is the
+    nested count."""
+    common = [False, 0.0, None, "0", [], {}, MISSING, 0]
+    valid = {"__typename": ["IssueComment"], "id": [clean_id], "databaseId": [clean_database_id],
+             "lastEditedAt": [None, "0"], "editor": [None, {}],
+             "includesCreatedEdit": [False], "userContentEdits": [], "userContentEdits.totalCount": [0]}
+    extra = {"__typename": ["issuecomment", "PullRequestReviewComment"], "id": [clean_id + " ", 5],
+             "databaseId": [float(clean_database_id), str(clean_database_id), True, clean_database_id + 1],
+             "lastEditedAt": [1, True], "editor": ["dflippojr", True], "includesCreatedEdit": [1, "false"],
+             "userContentEdits": [{"totalCount": 0.0}, 0], "userContentEdits.totalCount": [-1, True, 0.5]}
+    return {field: [v for v in common if not any(type(v) is type(ok) and v == ok for ok in oks)] + extra[field]
+            for field, oks in valid.items()}
+
+
+def set_field(node, field, value):
+    """node with field (a.b for a nested one) set to value, or removed when value is MISSING."""
+    node = dict(node)
+    outer, _, inner = field.partition(".")
+    if inner:
+        node[outer] = dict(node[outer])
+        target, key = node[outer], inner
+    else:
+        target, key = node, outer
+    if value is MISSING:
+        target.pop(key, None)
+    else:
+        target[key] = value
+    return node
+
+
+class EditHistory(unittest.TestCase):
+    """#62 security round 1: REST comment timestamps have one-second resolution, so updated_at == created_at doesn't
+    prove a record was never edited. The guard reads each candidate record's server edit history (GraphQL
+    IssueComment) and counts it only on affirmative evidence of no edit; an unreadable history fails closed."""
+    LABELED = {"event": "labeled", "label": gate_guard.APPROVAL_LABEL, "actor": OWNER,
+               "created_at": "2026-10-16T13:00:00Z"}
+    WORKFLOW_RECORD = {"author": OWNER, "created_at": "2026-10-16T13:00:01Z",
+                       "body": "Owner approved `gate-change-approved` at head {head} by [comment](https://github.com/"
+                               "dflippojr/demo/pull/7#issuecomment-1). A later push invalidates it.\n\n"
+                               "<!-- owner-label gate-change-approved head={head} -->"}
+    FORMS = {"workflow": WORKFLOW_RECORD, "ao": AO_RECORD}
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        diff = (FIXTURES / "flag-gate-target-caller.diff").read_text(encoding="utf-8")
+        self.server, (self.base, self.head) = make_remote(self.tmp, *_trees(diff))
+
+    def judge(self, comments, error=None):
+        """(exit code, the commit's check, outputs, fake) after a run of the job with these comments."""
+        fake = FakeGitHub.single(self.base, self.head, {"labels": [gate_guard.APPROVAL_LABEL], "events": [self.LABELED],
+                                                        "pushed_at": "2026-10-16T12:00:00Z", "comments": comments})
+        fake.graphql_error = error
+        with mock.patch.object(gate_guard, "_now", return_value=gate_guard.parse_time("2026-10-16T14:00:00Z")):
+            code, _, outputs = run_cli(self.tmp, self.server, {"pull_request": event_pr(NUMBER, self.head, "main")},
+                                       fake)
+        return code, fake.current(), outputs, fake
+
+    def assert_refused(self, comments):
+        code, check, outputs, _ = self.judge(comments)
+        self.assertEqual((code, check["conclusion"]), (1, "failure"), check["summary"])
+        self.assertIn("no unedited head record from the owner", check["summary"])
+        self.assertIn("gate-change-approved=false", outputs)
+
+    def test_an_edit_inside_the_creation_second_is_refused_in_either_form(self):
+        """created_at == updated_at, but GraphQL's lastEditedAt shows the edit."""
+        for name, record in self.FORMS.items():
+            with self.subTest(form=name):
+                self.assert_refused([dict(record, last_edited_at="2026-10-16T13:00:01Z")])
+
+    def test_an_edit_then_restore_is_refused_in_either_form(self):
+        """The body reads as the original record again, but its edit history is not empty."""
+        for name, record in self.FORMS.items():
+            with self.subTest(form=name):
+                self.assert_refused([dict(record, last_edited_at="2026-10-16T13:00:01Z", edits=3,
+                                          editor="collaborator")])
+
+    def test_an_unreadable_edit_history_fails_closed_in_either_form(self):
+        for name, record in self.FORMS.items():
+            for error in (gate_guard.urllib.error.URLError("graphql down"), ValueError("GraphQL errors")):
+                with self.subTest(form=name, error=error):
+                    code, check, outputs, _ = self.judge([record], error=error)
+                    self.assertEqual((code, check["conclusion"]), (2, "failure"), check["summary"])
+                    self.assertIn("could not read", check["summary"])
+                    self.assertIn("gate-change-approved=false", outputs)
+
+    def test_a_missing_edit_history_node_fails_closed(self):
+        """GraphQL answers null for a comment it can't show (deleted since the REST read, or not visible)."""
+        fake_graphql = FakeGitHub.graphql
+
+        def null_nodes(fake, query, variables):
+            return {"nodes": [None for _ in fake_graphql(fake, query, variables)["nodes"]]}
+
+        with mock.patch.object(FakeGitHub, "graphql", null_nodes):
+            code, check, outputs, _ = self.judge([AO_RECORD])
+        self.assertEqual((code, check["conclusion"]), (2, "failure"), check["summary"])
+        self.assertIn("gate-change-approved=false", outputs)
+
+    # Each partial answer drops edit evidence GraphQL was asked for (#62 security round 2).
+    STRIPS = {"lastEditedAt": ("lastEditedAt",), "editor": ("editor",), "both": ("lastEditedAt", "editor"),
+              "includesCreatedEdit": ("includesCreatedEdit",), "userContentEdits": ("userContentEdits",),
+              "totalCount": ("userContentEdits.totalCount",)}
+
+    @staticmethod
+    def stripping(keys):
+        """FakeGitHub.graphql with keys (a.b for a nested key) dropped from every node it returns."""
+        answer = FakeGitHub.graphql
+
+        def graphql(fake, query, variables):
+            data = answer(fake, query, variables)
+            for node in data["nodes"]:
+                for key in keys:
+                    outer, _, inner = key.partition(".")
+                    if inner:
+                        node[outer] = {k: v for k, v in node[outer].items() if k != inner}
+                    else:
+                        node.pop(outer, None)
+            return data
+        return graphql
+
+    def test_a_node_missing_edit_evidence_fails_closed_in_either_form(self):
+        """A missing key is not a null: the record counts only on every requested signal, present and clean."""
+        for strip, keys in self.STRIPS.items():
+            for name, record in self.FORMS.items():
+                with self.subTest(missing=strip, form=name), \
+                        mock.patch.object(FakeGitHub, "graphql", self.stripping(keys)):
+                    code, check, outputs, _ = self.judge([record])
+                    self.assertEqual((code, check["conclusion"]), (2, "failure"), check["summary"])
+                    self.assertIn("could not read", check["summary"])
+                    self.assertIn("gate-change-approved=false", outputs)
+
+    def test_a_node_missing_edit_evidence_on_a_later_poll_fails_closed(self):
+        """The record shows up only on the guard's second comment read, while it waits for a fresh label's record;
+        that read's history is checked as strictly as the first."""
+        for strip, keys in self.STRIPS.items():
+            for name, record in self.FORMS.items():
+                with self.subTest(missing=strip, form=name):
+                    reads = []
+
+                    class Late(FakeGitHub):
+                        def pages(self, path):
+                            if path.endswith("/comments"):
+                                reads.append(path)
+                                self.prs[NUMBER]["comments"] = [record] if len(reads) > 1 else []
+                            return super().pages(path)
+
+                    fake = Late(self.head, {"main": self.base},
+                                {NUMBER: {"labels": [gate_guard.APPROVAL_LABEL], "events": [self.LABELED],
+                                          "pushed_at": "2026-10-16T12:00:00Z", "comments": [], "base": "main",
+                                          "head_ref": HEAD_REF}})
+                    with mock.patch.object(FakeGitHub, "graphql", self.stripping(keys)), \
+                            mock.patch.object(gate_guard, "_now",
+                                              return_value=gate_guard.parse_time("2026-10-16T13:00:01Z")), \
+                            mock.patch("time.sleep"):
+                        code, _, outputs = run_cli(self.tmp, self.server,
+                                                   {"pull_request": event_pr(NUMBER, self.head, "main")}, fake)
+                    check = fake.current()
+                    self.assertEqual(len(reads), 2)
+                    self.assertEqual((code, check["conclusion"]), (2, "failure"), check["summary"])
+                    self.assertIn("gate-change-approved=false", outputs)
+
+    @staticmethod
+    def altering(field, value):
+        """FakeGitHub.graphql with field set to value (or removed) in every node it returns."""
+        answer = FakeGitHub.graphql
+
+        def graphql(fake, query, variables):
+            data = answer(fake, query, variables)
+            return {"nodes": [set_field(node, field, value) for node in data["nodes"]]}
+        return graphql
+
+    def late_fake(self, record, reads):
+        """A fake whose comments hold record only from the second read on, while the guard waits for it."""
+        class Late(FakeGitHub):
+            def pages(self, path):
+                if path.endswith("/comments"):
+                    reads.append(path)
+                    self.prs[NUMBER]["comments"] = [record] if len(reads) > 1 else []
+                return super().pages(path)
+
+        return Late(self.head, {"main": self.base},
+                    {NUMBER: {"labels": [gate_guard.APPROVAL_LABEL], "events": [self.LABELED],
+                              "pushed_at": "2026-10-16T12:00:00Z", "comments": [], "base": "main",
+                              "head_ref": HEAD_REF}})
+
+    def test_every_wrongly_typed_field_fails_closed(self):
+        """#62 security round 3: the whole node is checked against exact types before any edit signal is read.
+        Every field x every wrong type x both record forms x the first read and a later record-wait poll exits 2
+        with no approval."""
+        for field, values in wrong_types(f"IC_{NUMBER}_0", 0).items():
+            for value in values:
+                for name, record in self.FORMS.items():
+                    for read in ("first", "poll"):
+                        shown = "missing" if value is MISSING else repr(value)
+                        with self.subTest(field=field, value=shown, form=name, read=read), \
+                                mock.patch.object(FakeGitHub, "graphql", self.altering(field, value)):
+                            if read == "first":
+                                code, check, outputs, _ = self.judge([record])
+                            else:
+                                reads = []
+                                fake = self.late_fake(record, reads)
+                                with mock.patch.object(gate_guard, "_now",
+                                                       return_value=gate_guard.parse_time("2026-10-16T13:00:01Z")), \
+                                        mock.patch("time.sleep"):
+                                    code, _, outputs = run_cli(self.tmp, self.server,
+                                                               {"pull_request": event_pr(NUMBER, self.head, "main")},
+                                                               fake)
+                                check = fake.current()
+                                self.assertEqual(len(reads), 2)
+                            self.assertEqual((code, check["conclusion"]), (2, "failure"), check["summary"])
+                            self.assertIn("gate-change-approved=false", outputs)
+
+    def test_an_unedited_record_still_counts_in_either_form(self):
+        for name, record in self.FORMS.items():
+            with self.subTest(form=name):
+                code, check, _, _ = self.judge([record])
+                self.assertEqual((code, check["conclusion"]), (0, "success"), check["summary"])
+
+    def test_only_the_owners_records_are_looked_up_in_batches(self):
+        """One GraphQL read per 100 candidate records, and none for other comments, so the scan stays linear."""
+        noise = [{"author": OWNER, "body": "LGTM", "created_at": "2026-10-16T12:30:00Z"},
+                 dict(AO_RECORD, author="dflippojr-workers[bot]")]
+        records = [dict(AO_RECORD, created_at=f"2026-10-16T13:00:{i % 60:02d}Z") for i in range(1, 151)]
+        code, check, _, fake = self.judge(noise + records)
+        self.assertEqual((code, check["conclusion"]), (0, "success"), check["summary"])
+        self.assertEqual([len(ids) for ids in fake.graphql_calls], [100, 50])
+        self.assertEqual(sorted(i for ids in fake.graphql_calls for i in ids),
+                         sorted(f"IC_{NUMBER}_{i}" for i in range(2, 152)))
+
+
+class NeverEdited(unittest.TestCase):
+    """with_edit_history counts a record as unedited only when every server edit signal says so (#62 round 1)."""
+    COMMENT = {"id": 5, "node_id": "IC_5", "user": {"login": "dflippojr"}, "created_at": "2026-10-16T13:00:01Z",
+               "updated_at": "2026-10-16T13:00:01Z", "body": f"<!-- owner-label gate-change-approved head={'c' * 40} -->"}
+    CLEAN = {"__typename": "IssueComment", "id": "IC_5", "databaseId": 5, "lastEditedAt": None, "editor": None,
+             "includesCreatedEdit": False, "userContentEdits": {"totalCount": 0}}
+
+    def mark(self, node, comments=None):
+        github = mock.Mock()
+        github.graphql.return_value = {"nodes": [node]}
+        return gate_guard.with_edit_history(github, comments or [self.COMMENT], "dflippojr"), github
+
+    def test_a_clean_history_is_never_edited(self):
+        [comment], github = self.mark(self.CLEAN)
+        self.assertIs(comment["never_edited"], True)
+        github.graphql.assert_called_once_with(gate_guard.EDIT_QUERY, {"ids": ["IC_5"]})
+
+    def test_any_edit_signal_means_edited(self):
+        for change in ({"lastEditedAt": "2026-10-16T13:00:01Z"}, {"editor": {"login": "someone"}},
+                       {"includesCreatedEdit": True}, {"userContentEdits": {"totalCount": 1}}):
+            with self.subTest(change=change):
+                [comment], _ = self.mark(dict(self.CLEAN, **change))
+                self.assertIs(comment["never_edited"], False)
+                self.assertIsNone(gate_guard.recorded_head([comment], gate_guard.APPROVAL_LABEL, "dflippojr",
+                                                           gate_guard.parse_time("2026-10-16T13:00:00Z")))
+
+    def test_an_answer_for_another_comment_fails_closed(self):
+        for change in ({"id": "IC_6"}, {"databaseId": 6}, {"__typename": "PullRequestReviewComment"}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.mark(dict(self.CLEAN, **change))
+        for nodes in ([None], [], [self.CLEAN, self.CLEAN], None):
+            with self.subTest(nodes=nodes), self.assertRaises(ValueError):
+                github = mock.Mock()
+                github.graphql.return_value = {"nodes": nodes}
+                gate_guard.with_edit_history(github, [self.COMMENT], "dflippojr")
+
+    def test_a_missing_edit_key_fails_closed(self):
+        """#62 security round 2: every requested key must be present before its value is read. Round 3: a null
+        totalCount is malformed, not an edit."""
+        with self.assertRaises(ValueError):
+            self.mark(dict(self.CLEAN, includesCreatedEdit=None))
+        for keys in (("lastEditedAt",), ("editor",), ("lastEditedAt", "editor"), ("includesCreatedEdit",),
+                     ("userContentEdits",), ("__typename",), ("id",), ("databaseId",)):
+            with self.subTest(missing=keys), self.assertRaises(ValueError):
+                self.mark({k: v for k, v in self.CLEAN.items() if k not in keys})
+        for edits in ({}, None, [], 0, {"totalCount": None}):
+            with self.subTest(userContentEdits=edits), self.assertRaises(ValueError):
+                self.mark(dict(self.CLEAN, userContentEdits=edits))
+
+    def test_every_wrongly_typed_field_raises(self):
+        """#62 security round 3: exact types for the whole node, checked before any edit signal is read."""
+        for field, values in wrong_types(self.CLEAN["id"], self.CLEAN["databaseId"]).items():
+            for value in values:
+                with self.subTest(field=field, value="missing" if value is MISSING else repr(value)), \
+                        self.assertRaises(ValueError):
+                    self.mark(set_field(self.CLEAN, field, value))
+        with self.assertRaises(ValueError):
+            self.mark(["IssueComment"])
+
+    def test_every_valid_edit_signal_still_reads_as_edited(self):
+        """Well-typed values that show an edit deny the record rather than raise."""
+        for field, value in (("lastEditedAt", "2026-10-16T13:00:01Z"), ("editor", {"login": "someone"}),
+                             ("editor", {}), ("includesCreatedEdit", True), ("userContentEdits.totalCount", 1)):
+            with self.subTest(field=field, value=value):
+                [comment], _ = self.mark(set_field(self.CLEAN, field, value))
+                self.assertIs(comment["never_edited"], False)
+
+    def test_a_record_with_no_node_id_fails_closed(self):
+        comment = {k: v for k, v in self.COMMENT.items() if k != "node_id"}
+        with self.assertRaises(ValueError):
+            self.mark(self.CLEAN, [comment])
+
+    def test_other_comments_are_never_looked_up_or_counted(self):
+        github = mock.Mock()
+        others = [dict(self.COMMENT, user={"login": "worker[bot]"}), dict(self.COMMENT, body="LGTM"),
+                  dict(self.COMMENT, body=self.COMMENT["body"].replace("gate-change-approved", "findings-accepted"))]
+        marked = gate_guard.with_edit_history(github, others, "dflippojr")
+        github.graphql.assert_not_called()
+        self.assertEqual([c["never_edited"] for c in marked], [False, False, False])
+
+    def test_a_comment_claiming_never_edited_is_overwritten(self):
+        """A key on the REST comment can't vouch for itself; only the GraphQL answer sets it."""
+        [comment], _ = self.mark(dict(self.CLEAN, lastEditedAt="2026-10-16T13:00:01Z"),
+                                 [dict(self.COMMENT, never_edited=True)])
+        self.assertIs(comment["never_edited"], False)
+
+
+class GraphQL(unittest.TestCase):
+    def test_errors_beside_data_raise(self):
+        github = gate_guard.GitHub("https://api.test", "t", "https://api.test/graphql")
+        for answer in ({"data": {"nodes": []}, "errors": [{"message": "rate limited"}]}, {"errors": [{}]},
+                       {"data": None}, None, []):
+            with self.subTest(answer=answer), \
+                    mock.patch.object(gate_guard, "api_request", return_value=(answer, None)), \
+                    self.assertRaises(ValueError):
+                github.graphql(gate_guard.EDIT_QUERY, {"ids": ["IC_5"]})
+
+    def test_data_comes_back_from_the_graphql_endpoint(self):
+        with mock.patch.dict(os.environ, {"GITHUB_GRAPHQL_URL": "https://ghe.test/api/graphql"}), \
+                mock.patch.object(gate_guard, "api_request", return_value=({"data": {"nodes": []}}, None)) as call:
+            self.assertEqual(gate_guard.GitHub("https://ghe.test/api/v3", "t").graphql("q", {"ids": []}),
+                             {"nodes": []})
+        call.assert_called_once_with("https://ghe.test/api/graphql", "t", "POST",
+                                     {"query": "q", "variables": {"ids": []}})
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(gate_guard.GitHub("https://api.github.com", "t").graphql_url,
+                             "https://api.github.com/graphql")
 
 
 class HeadPushedAt(unittest.TestCase):
@@ -894,7 +1347,7 @@ class TargetFailures(unittest.TestCase):
         self.assertIn("could not read the pull request's labels", body["summary"])
 
     def test_cut_off_comments_fail_closed(self):
-        """A head record or an /approve-gate command past the page limit could change the verdict."""
+        """A head record past the page limit could change the verdict."""
         fake = self.github()
 
         def pages(path):
@@ -1184,8 +1637,8 @@ class ExtraGatePaths(unittest.TestCase):
             dict(self.CODE, **{"tests/golden/case.json": '{"total": 3}\n'}))
 
     def fake(self, head=None, labels=(), events=(), pushed_at="2026-10-16T12:00:00Z"):
-        return FakeGitHub.single(self.base, head or self.head,
-                                 {"labels": list(labels), "events": list(events), "pushed_at": pushed_at})
+        return FakeGitHub.single(self.base, head or self.head, {"labels": list(labels), "events": list(events),
+                                                                "pushed_at": pushed_at, "comments": [AO_RECORD]})
 
     def judge(self, fake, args=ARGS):
         """(exit code, the commit's check) after a run of the job on fake's head."""
