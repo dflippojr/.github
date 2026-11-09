@@ -16,11 +16,11 @@ Feature work and fixes go through GitHub issues and pull requests, so plans and 
 | `verification` | Confirm something already built works for real |
 | `reserved` | Held for a specific person or run; agents and orchestrators skip it |
 | `parked` | Deliberately deferred; not planned for now |
-| `gate-change-approved` | The owner approved this pull request's test removals, skips, retries or gate-config edits; the gate guard then passes |
+| `gate-change-approved` | The owner approved this pull request's test removals, skips, retries or gate-config edits at its current head; the gate guard then passes. Applied with `/approve-gate <head sha>` or `ao owner-label apply`, never by hand alone |
 | `findings-accepted` | The owner accepted this pull request's open review findings |
 | `P0` / `P1` / `P2` | Priority: do first / bugs and fixes ahead of features / normal |
 
-`gate-change-approved` and `findings-accepted` are owner-only. The default-branch gate guard counts one only when the owner applied it after the newest push. A label a worker applies, or re-applies, doesn't count, and a push voids the owner's label until the owner applies it again. A `gate-change-approved` label after any owner `/approve-gate` comment on the pull request also needs the owner's head record (`<!-- owner-label gate-change-approved head=SHA -->`) to name the exact current head (README.md, "Gate guard on the default branch").
+`gate-change-approved` and `findings-accepted` are owner-only. The default-branch gate guard counts one only when the owner applied it after the newest push. A label a worker applies, or re-applies, doesn't count, and a push voids the owner's label until the owner applies it again. `gate-change-approved` also needs the owner's unedited head record (`<!-- owner-label gate-change-approved head=SHA -->`), posted at or after the label, to name the exact current head. The label alone, applied from GitHub's UI, no longer counts. The owner approves a gate change one of two ways, and both post that record: comment `/approve-gate <head sha>` on the pull request (where the approve-gate workflow is installed), or run `ao owner-label apply <owner/repo> <pr> gate-change-approved --head <head sha>` in the owner's own terminal (README.md, "Gate guard on the default branch").
 
 The remaining labels are GitHub's defaults plus one for accessibility:
 
