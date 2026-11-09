@@ -1094,8 +1094,8 @@ class NeverEdited(unittest.TestCase):
 
     def test_any_edit_signal_means_edited(self):
         for change in ({"lastEditedAt": "2026-10-16T13:00:01Z"}, {"editor": {"login": "someone"}},
-                       {"includesCreatedEdit": True}, {"includesCreatedEdit": None}, {"userContentEdits": None},
-                       {"userContentEdits": {"totalCount": 1}}, {"userContentEdits": {}}):
+                       {"includesCreatedEdit": True}, {"includesCreatedEdit": None},
+                       {"userContentEdits": {"totalCount": 1}}, {"userContentEdits": {"totalCount": None}}):
             with self.subTest(change=change):
                 [comment], _ = self.mark(dict(self.CLEAN, **change))
                 self.assertIs(comment["never_edited"], False)

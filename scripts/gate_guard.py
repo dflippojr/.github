@@ -83,6 +83,8 @@ HEAD_RECORD = re.compile(r"<!-- owner-label (\S+) head=([0-9a-f]{40}) -->")
 EDIT_QUERY = ("query($ids: [ID!]!) { nodes(ids: $ids) { __typename ... on IssueComment { id databaseId "
               "lastEditedAt editor { login } includesCreatedEdit userContentEdits(first: 1) { totalCount } } } }")
 EDIT_BATCH = 100
+# The keys of each EDIT_QUERY node; userContentEdits must also hold totalCount.
+EDIT_KEYS = ("__typename", "id", "databaseId", "lastEditedAt", "editor", "includesCreatedEdit", "userContentEdits")
 # The judging job's check with the caller template: the caller's job id, then
 # the reusable workflow's job name. pr_body_lint.py reads its verdict annotation.
 REQUIRED_CHECK = "gate-guard-target / gate-guard"
@@ -2961,13 +2963,16 @@ def _records(comment, label):
 
 def _never_edited(node, comment):
     """Whether node, GraphQL's answer for comment, shows affirmatively that it was never edited: no last edit, no
-    editor, no edit history. Anything else, an unreadable answer included, raises or says no."""
-    if (not isinstance(node, dict) or node.get("__typename") != "IssueComment"
-            or node.get("id") != comment.get("node_id") or node.get("databaseId") != comment.get("id")):
-        raise ValueError(f"the GraphQL API did not return the edit history of comment {comment.get('id')}")
-    edits = (node.get("userContentEdits") or {}).get("totalCount")
-    return (node.get("lastEditedAt") is None and node.get("editor") is None
-            and node.get("includesCreatedEdit") is False and edits == 0)
+    editor, no edit history. Every key EDIT_QUERY asks for must be present before its value is read, since a
+    missing key is not a null. A partial or mismatched answer raises; an edited one says no."""
+    edits = node.get("userContentEdits") if isinstance(node, dict) else None
+    if (not isinstance(node, dict) or any(key not in node for key in EDIT_KEYS)
+            or not isinstance(edits, dict) or "totalCount" not in edits
+            or node["__typename"] != "IssueComment" or node["id"] != comment.get("node_id")
+            or node["databaseId"] != comment.get("id")):
+        raise ValueError(f"the GraphQL API did not return the whole edit history of comment {comment.get('id')}")
+    return (node["lastEditedAt"] is None and node["editor"] is None
+            and node["includesCreatedEdit"] is False and edits["totalCount"] == 0)
 
 
 def with_edit_history(github, comments, owner):
