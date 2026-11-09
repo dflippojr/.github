@@ -377,6 +377,15 @@ base: the same head against a new base can bring hits the old base hid.
    edited record or someone else's record fails closed, and the reason names
    both ways to approve.
 
+   Unedited means the server says so. REST's `created_at` and `updated_at`
+   have one-second resolution, so an edit in the second the record was posted
+   can leave them equal. For each of the owner's head records the guard also
+   reads GraphQL's `IssueComment` edit history, 100 comments per query, and
+   counts the record only when `lastEditedAt` and `editor` are null,
+   `includesCreatedEdit` is false and `userContentEdits` is empty. An edit
+   later restored to the original text still counts as an edit. If that
+   history can't be read, the job fails.
+
    The rule has no exceptions because the guard can't tell how a label got
    there. The approve-gate workflow labels with the owner's own token, so
    GitHub records the owner as the actor, exactly as for a label applied by
@@ -488,8 +497,9 @@ anything from the pull request:
   leaked owner token are outside what this check can see.
 - **A deleted head record.** Anyone with write access can delete comments,
   the owner's included. Deleting the owner's head record makes the label stop
-  counting, which fails closed; editing it does the same. Neither can make an
-  unapproved head pass. Before dflippojr/.github#62 the guard told a workflow
+  counting, which fails closed; editing it does the same, even within the
+  second it was posted, since the guard reads the server's edit history rather
+  than comparing timestamps. Neither can make an unapproved head pass. Before dflippojr/.github#62 the guard told a workflow
   label from a hand label by the owner's `/approve-gate` command, so deleting
   or rewriting that command turned a failed run's label into a hand label
   judged by its time alone. The head record is now required for every

@@ -76,6 +76,13 @@ OWNER_LABELS = (APPROVAL_LABEL, FINDINGS_LABEL)
 # they label: `ao owner-label apply` ("Owner applied ...") and approve_gate.py,
 # the /approve-gate workflow ("Owner approved ... by [comment](...)").
 HEAD_RECORD = re.compile(r"<!-- owner-label (\S+) head=([0-9a-f]{40}) -->")
+# REST comment timestamps have one-second resolution, so updated_at ==
+# created_at can't show that a record was never edited. GraphQL's IssueComment
+# keeps the server's edit history; the guard reads it for each candidate record,
+# up to EDIT_BATCH comments per query.
+EDIT_QUERY = ("query($ids: [ID!]!) { nodes(ids: $ids) { __typename ... on IssueComment { id databaseId "
+              "lastEditedAt editor { login } includesCreatedEdit userContentEdits(first: 1) { totalCount } } } }")
+EDIT_BATCH = 100
 # The judging job's check with the caller template: the caller's job id, then
 # the reusable workflow's job name. pr_body_lint.py reads its verdict annotation.
 REQUIRED_CHECK = "gate-guard-target / gate-guard"
@@ -2947,20 +2954,58 @@ def awaiting_record(events, owner, comments):
             and recorded_head(comments, APPROVAL_LABEL, owner, applied) is None)
 
 
+def _records(comment, label):
+    """The head SHAs that comment's head records for label name."""
+    return [m.group(2) for m in HEAD_RECORD.finditer(comment.get("body") or "") if m.group(1).lower() == label]
+
+
+def _never_edited(node, comment):
+    """Whether node, GraphQL's answer for comment, shows affirmatively that it was never edited: no last edit, no
+    editor, no edit history. Anything else, an unreadable answer included, raises or says no."""
+    if (not isinstance(node, dict) or node.get("__typename") != "IssueComment"
+            or node.get("id") != comment.get("node_id") or node.get("databaseId") != comment.get("id")):
+        raise ValueError(f"the GraphQL API did not return the edit history of comment {comment.get('id')}")
+    edits = (node.get("userContentEdits") or {}).get("totalCount")
+    return (node.get("lastEditedAt") is None and node.get("editor") is None
+            and node.get("includesCreatedEdit") is False and edits == 0)
+
+
+def with_edit_history(github, comments, owner):
+    """comments, each with never_edited: True only for an owner head record for gate-change-approved whose server
+    edit history GraphQL shows empty. Only those candidates are looked up, EDIT_BATCH per query, so the reads
+    stay linear in the comments. Raises when a history can't be read: the guard fails closed."""
+    marked = [dict(c, never_edited=False) for c in comments]
+    candidates = [c for c in marked if _by(c, owner) and _records(c, APPROVAL_LABEL)]
+    for start in range(0, len(candidates), EDIT_BATCH):
+        batch = candidates[start:start + EDIT_BATCH]
+        ids = [c.get("node_id") for c in batch]
+        if not all(isinstance(i, str) and i for i in ids):
+            raise ValueError("a head record comment has no node_id to read its edit history by")
+        nodes = (github.graphql(EDIT_QUERY, {"ids": ids}) or {}).get("nodes")
+        if not isinstance(nodes, list) or len(nodes) != len(batch):
+            raise ValueError("the GraphQL API did not return the edit history of every head record")
+        for comment, node in zip(batch, nodes):
+            comment["never_edited"] = _never_edited(node, comment)
+    return marked
+
+
 def recorded_head(comments, label, owner, since):
     """(sha, posted) from the owner's newest unedited head record for label posted at or after since, or None.
 
     Anyone with write access can edit the owner's comment, so an edited one
-    never counts (the rule of agent-ops `ao owner-label`).
+    never counts (the rule of agent-ops `ao owner-label`). Unedited means
+    GraphQL's edit history showed none (never_edited, from with_edit_history)
+    and the REST timestamps agree; a comment not looked up never counts.
     """
     found = None
     for c in comments:
         at = parse_time(c.get("created_at"))
-        if not _by(c, owner) or at is None or at < since or c.get("updated_at") != c.get("created_at"):
+        if (not _by(c, owner) or at is None or at < since or c.get("updated_at") != c.get("created_at")
+                or c.get("never_edited") is not True):
             continue
-        for match in HEAD_RECORD.finditer(c.get("body") or ""):
-            if match.group(1).lower() == label and (found is None or at >= found[1]):
-                found = (match.group(2), at)
+        for seen in _records(c, label):
+            if found is None or at >= found[1]:
+                found = (seen, at)
     return found
 
 
@@ -3020,8 +3065,17 @@ def owner_label(label, labels, events, owner, sha, pushed_at, comments=()):
 class GitHub:
     """The GitHub API calls the pull_request_target mode makes."""
 
-    def __init__(self, api, token):
+    def __init__(self, api, token, graphql_url=None):
         self.api, self.token = api, token
+        self.graphql_url = graphql_url or os.environ.get("GITHUB_GRAPHQL_URL") or f"{api}/graphql"
+
+    def graphql(self, query, variables):
+        """The data of one GraphQL query. Any error, even beside partial data, raises: nothing is judged from half
+        an answer."""
+        answer = api_request(self.graphql_url, self.token, "POST", {"query": query, "variables": variables})[0]
+        if not isinstance(answer, dict) or answer.get("errors") or not isinstance(answer.get("data"), dict):
+            raise ValueError(f"the GraphQL API answered with errors: {str((answer or {}).get('errors'))[:300]}")
+        return answer["data"]
 
     def get(self, path):
         return api_request(self.api + path, self.token)[0]
@@ -3212,12 +3266,14 @@ def _target_labels(github, repo, number, head, sha, owner):
             activity = github.pages(f"/repos/{head_repo}/activity?ref={urllib.parse.quote(ref, safe='/')}")
             pushed_at = head_pushed_at(activity, ref, sha)
     if APPROVAL_LABEL in labels:
-        comments = github.pages(f"/repos/{repo}/issues/{number}/comments")
+        def read():
+            return with_edit_history(github, github.pages(f"/repos/{repo}/issues/{number}/comments"), owner)
+        comments = read()
         for _ in range(RECORD_WAIT // RECORD_POLL):
             if not awaiting_record(events, owner, comments):
                 break
             time.sleep(RECORD_POLL)
-            comments = github.pages(f"/repos/{repo}/issues/{number}/comments")
+            comments = read()
     return labels, {label: owner_label(label, labels, events, owner, sha, pushed_at, comments)
                     for label in OWNER_LABELS}
 

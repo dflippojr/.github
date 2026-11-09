@@ -615,7 +615,7 @@ class OwnerLabel(unittest.TestCase):
 
     # The owner's head record for the head, a second after the 13:00:00 labels below; the login's case differs.
     RECORD = {"user": {"login": "owner"}, "created_at": "2026-10-16T13:00:01Z", "updated_at": "2026-10-16T13:00:01Z",
-              "body": f"<!-- owner-label {gate_guard.APPROVAL_LABEL} head={'c' * 40} -->"}
+              "body": f"<!-- owner-label {gate_guard.APPROVAL_LABEL} head={'c' * 40} -->", "never_edited": True}
 
     def verdict(self, events, labels=(gate_guard.APPROVAL_LABEL,), pushed=PUSHED, comments=(RECORD,)):
         return gate_guard.owner_label(gate_guard.APPROVAL_LABEL, set(labels), events, "Owner", "c" * 40, pushed,
@@ -658,9 +658,12 @@ class ApproveGateLabel(unittest.TestCase):
     LABELED = "2026-10-16T13:00:00Z"
 
     @staticmethod
-    def comment(body, at, author="dflippojr", edited_at=None, i=0):
+    def comment(body, at, author="dflippojr", edited_at=None, i=0, never_edited=None):
+        """A comment as the guard has it after with_edit_history: never_edited is GraphQL's verdict, which follows
+        edited_at unless given."""
         return {"id": i, "user": {"login": author}, "body": body, "created_at": at, "updated_at": edited_at or at,
-                "html_url": f"https://github.com/x#issuecomment-{i}"}
+                "html_url": f"https://github.com/x#issuecomment-{i}",
+                "never_edited": edited_at is None if never_edited is None else never_edited}
 
     def command(self, sha=HEAD, at="2026-10-16T12:59:50Z", **kw):
         return self.comment(f"/approve-gate {sha}", at, **kw)
@@ -756,6 +759,12 @@ class ApproveGateLabel(unittest.TestCase):
     def test_an_edited_record_does_not_count(self):
         counts, _ = self.verdict([self.command(), self.record(edited_at="2026-10-16T14:00:00Z")])
         self.assertFalse(counts)
+
+    def test_an_edit_the_rest_timestamps_hide_does_not_count_in_either_form(self):
+        """#62 round 1: equal created_at and updated_at, but the server's edit history isn't empty."""
+        for form in (self.record, self.ao_record):
+            with self.subTest(form=form.__name__):
+                self.assert_refused_naming_both_ways(self.verdict([form(never_edited=False)]))
 
     def test_someone_elses_record_does_not_count(self):
         for author in ("worker[bot]", "dflippojr-workers[bot]", "dflippojr2"):
@@ -1001,6 +1010,85 @@ class EditHistory(unittest.TestCase):
         self.assertEqual([len(ids) for ids in fake.graphql_calls], [100, 50])
         self.assertEqual(sorted(i for ids in fake.graphql_calls for i in ids),
                          sorted(f"IC_{NUMBER}_{i}" for i in range(2, 152)))
+
+
+class NeverEdited(unittest.TestCase):
+    """with_edit_history counts a record as unedited only when every server edit signal says so (#62 round 1)."""
+    COMMENT = {"id": 5, "node_id": "IC_5", "user": {"login": "dflippojr"}, "created_at": "2026-10-16T13:00:01Z",
+               "updated_at": "2026-10-16T13:00:01Z", "body": f"<!-- owner-label gate-change-approved head={'c' * 40} -->"}
+    CLEAN = {"__typename": "IssueComment", "id": "IC_5", "databaseId": 5, "lastEditedAt": None, "editor": None,
+             "includesCreatedEdit": False, "userContentEdits": {"totalCount": 0}}
+
+    def mark(self, node, comments=None):
+        github = mock.Mock()
+        github.graphql.return_value = {"nodes": [node]}
+        return gate_guard.with_edit_history(github, comments or [self.COMMENT], "dflippojr"), github
+
+    def test_a_clean_history_is_never_edited(self):
+        [comment], github = self.mark(self.CLEAN)
+        self.assertIs(comment["never_edited"], True)
+        github.graphql.assert_called_once_with(gate_guard.EDIT_QUERY, {"ids": ["IC_5"]})
+
+    def test_any_edit_signal_means_edited(self):
+        for change in ({"lastEditedAt": "2026-10-16T13:00:01Z"}, {"editor": {"login": "someone"}},
+                       {"includesCreatedEdit": True}, {"includesCreatedEdit": None}, {"userContentEdits": None},
+                       {"userContentEdits": {"totalCount": 1}}, {"userContentEdits": {}}):
+            with self.subTest(change=change):
+                [comment], _ = self.mark(dict(self.CLEAN, **change))
+                self.assertIs(comment["never_edited"], False)
+                self.assertIsNone(gate_guard.recorded_head([comment], gate_guard.APPROVAL_LABEL, "dflippojr",
+                                                           gate_guard.parse_time("2026-10-16T13:00:00Z")))
+
+    def test_an_answer_for_another_comment_fails_closed(self):
+        for change in ({"id": "IC_6"}, {"databaseId": 6}, {"__typename": "PullRequestReviewComment"}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.mark(dict(self.CLEAN, **change))
+        for nodes in ([None], [], [self.CLEAN, self.CLEAN], None):
+            with self.subTest(nodes=nodes), self.assertRaises(ValueError):
+                github = mock.Mock()
+                github.graphql.return_value = {"nodes": nodes}
+                gate_guard.with_edit_history(github, [self.COMMENT], "dflippojr")
+
+    def test_a_record_with_no_node_id_fails_closed(self):
+        comment = {k: v for k, v in self.COMMENT.items() if k != "node_id"}
+        with self.assertRaises(ValueError):
+            self.mark(self.CLEAN, [comment])
+
+    def test_other_comments_are_never_looked_up_or_counted(self):
+        github = mock.Mock()
+        others = [dict(self.COMMENT, user={"login": "worker[bot]"}), dict(self.COMMENT, body="LGTM"),
+                  dict(self.COMMENT, body=self.COMMENT["body"].replace("gate-change-approved", "findings-accepted"))]
+        marked = gate_guard.with_edit_history(github, others, "dflippojr")
+        github.graphql.assert_not_called()
+        self.assertEqual([c["never_edited"] for c in marked], [False, False, False])
+
+    def test_a_comment_claiming_never_edited_is_overwritten(self):
+        """A key on the REST comment can't vouch for itself; only the GraphQL answer sets it."""
+        [comment], _ = self.mark(dict(self.CLEAN, lastEditedAt="2026-10-16T13:00:01Z"),
+                                 [dict(self.COMMENT, never_edited=True)])
+        self.assertIs(comment["never_edited"], False)
+
+
+class GraphQL(unittest.TestCase):
+    def test_errors_beside_data_raise(self):
+        github = gate_guard.GitHub("https://api.test", "t", "https://api.test/graphql")
+        for answer in ({"data": {"nodes": []}, "errors": [{"message": "rate limited"}]}, {"errors": [{}]},
+                       {"data": None}, None, []):
+            with self.subTest(answer=answer), \
+                    mock.patch.object(gate_guard, "api_request", return_value=(answer, None)), \
+                    self.assertRaises(ValueError):
+                github.graphql(gate_guard.EDIT_QUERY, {"ids": ["IC_5"]})
+
+    def test_data_comes_back_from_the_graphql_endpoint(self):
+        with mock.patch.dict(os.environ, {"GITHUB_GRAPHQL_URL": "https://ghe.test/api/graphql"}), \
+                mock.patch.object(gate_guard, "api_request", return_value=({"data": {"nodes": []}}, None)) as call:
+            self.assertEqual(gate_guard.GitHub("https://ghe.test/api/v3", "t").graphql("q", {"ids": []}),
+                             {"nodes": []})
+        call.assert_called_once_with("https://ghe.test/api/graphql", "t", "POST",
+                                     {"query": "q", "variables": {"ids": []}})
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(gate_guard.GitHub("https://api.github.com", "t").graphql_url,
+                             "https://api.github.com/graphql")
 
 
 class HeadPushedAt(unittest.TestCase):
