@@ -616,9 +616,10 @@ The owner sets up, once per repository with a caller (repository Settings):
    Repository access: only this repository. Permissions:
    **Pull requests: Read and write** (labels and comments on pull requests,
    and the GraphQL read of the command's edit history), plus the mandatory
-   Metadata: Read. If GitHub refuses the label call, or the edit-history
-   read (the run replies "its edit history could not be read" and exits 2),
-   with 403, add **Issues: Read and write**. Set an expiry and renew it.
+   Metadata: Read. If GitHub refuses the label call with 403, or the run
+   replies "its edit history could not be read" naming a 403, `FORBIDDEN` or
+   "not accessible" error (a GraphQL denial can come back as HTTP 200 with
+   an error), add **Issues: Read and write**. Set an expiry and renew it.
 4. In the `approve-gate` environment, **Environment secrets → Add secret**,
    named `OWNER_GATE_TOKEN`, holding the token.
 5. If a repository secret named `OWNER_GATE_TOKEN` exists (Settings → Secrets
