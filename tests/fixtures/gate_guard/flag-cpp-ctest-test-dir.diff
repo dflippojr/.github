@@ -1,0 +1,19 @@
+# gate-guard fixture: a CTest registration removed from the test directory's CMakeLists.txt
+# expect: removed-tests
+# hits: 1
+# detail: a file in a test directory
+
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 5a02222..6077865 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -1,2 +1 @@
+ add_executable(clamp_test clamp_test.cpp)
+-add_test(NAME clamp COMMAND clamp_test)
+diff --git a/src/logic.cpp b/src/logic.cpp
+index 1c77b06..493ef5d 100644
+--- a/src/logic.cpp
++++ b/src/logic.cpp
+@@ -1 +1 @@
+-int clamp(int v, int lo, int hi) { return v; }
++int clamp(int v, int lo, int hi) { return v < lo ? lo : v; }

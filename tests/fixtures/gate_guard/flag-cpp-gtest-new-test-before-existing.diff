@@ -1,0 +1,35 @@
+# gate-guard fixture: a new GoogleTest test placed before the existing tests
+# expect: removed-tests
+# hits: 1
+# detail: it adds the test Clamp.Middle
+
+diff --git a/test/unit/clamp_test.cpp b/test/unit/clamp_test.cpp
+index 4234354..e29e91b 100644
+--- a/test/unit/clamp_test.cpp
++++ b/test/unit/clamp_test.cpp
+@@ -1,21 +1,25 @@
+ #include <gtest/gtest.h>
+ #include "logic.h"
+ 
+ namespace {
+ 
+ class ClampTest : public ::testing::Test {
+  protected:
+   void SetUp() override { limit_ = 10; }
+   int limit_ = 0;
+ };
+ 
++TEST(Clamp, Middle) {
++  EXPECT_EQ(5, clamp(5, 0, 10));
++}
++
+ TEST(Clamp, Low) {
+   EXPECT_EQ(0, clamp(-5, 0, 10));
+   EXPECT_TRUE(clamp(5, 0, 10) == 5);
+ }
+ 
+ TEST_F(ClampTest, High) {
+   EXPECT_EQ(limit_, clamp(50, 0, limit_));
+ }
+ 
+ }  // namespace

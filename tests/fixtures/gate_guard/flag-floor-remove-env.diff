@@ -1,0 +1,20 @@
+# gate-guard fixture: COVERAGE_FLOOR and a gcovr floor removed
+# expect: floor-lowered gate-config
+# hits: 3
+# detail: COVERAGE_FLOOR removed (was 83.07)
+# detail: --fail-under-branch removed (was 80)
+# detail: coverage config edited
+
+diff --git a/scripts/check.sh b/scripts/check.sh
+index c3de7c8..797a0f6 100644
+--- a/scripts/check.sh
++++ b/scripts/check.sh
+@@ -1,6 +1,6 @@
+ #!/bin/sh
+ set -e
+-COVERAGE_FLOOR=83.07
++COVERAGE_FLOOR=
+ cargo llvm-cov report --fail-under-lines "$COVERAGE_FLOOR"
+-gcovr --root .. --print-summary --fail-under-line 97.1 --fail-under-branch 80
++gcovr --root .. --print-summary --fail-under-line 97.1
+ echo "done"

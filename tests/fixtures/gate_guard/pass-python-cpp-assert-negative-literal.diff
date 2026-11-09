@@ -1,0 +1,31 @@
+# gate-guard fixture: compared numbers made negative in an existing test's assertions
+# expect: 
+# hits: 0
+
+diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
+--- a/firmware/src/logic.cpp
++++ b/firmware/src/logic.cpp
+@@ -1 +1 @@
+-int limit = 120;
++int limit = 125;
+diff --git a/backend/tests/test_guard.py b/backend/tests/test_guard.py
+--- a/backend/tests/test_guard.py
++++ b/backend/tests/test_guard.py
+@@ -1,15 +1,15 @@
+ import os
+ 
+ import pytest
+ 
+ from backend.app import create_app
+ 
+ 
+ def test_offsets():
+     app = create_app()
+-    assert app.offset == 1
+-    assert app.tilt == 0.5
++    assert app.offset == -1
++    assert app.tilt == -0.5
+ 
+ 
+ def test_later():
+     assert False

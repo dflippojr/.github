@@ -1,0 +1,56 @@
+# gate-guard fixture: two JaCoCo rules on the same counter swap their includes, so Critical* falls from 0.90 to 0.60 while each position rises
+# expect: floor-lowered gate-config
+# hits: 2
+# detail: JaCoCo CLASS LINE COVEREDRATIO minimum for includes com.shop.Critical* lowered from 0.90 to 0.60
+# detail: coverage config edited
+
+diff --git a/pom.xml b/pom.xml
+index 12183e1..072decf 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -1,41 +1,41 @@
+ <project>
+   <build>
+     <plugins>
+       <plugin>
+         <groupId>org.jacoco</groupId>
+         <artifactId>jacoco-maven-plugin</artifactId>
+         <version>0.8.12</version>
+         <configuration>
+           <rules>
+             <rule>
+               <element>CLASS</element>
+               <includes>
+-                <include>com.shop.Critical*</include>
++                <include>com.shop.Utility*</include>
+               </includes>
+               <limits>
+                 <limit>
+                   <counter>LINE</counter>
+                   <value>COVEREDRATIO</value>
+-                  <minimum>0.90</minimum>
++                  <minimum>0.95</minimum>
+                 </limit>
+               </limits>
+             </rule>
+             <rule>
+               <element>CLASS</element>
+               <includes>
+-                <include>com.shop.Utility*</include>
++                <include>com.shop.Critical*</include>
+               </includes>
+               <limits>
+                 <limit>
+                   <counter>LINE</counter>
+                   <value>COVEREDRATIO</value>
+-                  <minimum>0.50</minimum>
++                  <minimum>0.60</minimum>
+                 </limit>
+               </limits>
+             </rule>
+           </rules>
+         </configuration>
+       </plugin>
+     </plugins>
+   </build>
+ </project>

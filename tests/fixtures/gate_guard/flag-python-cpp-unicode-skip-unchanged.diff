@@ -1,0 +1,39 @@
+# gate-guard fixture: in a C/C++ repository, an unchanged fixture calls a fullwidth pytest.skip, which Python reads as pytest.skip, when a test fills a list
+# expect: removed-tests
+# hits: 1
+# detail: not an assert statement of a test's own body
+
+diff --git a/backend/tests/test_api.py b/backend/tests/test_api.py
+index 087045b..cf96160 100644
+--- a/backend/tests/test_api.py
++++ b/backend/tests/test_api.py
+@@ -1,19 +1,19 @@
+ import pytest
+ from backend.app import create_app
+ 
+ FLAGS = []
+ 
+ 
+ @pytest.fixture(autouse=True)
+ def _gate():
+     if FLAGS:
+         pytest.ｓｋｉｐ("later")
+ 
+ 
+ def test_health():
+-    FLAGS.extend([])
++    FLAGS.extend([1])
+     assert create_app()
+ 
+ 
+ def test_height_limits():
+     assert create_app().max_height == 120
+diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
+index b384dce..3925a03 100644
+--- a/firmware/src/logic.cpp
++++ b/firmware/src/logic.cpp
+@@ -1,3 +1,3 @@
+ int clamp(int v, int lo, int hi) {
+-  return v < lo ? lo : v;
++  return v < lo ? lo : (v > hi ? hi : v);
+ }

@@ -1,0 +1,18 @@
+# gate-guard fixture: in a C/C++ repository, PR #41 review 2: a test module renamed unchanged into backend/tests/.disabled
+# expect: removed-tests
+# hits: 1
+# detail: only an edit in place
+
+diff --git a/backend/tests/test_api.py b/backend/tests/.disabled/test_api.py
+similarity index 100%
+rename from backend/tests/test_api.py
+rename to backend/tests/.disabled/test_api.py
+diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
+index b384dce..3925a03 100644
+--- a/firmware/src/logic.cpp
++++ b/firmware/src/logic.cpp
+@@ -1,3 +1,3 @@
+ int clamp(int v, int lo, int hi) {
+-  return v < lo ? lo : v;
++  return v < lo ? lo : (v > hi ? hi : v);
+ }

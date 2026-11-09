@@ -1,0 +1,18 @@
+# gate-guard fixture: a doctest CHECK_MESSAGE's compared literal changed while a middle message argument is a call between strings (Codex r2)
+# expect: removed-tests
+# hits: 1
+# detail: message is not a string literal
+
+diff --git a/tests/clamp_test.cpp b/tests/clamp_test.cpp
+index 1111111..2222222 100644
+--- a/tests/clamp_test.cpp
++++ b/tests/clamp_test.cpp
+@@ -1,7 +1,7 @@
+ #include <doctest/doctest.h>
+ #include "support.h"
+ 
+ TEST_CASE("existing") {
+-    CHECK_MESSAGE(value() == 1, "head", describe(), "tail");
++    CHECK_MESSAGE(value() == 2, "head", describe(), "tail");
+     CHECK(false);
+ }

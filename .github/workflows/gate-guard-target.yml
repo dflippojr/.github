@@ -36,6 +36,14 @@ on:
           Login whose labels count. Defaults to the repository owner.
         type: string
         default: ''
+      extra-gate-paths:
+        description: >-
+          Repository-specific gate paths, one glob per line, such as
+          tests/golden/**. A change to a matching file is a gate-config hit.
+          * and ? match within a segment and ** stands alone for any number of
+          segments; a glob the guard refuses fails the job. Empty adds none.
+        type: string
+        default: ''
     outputs:
       conclusion:
         description: >-
@@ -96,4 +104,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           GUARD_REF: ${{ inputs.guard-ref }}
           OWNER: ${{ inputs.owner }}
-        run: python3 gate-guard/scripts/gate_guard.py --pull-request-target --guard-sha "$GUARD_REF" ${OWNER:+--owner "$OWNER"}
+          EXTRA_GATE_PATHS: ${{ inputs.extra-gate-paths }}
+        # The globs go as one quoted value, never through shell globbing; the script splits the lines.
+        # No flag when empty, so an older guard-ref without --extra-gate-path still runs.
+        run: python3 gate-guard/scripts/gate_guard.py --pull-request-target --guard-sha "$GUARD_REF" ${OWNER:+--owner "$OWNER"} ${EXTRA_GATE_PATHS:+"--extra-gate-path=$EXTRA_GATE_PATHS"}

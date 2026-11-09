@@ -1,0 +1,21 @@
+# gate-guard fixture: a floor raised in a workflow is still a workflow edit
+# expect: gate-config
+# hits: 1
+# detail: workflow modified
+
+diff --git a/.github/workflows/coverage.yml b/.github/workflows/coverage.yml
+index d863e98..72aa291 100644
+--- a/.github/workflows/coverage.yml
++++ b/.github/workflows/coverage.yml
+@@ -1,9 +1,9 @@
+ name: Coverage
+ on: [pull_request]
+ env:
+-  COVERAGE_FLOOR: 83.07
++  COVERAGE_FLOOR: 84
+ jobs:
+   coverage:
+     runs-on: ubuntu-latest
+     steps:
+-      - run: gcovr --root .. --fail-under-line 97.1
++      - run: gcovr --root .. --fail-under-line 97.5

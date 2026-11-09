@@ -1,0 +1,30 @@
+# gate-guard fixture: an assertion's value changed inside a with that suppresses its failure
+# expect: removed-tests
+# hits: 1
+# detail: not an assert statement of a test's own body
+
+diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
+--- a/firmware/src/logic.cpp
++++ b/firmware/src/logic.cpp
+@@ -1 +1 @@
+-int limit = 120;
++int limit = 125;
+diff --git a/backend/tests/test_guard.py b/backend/tests/test_guard.py
+--- a/backend/tests/test_guard.py
++++ b/backend/tests/test_guard.py
+@@ -1,14 +1,14 @@
+ import os
+ 
+ import pytest
+ 
+ from backend.app import create_app
+ 
+ 
+ def test_guard():
+     with pytest.raises(AssertionError):
+-        assert os.sep == "/"
++        assert os.sep == "\\"
+ 
+ 
+ def test_later():
+     assert False

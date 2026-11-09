@@ -1,0 +1,29 @@
+# gate-guard fixture: with the test's os = Mock() deleted, an unchanged nested helper's os is the module's
+# expect: removed-tests
+# hits: 1
+# detail: adds, removes or moves a statement
+
+diff --git a/firmware/src/logic.cpp b/firmware/src/logic.cpp
+--- a/firmware/src/logic.cpp
++++ b/firmware/src/logic.cpp
+@@ -1 +1 @@
+-int limit = 120;
++int limit = 125;
+diff --git a/backend/tests/test_environment.py b/backend/tests/test_environment.py
+--- a/backend/tests/test_environment.py
++++ b/backend/tests/test_environment.py
+@@ -1,14 +1,13 @@
+ import os
+ from unittest.mock import Mock
+ 
+ 
+ def test_hw():
+-    os = Mock()
+     def helper():
+         os.getcwd()
+     helper()
+     assert True
+ 
+ 
+ def test_later():
+     assert False

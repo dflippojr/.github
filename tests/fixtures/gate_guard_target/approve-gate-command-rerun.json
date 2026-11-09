@@ -1,0 +1,46 @@
+{
+  "description": "The owner posted /approve-gate for head A once. Run 1 labeled and recorded A for that command; B was pushed; a rerun of run 1 removed and re-applied the label and died before its record. The command marks the rerun's label although run 1's record links it: B is refused.",
+  "diff": "flag-gate-target-caller",
+  "pushed_at": "2026-10-16T10:00:12Z",
+  "labels": [
+    "gate-change-approved"
+  ],
+  "events": [
+    {
+      "event": "labeled",
+      "label": "gate-change-approved",
+      "actor": "dflippojr",
+      "created_at": "2026-10-16T10:00:08Z"
+    },
+    {
+      "event": "unlabeled",
+      "label": "gate-change-approved",
+      "actor": "dflippojr",
+      "created_at": "2026-10-16T10:00:14Z"
+    },
+    {
+      "event": "labeled",
+      "label": "gate-change-approved",
+      "actor": "dflippojr",
+      "created_at": "2026-10-16T10:00:15Z"
+    }
+  ],
+  "comments": [
+    {
+      "author": "dflippojr",
+      "body": "/approve-gate aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "created_at": "2026-10-16T10:00:00Z"
+    },
+    {
+      "author": "dflippojr",
+      "body": "Owner approved `gate-change-approved` at head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa by [comment](https://github.com/dflippojr/demo/pull/7#issuecomment-0). A later push invalidates it.\n\n<!-- owner-label gate-change-approved head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -->",
+      "created_at": "2026-10-16T10:00:09Z"
+    }
+  ],
+  "expect": {
+    "conclusion": "failure",
+    "exit": 1,
+    "title": "2 hits, not approved",
+    "reason": "applied through `/approve-gate`, but no unedited head record from the owner"
+  }
+}

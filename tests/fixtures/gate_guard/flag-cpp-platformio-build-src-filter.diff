@@ -1,0 +1,16 @@
+# gate-guard fixture: a PlatformIO build_src_filter narrowed, which changes what tests build against
+# expect: skip-marker
+# hits: 1
+# detail: PlatformIO firmware/platformio.ini modified
+
+diff --git a/firmware/platformio.ini b/firmware/platformio.ini
+index 117464f..0c37d84 100644
+--- a/firmware/platformio.ini
++++ b/firmware/platformio.ini
+@@ -1,5 +1,5 @@
+ [env:native]
+ platform = native
+ test_framework = unity
+ build_flags = -DCLAMP_LIMIT=10
+-build_src_filter = +<*> -<main.cpp>
++build_src_filter = +<*> -<main.cpp> -<logic.cpp>

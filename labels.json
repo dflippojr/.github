@@ -15,6 +15,7 @@
     {"name": "ready", "color": "2ea44f", "description": "Specified enough to implement or verify without further decisions"},
     {"name": "blocked", "color": "5319e7", "description": "Specified, but waiting on a dependency"},
     {"name": "user-present", "color": "f9d0c4", "description": "The owner or a physical device is needed for the next step"},
+    {"name": "user-action", "color": "8b5e34", "description": "Needs the owner to do something (purchase, credential, decision)"},
     {"name": "in-progress", "color": "1d76db", "description": "Work started on a branch; no pull request yet"},
     {"name": "awaiting-review", "color": "d4c5f9", "description": "Pull request open; waiting for the owner's review or merge"},
     {"name": "verification", "color": "006b75", "description": "Confirm something already built works for real"},
@@ -28,8 +29,7 @@
     {"name": "P2", "color": "fef2c0", "description": "Priority: normal; not yet ordered"}
   ],
   "renames": {
-    "agent-ready": "ready",
-    "user-action": "user-present"
+    "agent-ready": "ready"
   },
   "remove": {
     "agent-harness": ["phase-8"]

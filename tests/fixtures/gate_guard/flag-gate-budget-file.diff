@@ -1,0 +1,21 @@
+# gate-guard fixture: a size budget file's limit and an unlisted numeric key raised, and a budget removed
+# expect: gate-config
+# hits: 3
+# detail: budget raised: "limit": 200000,
+# detail: budget raised: "maxGzipBytes": 40000,
+# detail: budget removed: maxImages
+
+diff --git a/checks/size-budget.json b/checks/size-budget.json
+index 9a1c2e4..0f7d3b8 100644
+--- a/checks/size-budget.json
++++ b/checks/size-budget.json
+@@ -1,6 +1,5 @@
+ {
+-  "limit": 100000,
+-  "maxGzipBytes": 30000,
+-  "maxRequests": 40,
+-  "maxImages": 12
++  "limit": 200000,
++  "maxGzipBytes": 40000,
++  "maxRequests": 40
+ }

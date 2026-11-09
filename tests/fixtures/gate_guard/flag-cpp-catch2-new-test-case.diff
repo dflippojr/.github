@@ -1,0 +1,21 @@
+# gate-guard fixture: a Catch2 REQUIRE's operator changed and a new TEST_CASE after the existing one; new tests are not exempt (owner decision 2026-11-06)
+# expect: removed-tests
+# hits: 1
+# detail: it adds the test "clamp high"
+
+diff --git a/tests/clamp_test.cpp b/tests/clamp_test.cpp
+index 474dc7a..38f2e5a 100644
+--- a/tests/clamp_test.cpp
++++ b/tests/clamp_test.cpp
+@@ -1,7 +1,10 @@
+ #include <catch2/catch_test_macros.hpp>
+ #include "logic.h"
+ 
+ TEST_CASE("clamp low", "[clamp]") {
+-    REQUIRE(clamp(-5, 0, 10) == 0);
++    REQUIRE(clamp(-5, 0, 10) <= 0);
+     CHECK(clamp(5, 0, 10) == 5);
+ }
++TEST_CASE("clamp high", "[clamp]") {
++    REQUIRE(clamp(50, 0, 10) == 10);
++}
