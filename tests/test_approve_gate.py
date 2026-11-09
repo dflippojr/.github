@@ -1,4 +1,5 @@
 """approve_gate.py: only the owner's own unedited `/approve-gate <head sha>` on a same-repo PR labels it."""
+import ast
 import http.client
 import io
 import json
@@ -519,6 +520,39 @@ class CommandEditHistory(unittest.TestCase):
         self.assertEqual(github.writes, [])
 
 
+COPIED = {"_check_edit_node": "def", "_never_edited": "def", "EDIT_QUERY": "literal", "EDIT_KEYS": "literal"}
+
+
+def is_literal(node):
+    try:
+        ast.literal_eval(node)
+    except ValueError:
+        return False
+    return True
+
+
+def script_bindings(path):
+    """How path binds each name it mentions: (kind, line) pairs, kind 'def', 'literal', 'expression' or 'import'.
+
+    Definitions and assignments count at module level only, so a later statement that rebinds a name is a second
+    entry. Imports count at any depth, so an import inside try: or if: is seen too."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    found = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            found.setdefault(node.name, []).append(("def", node.lineno))
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    kind = "literal" if is_literal(node.value) else "expression"
+                    found.setdefault(target.id, []).append((kind, node.lineno))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                found.setdefault(alias.asname or alias.name.split(".")[0], []).append(("import", node.lineno))
+    return found
+
+
 class EditCheckIsTheGuards(unittest.TestCase):
     """The workflow's sparse checkout carries only approve_gate.py, so it holds a copy of the gate guard's
     edit-history check (.github #63). The copy must stay the guard's, byte for byte."""
@@ -532,6 +566,21 @@ class EditCheckIsTheGuards(unittest.TestCase):
                                  inspect.getsource(getattr(gate_guard, name)))
         self.assertEqual(approve_gate.EDIT_QUERY, gate_guard.EDIT_QUERY)
         self.assertEqual(approve_gate.EDIT_KEYS, gate_guard.EDIT_KEYS)
+
+    def test_each_script_defines_its_own_copy(self):
+        """Each script binds the four copied names once, at module level, to its own def or literal, and no import
+        binds them. test_same_source passes for an import or an alias, since getsource and == follow the value, and
+        a def that a later import rebinds still passes too. Under the sparse checkout such a copy fails at import."""
+        import gate_guard
+        for module, path in ((approve_gate, ROOT / "scripts" / "approve_gate.py"),
+                             (gate_guard, ROOT / "scripts" / "gate_guard.py")):
+            found = script_bindings(path)
+            for name, kind in COPIED.items():
+                with self.subTest(script=path.name, name=name):
+                    self.assertEqual([k for k, _ in found.get(name, [])], [kind],
+                                     f"{path.name} binds {name} as {found.get(name)}, not its own {kind}")
+                    if kind == "def":
+                        self.assertEqual(getattr(module, name).__module__, module.__name__)
 
 
 class GraphqlCall(unittest.TestCase):
