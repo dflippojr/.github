@@ -137,6 +137,20 @@ class Acceptance(unittest.TestCase):
         self.assertIn(f"<!-- owner-label {LABEL} head={HEAD} -->", record)
         self.assertFalse(record.lstrip().startswith("/approve-gate"), "the record must not trigger another run")
 
+    def test_record_matches_what_the_gate_guard_reads(self):
+        """gate_guard.py marks a label as this workflow's by APPROVE_RECORD, and dates the head by HEAD_RECORD.
+
+        Its fixtures hard-code the record text, so only this catches head_record() drifting from the guard."""
+        import gate_guard
+        url = "https://github.com/dflippojr/demo/pull/7#issuecomment-1"
+        record = approve_gate.head_record(HEAD, url)
+        marked = gate_guard.APPROVE_RECORD.search(record)
+        self.assertIsNotNone(marked, record)
+        self.assertEqual(marked.group(1), url)
+        self.assertEqual([m.groups() for m in gate_guard.HEAD_RECORD.finditer(record)], [(LABEL, HEAD)])
+        self.assertIsNone(gate_guard.APPROVE_COMMAND.match(record), "the guard must not read the record as a command")
+        self.assertIsNotNone(gate_guard.APPROVE_COMMAND.match(f"/approve-gate {HEAD}"))
+
 
 class Rejections(unittest.TestCase):
     def assert_refused(self, github, why, replied=True, payload=None, name="issue_comment"):

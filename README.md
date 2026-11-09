@@ -559,9 +559,10 @@ record to name the current head, and the gate guard needs the label applied
 after the newest push and, for a label this workflow may have applied, the
 owner's newest head record since the label to name the current head ("A label
 from `/approve-gate` needs the head record" under "Gate guard on the default
-branch"). That guard rule also covers what the cleanup above can't: a run
-killed between the label and the record, or a label whose removal failed,
-leaves no record for the head, so the guard fails closed.
+branch"). That guard rule also covers what the cleanup above can't, a run
+killed between the label and the record or a removal that failed: the guard
+counts such a label only when the owner's newest record names the current
+head, so a label left on a head the owner never named fails closed.
 
 ### The token
 
