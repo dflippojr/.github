@@ -215,7 +215,9 @@ class Scenarios(unittest.TestCase):
         self.assertLessEqual({"head-edits-caller", "stale-owner-label", "bot-label", "owner-label-after-head",
                               "approve-gate-no-record", "approve-gate-push-race", "approve-gate-head-record",
                               "approve-gate-record-without-command", "approve-gate-hand-label-after-workflow",
-                              "approve-gate-second-command-race", "approve-gate-command-rerun"},
+                              "approve-gate-second-command-race", "approve-gate-command-rerun",
+                              "approve-gate-command-deleted", "approve-gate-command-rewritten",
+                              "edited-ao-head-record", "bare-owner-label"},
                              names)
 
     def test_scenarios(self):
@@ -286,6 +288,19 @@ class RecordAfterTheGuard(unittest.TestCase):
         self.assertGreater(sleeps, 0)
         self.assertLessEqual(sleeps * gate_guard.RECORD_POLL, gate_guard.RECORD_WAIT)
         self.assertEqual(reads, sleeps + 1)
+
+    def test_an_ao_owner_label_record_posted_after_the_first_read_counts(self):
+        """#62: `ao owner-label apply` labels, then posts its record, and the label starts the guard. With no
+        /approve-gate command at all the guard still waits for that record rather than judge the bare label."""
+        scenario = dict(self.SCENARIO, comments=[{
+            "author": OWNER, "created_at": "2026-10-16T13:00:01Z",
+            "body": "Owner applied `gate-change-approved` at head {head}. A later push invalidates it.\n\n"
+                    "<!-- owner-label gate-change-approved head={head} -->"}])
+        self.SCENARIO = scenario
+        code, check, reads, sleeps = self.run_guard("2026-10-16T13:00:01Z", record_after=1)
+        self.assertEqual((code, check["conclusion"]), (0, "success"), check["summary"])
+        self.assertIn("and the owner's head record posted at 2026-10-16T13:00:01Z names", check["summary"])
+        self.assertEqual((reads, sleeps), (2, 1))
 
     def test_an_old_label_gets_no_wait(self):
         code, check, reads, sleeps = self.run_guard("2026-10-16T13:10:00Z", record_after=1)
@@ -619,13 +634,50 @@ class ApproveGateLabel(unittest.TestCase):
                             f"{command}). A later push invalidates it.\n\n<!-- owner-label {label} head={sha} -->",
                             at, **kw)
 
-    def ao_record(self, sha=HEAD, at="2026-10-16T13:00:01Z", label=gate_guard.APPROVAL_LABEL):
+    def ao_record(self, sha=HEAD, at="2026-10-16T13:00:01Z", label=gate_guard.APPROVAL_LABEL, **kw):
+        """The record `ao owner-label apply` posts right after it labels."""
         return self.comment(f"Owner applied `{label}` at head {sha}. A later push invalidates it.\n\n"
-                            f"<!-- owner-label {label} head={sha} -->", at)
+                            f"<!-- owner-label {label} head={sha} -->", at, **kw)
 
     def verdict(self, comments, label=gate_guard.APPROVAL_LABEL, labeled=LABELED, pushed=PUSHED):
         events = [OwnerLabel.event("labeled", "dflippojr", labeled, label=label)]
         return gate_guard.owner_label(label, {label}, events, "dflippojr", self.HEAD, pushed, comments)
+
+    def assert_refused_naming_both_ways(self, verdict):
+        counts, why = verdict
+        self.assertFalse(counts, why)
+        self.assertIn(f"`/approve-gate {self.HEAD}`", why)
+        self.assertIn(f"`ao owner-label apply <repo> <pr> {gate_guard.APPROVAL_LABEL} --head {self.HEAD}`", why)
+
+    def test_interrupted_run_with_its_command_deleted_is_refused(self):
+        """#62: the owner comments /approve-gate A; B is pushed; the workflow labels after B's push and dies before
+        its record; someone deletes the command. No record names B, so B is refused."""
+        self.assert_refused_naming_both_ways(self.verdict([], labeled="2026-10-16T12:00:03Z"))
+
+    def test_interrupted_run_with_its_command_rewritten_is_refused(self):
+        """#62: the same run, with the owner's command rewritten to plain text instead of deleted."""
+        rewritten = self.comment("Looks good to me.", "2026-10-16T11:59:58Z", edited_at="2026-10-16T12:30:00Z")
+        self.assert_refused_naming_both_ways(self.verdict([rewritten], labeled="2026-10-16T12:00:03Z"))
+
+    def test_an_edited_head_record_never_counts_in_either_form(self):
+        """#62: anyone with write access can edit the owner's comment, so neither record form counts once edited."""
+        edited = "2026-10-16T14:00:00Z"
+        for form in (self.record, self.ao_record):
+            with self.subTest(form=form.__name__):
+                self.assert_refused_naming_both_ways(self.verdict([form(edited_at=edited)]))
+
+    def test_a_bare_label_with_no_record_is_refused(self):
+        """#62, owner decision: the owner's label alone no longer counts, however fresh."""
+        self.assert_refused_naming_both_ways(self.verdict([]))
+
+    def test_either_record_form_for_the_head_counts(self):
+        """The two ways to approve: approve_gate.py's record and `ao owner-label apply`'s both carry the marker."""
+        for form in (self.record, self.ao_record):
+            with self.subTest(form=form.__name__):
+                counts, why = self.verdict([form()])
+                self.assertTrue(counts, why)
+                self.assertIn(f"and the owner's head record posted at 2026-10-16T13:00:01Z names {self.HEAD[:7]}",
+                              why)
 
     def test_workflow_label_without_a_record_does_not_count(self):
         counts, why = self.verdict([self.command()])
