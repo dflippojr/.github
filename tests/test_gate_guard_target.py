@@ -252,8 +252,9 @@ class Scenarios(unittest.TestCase):
 
 
 class RecordAfterTheGuard(unittest.TestCase):
-    """The label starts the guard, and approve_gate.py posts its head record a moment later. Nothing reruns the
-    guard on a comment, so it waits a little for the record of a fresh /approve-gate label (#46)."""
+    """The label starts the guard, and approve_gate.py or `ao owner-label apply` posts its head record a moment
+    later. Nothing reruns the guard on a comment, so it waits a little for the record of a fresh owner label (#46,
+    #62)."""
     SCENARIO = json.loads((SCENARIOS / "approve-gate-head-record.json").read_text(encoding="utf-8"))
 
     def run_guard(self, now, record_after=None):
@@ -953,7 +954,7 @@ class TargetFailures(unittest.TestCase):
         self.assertIn("could not read the pull request's labels", body["summary"])
 
     def test_cut_off_comments_fail_closed(self):
-        """A head record or an /approve-gate command past the page limit could change the verdict."""
+        """A head record past the page limit could change the verdict."""
         fake = self.github()
 
         def pages(path):
