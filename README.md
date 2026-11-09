@@ -543,8 +543,9 @@ adds it again. Adding a label that is already on records no event, and the
 gate guard dates the label by its newest event: a re-approval after a push
 would still look older than the push. Then it posts the head record. Last, it
 reads the head again. If a push landed meanwhile, it removes the label again,
-because the gate guard would date the label after that push and count it for
-a commit the owner never named. For the same reason it removes the label
+because the label would date after that push and sit on a commit the owner
+never named; the gate guard refuses such a label, since the record names the
+old head, but it must not stay. For the same reason it removes the label
 again when anything fails once the label request is sent: the label write
 itself (GitHub may have applied it), the record, or the final read. If that
 removal fails too, the run fails with an error line saying the label is still
@@ -555,7 +556,12 @@ owner also sees a failed run.
 
 A later push invalidates the approval in both checks: `ao ready` needs the
 record to name the current head, and the gate guard needs the label applied
-after the newest push.
+after the newest push and, for a label this workflow may have applied, the
+owner's newest head record since the label to name the current head ("A label
+from `/approve-gate` needs the head record" under "Gate guard on the default
+branch"). That guard rule also covers what the cleanup above can't: a run
+killed between the label and the record, or a label whose removal failed,
+leaves no record for the head, so the guard fails closed.
 
 ### The token
 

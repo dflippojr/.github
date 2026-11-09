@@ -17,13 +17,16 @@ new labeled event, dated after the newest push), adds it, and posts the head
 record `ao owner-label` writes: <!-- owner-label gate-change-approved head=SHA -->.
 Label first, then record, so `ao ready` finds the record at or after the label.
 Both calls use OWNER_GATE_TOKEN, the owner's own token, so GitHub records the
-owner as the actor and the gate guard and `ao ready` need no new rule. The
-script checks that the token is the owner's before it writes.
+owner as the actor and `ao ready` needs no new rule. The gate guard counts a
+label this workflow may have applied only when the owner's newest head record
+since the label names the current head (.github #46). The script checks that
+the token is the owner's before it writes.
 
 Last it reads the head again. A push that landed between the first read and
-the label would be dated before the label, and the gate guard would count the
-label for a commit the owner never named, so when the head has moved the label
-is removed again. For the same reason the label is removed again whenever the
+the label would be dated before the label, which would then sit on a commit the
+owner never named (the gate guard refuses it, since the record names the old
+head, but the label must not stay), so when the head has moved the label is
+removed again. For the same reason the label is removed again whenever the
 run fails once the label request is sent (the label write itself, the record,
 the final read). If that removal fails too, the run says so in an error line
 naming the pull request and exits 2: the owner removes the label by hand.
