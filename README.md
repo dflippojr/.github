@@ -543,11 +543,15 @@ only when all of these hold:
   (`GITHUB_REPOSITORY_OWNER`, `GITHUB_REPOSITORY_OWNER_ID`), and is a user.
   Another account, a look-alike login, or a renamed account with the old login
   doesn't count, and neither does a collaborator saying "approved".
-- The comment's REST `updated_at` equals its `created_at`, so it was not
-  edited in any later second. REST's one-second timestamps can't show an
-  edit in the second it was posted; the script doesn't read GraphQL's edit
-  history for the command, as the gate guard does for head records (see
-  "Threats it still doesn't cover"). Callers listen for `created` only, and
+- The comment was never edited. Its REST `updated_at` equals its
+  `created_at`, and, since REST's one-second timestamps can't show an edit
+  in the second it was posted, GraphQL's `IssueComment` edit history shows
+  none: `lastEditedAt` and `editor` null, `includesCreatedEdit` false,
+  `userContentEdits` empty. The check is the gate guard's, field for field
+  and of exactly its type; `approve_gate.py` carries a copy, since the
+  workflow checks out only that file, and a test pins it to the guard's. An
+  edit, a malformed answer or a history that can't be read applies nothing:
+  the run replies why and exits 2. Callers listen for `created` only, and
   the script refuses any other action.
 - The body is exactly `/approve-gate`, one space and the full lowercase SHA;
   trailing whitespace is ignored. A short SHA or any extra text is refused,
@@ -610,9 +614,11 @@ The owner sets up, once per repository with a caller (repository Settings):
    in agent-ops). No tag rules. Leave required reviewers and wait timers off.
 3. A fine-grained personal access token. Resource owner `dflippojr`.
    Repository access: only this repository. Permissions:
-   **Pull requests: Read and write** (labels and comments on pull requests),
-   plus the mandatory Metadata: Read. If GitHub refuses the label call with
-   403, add **Issues: Read and write**. Set an expiry and renew it.
+   **Pull requests: Read and write** (labels and comments on pull requests,
+   and the GraphQL read of the command's edit history), plus the mandatory
+   Metadata: Read. If GitHub refuses the label call, or the edit-history
+   read (the run replies "its edit history could not be read" and exits 2),
+   with 403, add **Issues: Read and write**. Set an expiry and renew it.
 4. In the `approve-gate` environment, **Environment secrets → Add secret**,
    named `OWNER_GATE_TOKEN`, holding the token.
 5. If a repository secret named `OWNER_GATE_TOKEN` exists (Settings → Secrets
@@ -691,15 +697,11 @@ which job declares the environment:
   `workflow_dispatch` job there passes the branch rule. Only
   `approve-gate.yml`'s `approve` job may declare it; the tests check that in
   this repository, and agent-ops checks its own workflows.
-- **An edit to the command in the second it was posted.** The script
-  trusts the command's REST timestamps, which can't show an edit within the
-  same second. Someone with write access who rewrote the owner's
-  `/approve-gate` in that second could name a head the owner never named, if
-  it is the current head when the run reads the comment. The run would then
-  label and post a fresh, unedited record for it, which the gate guard
-  counts. Reading the command's GraphQL edit history, as the guard does for
-  head records, would close this; it needs the owner's token to read GraphQL
-  and is not done yet.
+- **GraphQL's edit history is the last word.** An edit to the command
+  in the second it was posted is caught only because GitHub's GraphQL API
+  reports it. If that history ever under-reported an edit, the run would
+  act on the rewritten command, if it names the current head. The gate
+  guard trusts the same history for head records.
 - **`gate-guard.yml` callers.** The `pull_request` gate guard checks only who
   applied the label, not when, so in a repository still on it a push does not
   void an approval there; `ao ready` still does, through the head record.

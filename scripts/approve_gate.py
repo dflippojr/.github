@@ -7,8 +7,9 @@ code. It reads the comment and the pull request again from the API, and acts
 only when all of these hold:
 
     the comment's author is the repository owner, by login and by user id
-    the comment's REST updated_at equals created_at (no edit in a later second), and the event is `created`
+    the comment's REST updated_at equals created_at, and the event is `created`
     the body is exactly `/approve-gate <sha>`, a full 40-character lowercase SHA (trailing whitespace aside)
+    GraphQL's edit history of the comment shows it never edited, every field of exactly its type
     the comment is on a pull request, open, whose head branch is in this repository
     the SHA is the pull request's current head
 
@@ -32,8 +33,10 @@ run fails once the label request is sent (the label write itself, the record,
 the final read). If that removal fails too, the run says so in an error line
 naming the pull request and exits 2: the owner removes the label by hand.
 
-Exit status: 0 applied, 1 refused, 2 when the API could not be read or written.
-A refusal of the owner's own comment is answered with a reply on the pull
+Exit status: 0 applied, 1 refused, 2 when the API could not be read or written,
+or when the owner's command has an edit history that shows an edit, is
+malformed or can't be read (nothing is applied, and the reply says why). A
+refusal of the owner's own comment is answered with a reply on the pull
 request; anyone else's comment is refused silently.
 
     OWNER_GATE_TOKEN=... python3 approve_gate.py
@@ -49,10 +52,23 @@ import urllib.request
 LABEL = "gate-change-approved"
 COMMAND = re.compile(r"/approve-gate ([0-9a-f]{40})")
 SHA = re.compile(r"[0-9a-f]{40}")
+# REST comment timestamps have one-second resolution, so updated_at ==
+# created_at can't show that the command was never edited. GraphQL's
+# IssueComment keeps the server's edit history. EDIT_QUERY, EDIT_KEYS,
+# _check_edit_node and _never_edited are the gate guard's (.github #63), copied
+# because the workflow checks out only this file; a test pins them equal.
+EDIT_QUERY = ("query($ids: [ID!]!) { nodes(ids: $ids) { __typename ... on IssueComment { id databaseId "
+              "lastEditedAt editor { login } includesCreatedEdit userContentEdits(first: 1) { totalCount } } } }")
+# The keys of each EDIT_QUERY node; userContentEdits must also hold totalCount.
+EDIT_KEYS = ("__typename", "id", "databaseId", "lastEditedAt", "editor", "includesCreatedEdit", "userContentEdits")
 
 
 class Refused(Exception):
     """The comment does not approve anything; the message says why."""
+
+
+class Unproven(Exception):
+    """The command's edit history does not show it was never edited (edited, malformed or unreadable)."""
 
 
 class LabelLeft(Exception):
@@ -62,17 +78,18 @@ class LabelLeft(Exception):
 class GitHub:
     """The GitHub API calls this script makes, all with one token."""
 
-    def __init__(self, api, token):
+    def __init__(self, api, token, graphql_url=None):
         self.api, self.token = api, token
+        self.graphql_url = graphql_url or os.environ.get("GITHUB_GRAPHQL_URL") or f"{api}/graphql"
 
-    def request(self, method, path, body=None):
+    def request(self, method, path, body=None, url=None):
         headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28",
                    "User-Agent": "approve-gate", "Authorization": f"Bearer {self.token}"}
         data = None
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        request = urllib.request.Request(self.api + path, data=data, headers=headers, method=method)
+        request = urllib.request.Request(url or self.api + path, data=data, headers=headers, method=method)
         with urllib.request.urlopen(request, timeout=20) as resp:
             return json.loads(resp.read().decode("utf-8") or "null")
 
@@ -85,9 +102,76 @@ class GitHub:
     def delete(self, path):
         return self.request("DELETE", path)
 
+    def graphql(self, query, variables):
+        """The data of one GraphQL query. Any error, even beside partial data, raises."""
+        answer = self.request("POST", None, {"query": query, "variables": variables}, url=self.graphql_url)
+        if not isinstance(answer, dict) or answer.get("errors") or not isinstance(answer.get("data"), dict):
+            raise ValueError(f"the GraphQL API answered with errors: {str((answer or {}).get('errors'))[:300]}")
+        return answer["data"]
 
-def requested_sha(comment, owner, owner_id):
-    """The SHA the owner's comment names. Raises Refused for any other author, an edit or any other body."""
+
+def _check_edit_node(node, comment):
+    """Raise unless node is a whole EDIT_QUERY answer for comment, every field of exactly its type (#62 security
+    rounds 2 and 3). type(x) is int rules out a bool or float that == would take for a count or an id; a missing
+    key is not a null."""
+    def fail(why):
+        raise ValueError(f"the GraphQL API's edit history of comment {comment.get('id')} is malformed: {why}")
+
+    if type(node) is not dict:
+        fail("not an object")
+    missing = [key for key in EDIT_KEYS if key not in node]
+    if missing:
+        fail(f"no {', '.join(missing)}")
+    if type(node["__typename"]) is not str or node["__typename"] != "IssueComment":
+        fail("not an IssueComment")
+    if type(node["id"]) is not str or node["id"] != comment.get("node_id"):
+        fail("an id other than the comment's node_id")
+    if type(node["databaseId"]) is not int or node["databaseId"] != comment.get("id"):
+        fail("a databaseId other than the comment's id")
+    if node["lastEditedAt"] is not None and type(node["lastEditedAt"]) is not str:
+        fail("lastEditedAt is neither a string nor null")
+    if node["editor"] is not None and type(node["editor"]) is not dict:
+        fail("editor is neither an object nor null")
+    if type(node["includesCreatedEdit"]) is not bool:
+        fail("includesCreatedEdit is not a boolean")
+    edits = node["userContentEdits"]
+    if type(edits) is not dict or "totalCount" not in edits:
+        fail("userContentEdits is not an object with a totalCount")
+    if type(edits["totalCount"]) is not int or edits["totalCount"] < 0:
+        fail("userContentEdits.totalCount is not a non-negative integer")
+
+
+def _never_edited(node, comment):
+    """Whether node, GraphQL's answer for comment, shows affirmatively that it was never edited: no last edit, no
+    editor, no edit history. The whole node is checked first; a malformed or mismatched answer raises, an edited
+    one says no."""
+    _check_edit_node(node, comment)
+    return (node["lastEditedAt"] is None and node["editor"] is None
+            and node["includesCreatedEdit"] is False and node["userContentEdits"]["totalCount"] == 0)
+
+
+def never_edited(github, comment):
+    """Raises Unproven unless GraphQL's edit history of comment shows it was never edited, every field checked."""
+    node_id = comment.get("node_id")
+    if type(node_id) is not str or not node_id:
+        raise Unproven("its edit history could not be read: the comment has no node_id")
+    try:
+        nodes = github.graphql(EDIT_QUERY, {"ids": [node_id]}).get("nodes")
+    except (urllib.error.URLError, OSError, ValueError, AttributeError) as e:
+        raise Unproven(f"its edit history could not be read ({e}); post a new comment when GitHub answers") from e
+    if type(nodes) is not list or len(nodes) != 1:
+        raise Unproven("its edit history could not be read: GitHub did not answer with exactly one node")
+    try:
+        unedited = _never_edited(nodes[0], comment)
+    except ValueError as e:
+        raise Unproven(str(e)) from e
+    if not unedited:
+        raise Unproven("GitHub's edit history shows the comment was edited; post a new one")
+
+
+def requested_sha(github, comment, owner, owner_id):
+    """The SHA the owner's comment names. Raises Refused for any other author, an edit REST shows or any other
+    body, and then Unproven unless GraphQL's edit history shows the comment never edited."""
     user = comment.get("user") or {}
     login, uid = user.get("login"), user.get("id")
     if login != owner or uid != owner_id or user.get("type") != "User":
@@ -98,6 +182,8 @@ def requested_sha(comment, owner, owner_id):
     match = COMMAND.fullmatch(body)
     if not match:
         raise Refused("the comment must be exactly `/approve-gate <sha>` with the full 40-character head SHA")
+    # REST's one-second timestamps can't show an edit in the second the comment was posted.
+    never_edited(github, comment)
     return match.group(1)
 
 
@@ -174,17 +260,23 @@ def run(github, event_name, event, repo, owner, owner_id):
     comment = github.get(f"/repos/{repo}/issues/comments/{comment_id}")
     if not (comment.get("issue_url") or "").endswith(f"/repos/{repo}/issues/{number}"):
         return 1, f"comment {comment_id} is not on {repo}#{number}"
+    unproven = None
     try:
-        sha = requested_sha(comment, owner, owner_id)
+        sha = requested_sha(github, comment, owner, owner_id)
     except Refused as e:
         if (comment.get("user") or {}).get("id") != owner_id:
             return 1, str(e)  # someone else's comment gets no reply
         sha, refused = None, e
+    except Unproven as e:
+        sha, refused, unproven = None, None, e  # only the owner's command gets this far
     else:
         refused = None
     me = github.get("/user")
     if me.get("login") != owner or me.get("id") != owner_id:
         return 2, f"OWNER_GATE_TOKEN belongs to @{me.get('login')}, not the owner @{owner}"
+    if unproven is not None:
+        github.post(f"/repos/{repo}/issues/{number}/comments", {"body": f"`{LABEL}` was not applied: {unproven}."})
+        return 2, str(unproven)
     if refused is None:
         try:
             issue = github.get(f"/repos/{repo}/issues/{number}")
