@@ -994,6 +994,69 @@ class EditHistory(unittest.TestCase):
         self.assertEqual((code, check["conclusion"]), (2, "failure"), check["summary"])
         self.assertIn("gate-change-approved=false", outputs)
 
+    # Each partial answer drops edit evidence GraphQL was asked for (#62 security round 2).
+    STRIPS = {"lastEditedAt": ("lastEditedAt",), "editor": ("editor",), "both": ("lastEditedAt", "editor"),
+              "includesCreatedEdit": ("includesCreatedEdit",), "userContentEdits": ("userContentEdits",),
+              "totalCount": ("userContentEdits.totalCount",)}
+
+    @staticmethod
+    def stripping(keys):
+        """FakeGitHub.graphql with keys (a.b for a nested key) dropped from every node it returns."""
+        answer = FakeGitHub.graphql
+
+        def graphql(fake, query, variables):
+            data = answer(fake, query, variables)
+            for node in data["nodes"]:
+                for key in keys:
+                    outer, _, inner = key.partition(".")
+                    if inner:
+                        node[outer] = {k: v for k, v in node[outer].items() if k != inner}
+                    else:
+                        node.pop(outer, None)
+            return data
+        return graphql
+
+    def test_a_node_missing_edit_evidence_fails_closed_in_either_form(self):
+        """A missing key is not a null: the record counts only on every requested signal, present and clean."""
+        for strip, keys in self.STRIPS.items():
+            for name, record in self.FORMS.items():
+                with self.subTest(missing=strip, form=name), \
+                        mock.patch.object(FakeGitHub, "graphql", self.stripping(keys)):
+                    code, check, outputs, _ = self.judge([record])
+                    self.assertEqual((code, check["conclusion"]), (2, "failure"), check["summary"])
+                    self.assertIn("could not read", check["summary"])
+                    self.assertIn("gate-change-approved=false", outputs)
+
+    def test_a_node_missing_edit_evidence_on_a_later_poll_fails_closed(self):
+        """The record shows up only on the guard's second comment read, while it waits for a fresh label's record;
+        that read's history is checked as strictly as the first."""
+        for strip, keys in self.STRIPS.items():
+            for name, record in self.FORMS.items():
+                with self.subTest(missing=strip, form=name):
+                    reads = []
+
+                    class Late(FakeGitHub):
+                        def pages(self, path):
+                            if path.endswith("/comments"):
+                                reads.append(path)
+                                self.prs[NUMBER]["comments"] = [record] if len(reads) > 1 else []
+                            return super().pages(path)
+
+                    fake = Late(self.head, {"main": self.base},
+                                {NUMBER: {"labels": [gate_guard.APPROVAL_LABEL], "events": [self.LABELED],
+                                          "pushed_at": "2026-10-16T12:00:00Z", "comments": [], "base": "main",
+                                          "head_ref": HEAD_REF}})
+                    with mock.patch.object(FakeGitHub, "graphql", self.stripping(keys)), \
+                            mock.patch.object(gate_guard, "_now",
+                                              return_value=gate_guard.parse_time("2026-10-16T13:00:01Z")), \
+                            mock.patch("time.sleep"):
+                        code, _, outputs = run_cli(self.tmp, self.server,
+                                                   {"pull_request": event_pr(NUMBER, self.head, "main")}, fake)
+                    check = fake.current()
+                    self.assertEqual(len(reads), 2)
+                    self.assertEqual((code, check["conclusion"]), (2, "failure"), check["summary"])
+                    self.assertIn("gate-change-approved=false", outputs)
+
     def test_an_unedited_record_still_counts_in_either_form(self):
         for name, record in self.FORMS.items():
             with self.subTest(form=name):
@@ -1048,6 +1111,16 @@ class NeverEdited(unittest.TestCase):
                 github = mock.Mock()
                 github.graphql.return_value = {"nodes": nodes}
                 gate_guard.with_edit_history(github, [self.COMMENT], "dflippojr")
+
+    def test_a_missing_edit_key_fails_closed(self):
+        """#62 security round 2: every requested key must be present before its value is read."""
+        for keys in (("lastEditedAt",), ("editor",), ("lastEditedAt", "editor"), ("includesCreatedEdit",),
+                     ("userContentEdits",), ("__typename",), ("id",), ("databaseId",)):
+            with self.subTest(missing=keys), self.assertRaises(ValueError):
+                self.mark({k: v for k, v in self.CLEAN.items() if k not in keys})
+        for edits in ({}, None, [], 0):
+            with self.subTest(userContentEdits=edits), self.assertRaises(ValueError):
+                self.mark(dict(self.CLEAN, userContentEdits=edits))
 
     def test_a_record_with_no_node_id_fails_closed(self):
         comment = {k: v for k, v in self.COMMENT.items() if k != "node_id"}
