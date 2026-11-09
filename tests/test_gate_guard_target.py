@@ -45,6 +45,30 @@ class FakeGitHub:
     def __init__(self, head, merge_bases, prs):
         self.head, self.merge_bases, self.prs = head, merge_bases, prs
         self.jobs, self.writes = [], []
+        # GraphQL edit-history reads, and the error the next one raises (None: it answers).
+        self.graphql_calls, self.graphql_error = [], None
+
+    def graphql(self, query, variables):
+        """Each comment's server edit history, as GraphQL's IssueComment has it. A comment is edited when its
+        scenario gives last_edited_at, or an updated_at other than its created_at; edits counts its history."""
+        self.graphql_calls.append(list(variables["ids"]))
+        if self.graphql_error:
+            raise self.graphql_error
+        comments = {f"IC_{number}_{i}": (i, c) for number, s in self.prs.items()
+                    for i, c in enumerate(s.get("comments", []))}
+        nodes = []
+        for node_id in variables["ids"]:
+            if node_id not in comments:
+                nodes.append(None)
+                continue
+            i, c = comments[node_id]
+            changed = c.get("updated_at", c["created_at"]) != c["created_at"]
+            edited = c.get("last_edited_at") or (c["updated_at"] if changed else None)
+            nodes.append({"__typename": "IssueComment", "id": node_id, "databaseId": i, "lastEditedAt": edited,
+                          "editor": {"login": c.get("editor", c["author"])} if edited else None,
+                          "includesCreatedEdit": bool(edited),
+                          "userContentEdits": {"totalCount": c.get("edits", 2 if edited else 0)}})
+        return {"nodes": nodes}
 
     @classmethod
     def single(cls, merge_base, head, scenario, base="main"):
@@ -80,7 +104,8 @@ class FakeGitHub:
                         for i, e in enumerate(s["events"])]
             if path == f"/repos/{REPO}/issues/{number}/comments":
                 # {head} in a body stands for the head sha, which the scenario's git trees decide.
-                return [{"id": i, "user": {"login": c["author"]}, "body": c["body"].format(head=self.head),
+                return [{"id": i, "node_id": f"IC_{number}_{i}", "user": {"login": c["author"]},
+                         "body": c["body"].format(head=self.head),
                          "created_at": c["created_at"], "updated_at": c.get("updated_at", c["created_at"]),
                          "html_url": f"https://github.com/{REPO}/pull/{number}#issuecomment-{i}"}
                         for i, c in enumerate(s.get("comments", []))]
@@ -889,6 +914,93 @@ class ApproveGateLabel(unittest.TestCase):
         counts, why = self.verdict([self.command(), self.record()], pushed=pushed)
         self.assertFalse(counts)
         self.assertIn("re-applies it after reviewing the new commits", why)
+
+
+class EditHistory(unittest.TestCase):
+    """#62 security round 1: REST comment timestamps have one-second resolution, so updated_at == created_at doesn't
+    prove a record was never edited. The guard reads each candidate record's server edit history (GraphQL
+    IssueComment) and counts it only on affirmative evidence of no edit; an unreadable history fails closed."""
+    LABELED = {"event": "labeled", "label": gate_guard.APPROVAL_LABEL, "actor": OWNER,
+               "created_at": "2026-10-16T13:00:00Z"}
+    WORKFLOW_RECORD = {"author": OWNER, "created_at": "2026-10-16T13:00:01Z",
+                       "body": "Owner approved `gate-change-approved` at head {head} by [comment](https://github.com/"
+                               "dflippojr/demo/pull/7#issuecomment-1). A later push invalidates it.\n\n"
+                               "<!-- owner-label gate-change-approved head={head} -->"}
+    FORMS = {"workflow": WORKFLOW_RECORD, "ao": AO_RECORD}
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        diff = (FIXTURES / "flag-gate-target-caller.diff").read_text(encoding="utf-8")
+        self.server, (self.base, self.head) = make_remote(self.tmp, *_trees(diff))
+
+    def judge(self, comments, error=None):
+        """(exit code, the commit's check, outputs, fake) after a run of the job with these comments."""
+        fake = FakeGitHub.single(self.base, self.head, {"labels": [gate_guard.APPROVAL_LABEL], "events": [self.LABELED],
+                                                        "pushed_at": "2026-10-16T12:00:00Z", "comments": comments})
+        fake.graphql_error = error
+        with mock.patch.object(gate_guard, "_now", return_value=gate_guard.parse_time("2026-10-16T14:00:00Z")):
+            code, _, outputs = run_cli(self.tmp, self.server, {"pull_request": event_pr(NUMBER, self.head, "main")},
+                                       fake)
+        return code, fake.current(), outputs, fake
+
+    def assert_refused(self, comments):
+        code, check, outputs, _ = self.judge(comments)
+        self.assertEqual((code, check["conclusion"]), (1, "failure"), check["summary"])
+        self.assertIn("no unedited head record from the owner", check["summary"])
+        self.assertIn("gate-change-approved=false", outputs)
+
+    def test_an_edit_inside_the_creation_second_is_refused_in_either_form(self):
+        """created_at == updated_at, but GraphQL's lastEditedAt shows the edit."""
+        for name, record in self.FORMS.items():
+            with self.subTest(form=name):
+                self.assert_refused([dict(record, last_edited_at="2026-10-16T13:00:01Z")])
+
+    def test_an_edit_then_restore_is_refused_in_either_form(self):
+        """The body reads as the original record again, but its edit history is not empty."""
+        for name, record in self.FORMS.items():
+            with self.subTest(form=name):
+                self.assert_refused([dict(record, last_edited_at="2026-10-16T13:00:01Z", edits=3,
+                                          editor="collaborator")])
+
+    def test_an_unreadable_edit_history_fails_closed_in_either_form(self):
+        for name, record in self.FORMS.items():
+            for error in (gate_guard.urllib.error.URLError("graphql down"), ValueError("GraphQL errors")):
+                with self.subTest(form=name, error=error):
+                    code, check, outputs, _ = self.judge([record], error=error)
+                    self.assertEqual((code, check["conclusion"]), (2, "failure"), check["summary"])
+                    self.assertIn("could not read", check["summary"])
+                    self.assertIn("gate-change-approved=false", outputs)
+
+    def test_a_missing_edit_history_node_fails_closed(self):
+        """GraphQL answers null for a comment it can't show (deleted since the REST read, or not visible)."""
+        fake_graphql = FakeGitHub.graphql
+
+        def null_nodes(fake, query, variables):
+            return {"nodes": [None for _ in fake_graphql(fake, query, variables)["nodes"]]}
+
+        with mock.patch.object(FakeGitHub, "graphql", null_nodes):
+            code, check, outputs, _ = self.judge([AO_RECORD])
+        self.assertEqual((code, check["conclusion"]), (2, "failure"), check["summary"])
+        self.assertIn("gate-change-approved=false", outputs)
+
+    def test_an_unedited_record_still_counts_in_either_form(self):
+        for name, record in self.FORMS.items():
+            with self.subTest(form=name):
+                code, check, _, _ = self.judge([record])
+                self.assertEqual((code, check["conclusion"]), (0, "success"), check["summary"])
+
+    def test_only_the_owners_records_are_looked_up_in_batches(self):
+        """One GraphQL read per 100 candidate records, and none for other comments, so the scan stays linear."""
+        noise = [{"author": OWNER, "body": "LGTM", "created_at": "2026-10-16T12:30:00Z"},
+                 dict(AO_RECORD, author="dflippojr-workers[bot]")]
+        records = [dict(AO_RECORD, created_at=f"2026-10-16T13:00:{i % 60:02d}Z") for i in range(1, 151)]
+        code, check, _, fake = self.judge(noise + records)
+        self.assertEqual((code, check["conclusion"]), (0, "success"), check["summary"])
+        self.assertEqual([len(ids) for ids in fake.graphql_calls], [100, 50])
+        self.assertEqual(sorted(i for ids in fake.graphql_calls for i in ids),
+                         sorted(f"IC_{NUMBER}_{i}" for i in range(2, 152)))
 
 
 class HeadPushedAt(unittest.TestCase):
