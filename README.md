@@ -532,7 +532,9 @@ Every merged change to `.github/workflows/gate-guard.yml`,
 `.github/workflows/gate-guard-target.yml` or `scripts/gate_guard.py` is
 followed by a new guard tag at a `main` commit that contains it. The owner
 creates the tags; agents don't. Make them annotated (`git tag -a`), and never
-move or delete one that has been pushed: cut a new release instead.
+move or delete one that has been pushed: cut a new release instead. Don't
+put another family's version tag (a bare `v…` or `approve-gate/v…`) on a
+commit that carries a guard tag (see "Tag format").
 
 ### Tag format
 
@@ -572,8 +574,13 @@ family. `gate-guard/v1.0.0` passes both. Its `gate-guard/` prefix also keeps
 the family apart. Dependabot only offers tags with the same prefix as the tag
 at the pinned SHA (`matches_existing_prefix?` and `same_prefix?`,
 [`git_commit_checker.rb` lines 606-628](https://github.com/dependabot/dependabot-core/blob/v0.405.0/common/lib/dependabot/git_commit_checker.rb#L606-L628)),
-so a later `v2.0.0` or `approve-gate/v1.0.0` tag is never offered to guard
-callers.
+so a later `v2.0.0` or `approve-gate/v1.0.0` tag isn't offered to guard
+callers. That holds only while the guard tag is the tag Dependabot finds at the
+pinned commit. When a commit carries several version tags, Dependabot takes
+the highest version whatever its prefix
+([`git_commit_checker.rb` lines 306-311](https://github.com/dependabot/dependabot-core/blob/v0.405.0/common/lib/dependabot/git_commit_checker.rb#L306-L311)).
+An `approve-gate/v2.0.0` on the same commit as `gate-guard/v1.2.0` would then
+win and steer the bumps to `approve-gate/v…` releases.
 
 ### Pinning a release
 
