@@ -443,7 +443,9 @@ request with the head.
 
 Copy `templates/gate-guard-target-caller.yml` to
 `.github/workflows/gate-guard-target.yml` in each repository and put the same
-full SHA of this repository's `main` in both places it asks for one. This
+full commit SHA in both places it asks for one: the commit of the newest guard
+release, with its tag in a comment after the `uses:` SHA (see "Guard
+releases"). Until the first guard tag exists, use a full SHA of `main`. This
 repository calls the local copy through `gate-guard-base.yml`, with
 `guard-ref: ${{ github.sha }}`, which under `pull_request_target` is the
 default branch's newest commit.
@@ -517,6 +519,107 @@ anything from the pull request:
   version keep the old hole until they move. That version checks only the
   label (and, with `require-owner-label-actor`, who applied it), never a head
   record.
+
+## Guard releases
+
+Callers pin the gate guard to a guard release: a tag on this repository that
+Dependabot's `github-actions` updater reads as a version, so it opens a pull
+request when a newer release exists.
+
+### When to tag
+
+Every merged change to `.github/workflows/gate-guard.yml`,
+`.github/workflows/gate-guard-target.yml` or `scripts/gate_guard.py` is
+followed by a new guard tag at a `main` commit that contains it. The owner
+creates the tags; agents don't. Make them annotated (`git tag -a`), and never
+move or delete one that has been pushed: cut a new release instead.
+
+### Tag format
+
+Guard tags are named **`gate-guard/vMAJOR.MINOR.PATCH`**, always with three
+numbers, starting at `gate-guard/v1.0.0`. Raise MAJOR when callers have to
+change their caller file, MINOR for new behaviour and PATCH for fixes.
+
+This format was checked against dependabot-core
+[v0.405.0](https://github.com/dependabot/dependabot-core/releases/tag/v0.405.0),
+the current release on 2026-11-17. Dependabot only reads a tag as a version
+if it passes two checks:
+
+- **A candidate for a newer release.** The tag has to match `VERSION_REGEX` in
+  [`common/lib/dependabot/git_commit_checker.rb` lines 31-39](https://github.com/dependabot/dependabot-core/blob/v0.405.0/common/lib/dependabot/git_commit_checker.rb#L31-L39).
+  That pattern accepts a bare major only as `v1` at the very start of the tag.
+  Anywhere else it needs at least `MAJOR.MINOR`.
+- **Which release the pinned SHA is.** Dependabot parses the whole tag name
+  with the `github_actions` version class,
+  [`github_actions/lib/dependabot/github_actions/version.rb` lines 26-30](https://github.com/dependabot/dependabot-core/blob/v0.405.0/github_actions/lib/dependabot/github_actions/version.rb#L26-L30)
+  (`remove_leading_v`) and
+  [lines 37-43](https://github.com/dependabot/dependabot-core/blob/v0.405.0/github_actions/lib/dependabot/github_actions/version.rb#L37-L43)
+  (`correct?`). It strips a `v` only at the start of the name or right after
+  a `/`, and calls `correct?` from
+  [`git_commit_checker.rb` lines 433-436](https://github.com/dependabot/dependabot-core/blob/v0.405.0/common/lib/dependabot/git_commit_checker.rb#L433-L436).
+
+| Tag | Candidate | Identifies the pinned SHA |
+| --- | --- | --- |
+| `gate-guard-v1` | no | no |
+| `gate-guard-v1.0.0` | yes | no |
+| `gate-guard/v1` | no | yes |
+| `gate-guard/v1.0.0` | yes | yes |
+
+`gate-guard-v1` passes neither check, so Dependabot would never offer it.
+`gate-guard-v1.0.0` fails the second: Dependabot can't tell which release a
+caller is on, so it never updates the comment and would offer tags from any
+family. `gate-guard/v1.0.0` passes both. Its `gate-guard/` prefix also keeps
+the family apart. Dependabot only offers tags with the same prefix as the tag
+at the pinned SHA (`matches_existing_prefix?` and `same_prefix?`,
+[`git_commit_checker.rb` lines 606-628](https://github.com/dependabot/dependabot-core/blob/v0.405.0/common/lib/dependabot/git_commit_checker.rb#L606-L628)),
+so a later `v2.0.0` or `approve-gate/v1.0.0` tag is never offered to guard
+callers.
+
+### Pinning a release
+
+Callers pin the full SHA of the tag's commit in both `uses:` and `guard-ref`,
+with the tag as a comment after the `uses:` SHA (`@<sha> # <tag>`):
+
+```yaml
+jobs:
+  gate-guard-target:
+    uses: dflippojr/.github/.github/workflows/gate-guard-target.yml@<sha> # gate-guard/v1.0.0
+    with:
+      guard-ref: <sha>
+```
+
+Pin the commit, not the annotated tag object. This prints the commit, and
+prints nothing for a lightweight tag:
+
+```sh
+git ls-remote https://github.com/dflippojr/.github 'refs/tags/gate-guard/v1.0.0^{}'
+```
+
+`gate-guard.yml` callers follow the same rule, with the SHA in `uses:` and
+`guard-ref`. Callers need a `github-actions` entry in their
+`.github/dependabot.yml`.
+
+### What Dependabot does with the pin
+
+- **The tag at the SHA decides, not the comment.** Dependabot looks up the
+  version tags that point at the pinned commit (`local_tag_for_pinned_sha`,
+  [`git_commit_checker.rb` lines 267-275](https://github.com/dependabot/dependabot-core/blob/v0.405.0/common/lib/dependabot/git_commit_checker.rb#L267-L275)).
+  When a newer `gate-guard/v…` tag exists, it proposes that tag's commit SHA
+  ([`github_actions/lib/dependabot/github_actions/update_checker.rb` lines 355-367](https://github.com/dependabot/dependabot-core/blob/v0.405.0/github_actions/lib/dependabot/github_actions/update_checker.rb#L355-L367)).
+  A SHA that no guard tag points at (a `main` commit between releases) has no
+  release, so pin only tagged commits.
+- **It keeps the comment in step.** It rewrites the comment only when the
+  comment ends with the old version, and it adds no comment when one SHA
+  replaces another
+  ([`github_actions/lib/dependabot/github_actions/file_updater/workflow_updater/version_commenter.rb` lines 24-47](https://github.com/dependabot/dependabot-core/blob/v0.405.0/github_actions/lib/dependabot/github_actions/file_updater/workflow_updater/version_commenter.rb#L24-L47)
+  and [lines 72-86](https://github.com/dependabot/dependabot-core/blob/v0.405.0/github_actions/lib/dependabot/github_actions/file_updater/workflow_updater/version_commenter.rb#L72-L86)).
+  Write the comment when you pin, and keep the full tag last on the line.
+- **It leaves `guard-ref` alone.** It rewrites only the `uses:` value
+  ([`github_actions/lib/dependabot/github_actions/file_updater/workflow_updater.rb` lines 112-129](https://github.com/dependabot/dependabot-core/blob/v0.405.0/github_actions/lib/dependabot/github_actions/file_updater/workflow_updater.rb#L112-L129)).
+  In each Dependabot pull request that bumps the guard, set `guard-ref` to the
+  new SHA before it merges. If it merges without that edit, the new workflow
+  loads the old script. The pull request edits `.github/workflows/**`, so like
+  any caller edit it needs the owner's `gate-change-approved`.
 
 ## Approve a gate change by comment
 
